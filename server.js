@@ -768,6 +768,17 @@ app.get('/force-sheet/:phone', async (req, res) => {
     res.json({ error: err.message });
   }
 });
+// ── Clear/reset a session (fixes stuck old sessions) ──────
+app.get('/clear-session/:phone', async (req, res) => {
+  const phone = req.params.phone.replace(/\D/g, '');
+  try {
+    if (sessionsCol) await sessionsCol.deleteOne({ phone });
+    res.json({ success: true, message: `Session cleared for ${phone}. Fresh start on next message.` });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 // ─────────────────────────────────────────────
