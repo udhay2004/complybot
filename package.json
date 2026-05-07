@@ -1,7 +1,7 @@
 {
   "name": "comply-globally-bot",
-  "version": "1.0.0",
-  "description": "WhatsApp AI Chatbot for Connect Ventures Inc. (Comply Globally)",
+  "version": "2.0.0",
+  "description": "WhatsApp AI Chatbot for Connect Ventures Inc. — with MongoDB, Google Sheets & Human Handoff",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -13,17 +13,12 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.18.2",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "mongodb": "^6.5.0",
+    "googleapis": "^144.0.0",
+    "nodemailer": "^6.9.13"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
-  },
-  "keywords": [
-    "whatsapp",
-    "chatbot",
-    "compliance",
-    "global-expansion"
-  ],
-  "author": "Connect Ventures Inc.",
-  "license": "ISC"
+  }
 }
