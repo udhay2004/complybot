@@ -707,6 +707,67 @@ app.post('/chat', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+
+// ── DEBUG: Test Google Sheets connection directly ──────────
+app.get('/debug-sheets', async (req, res) => {
+  const results = { env: {}, parseOk: false, authOk: false, writeOk: false, error: null };
+  results.env.GOOGLE_SHEET_ID = GOOGLE_SHEET_ID ? '✅ set' : '❌ missing';
+  results.env.GOOGLE_CREDENTIALS_length = GOOGLE_CREDENTIALS ? GOOGLE_CREDENTIALS.length : 0;
+  results.env.GOOGLE_CREDENTIALS_starts = GOOGLE_CREDENTIALS.substring(0, 20);
+  results.env.GOOGLE_CREDENTIALS_ends = GOOGLE_CREDENTIALS.substring(GOOGLE_CREDENTIALS.length - 20);
+
+  try {
+    const creds = JSON.parse(GOOGLE_CREDENTIALS);
+    results.parseOk = true;
+    results.client_email = creds.client_email;
+    results.has_private_key = !!creds.private_key;
+    results.private_key_start = creds.private_key ? creds.private_key.substring(0, 40) : 'MISSING';
+
+    const auth = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+    results.authOk = true;
+
+    // Try to read the sheet first
+    const readRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'Sheet1!A1:A1',
+    });
+    results.sheetReadOk = true;
+
+    // Try to write a test row
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'Sheet1!A1',
+      valueInputOption: 'RAW',
+      requestBody: { values: [['DEBUG TEST', 'Test Name', '9999999999', 'India', 'UAE', 'Company Formation', 'Startup', 'ASAP', 'Debug test row', 'This is a test']] },
+    });
+    results.writeOk = true;
+
+  } catch (err) {
+    results.error = err.message;
+    results.stack = err.stack;
+  }
+
+  res.json(results);
+});
+
+// ── Force-log a specific session to sheet ─────────────────
+app.get('/force-sheet/:phone', async (req, res) => {
+  const phone = req.params.phone.replace(/\D/g, '');
+  const session = await getSession(phone);
+  if (!session) return res.json({ error: 'Session not found' });
+  try {
+    const summary = await generateSummary(session.history);
+    await appendToSheet(session.leadData, summary);
+    await saveLead({ ...session.leadData, summary, completedAt: new Date() });
+    res.json({ success: true, leadData: session.leadData, summary });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 // ─────────────────────────────────────────────
