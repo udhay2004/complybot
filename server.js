@@ -81,8 +81,12 @@ async function saveLead(leadData) {
 // GOOGLE SHEETS
 // ─────────────────────────────────────────────
 async function appendToSheet(leadData, conversationSummary) {
-  if (!GOOGLE_SHEET_ID || !GOOGLE_CREDENTIALS) return;
+  if (!GOOGLE_SHEET_ID || !GOOGLE_CREDENTIALS) {
+    console.warn('⚠️ Skipping Sheets — missing GOOGLE_SHEET_ID or GOOGLE_CREDENTIALS');
+    return;
+  }
   try {
+    console.log('📊 Attempting to write to Google Sheet...');
     const creds = JSON.parse(GOOGLE_CREDENTIALS);
     const auth  = new google.auth.GoogleAuth({
       credentials: creds,
@@ -92,13 +96,14 @@ async function appendToSheet(leadData, conversationSummary) {
     const now    = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
     const row    = [
       now,
-      leadData.name         || '',
-      leadData.phone        || '',
+      leadData.name           || '',
+      leadData.phone          || '',
       leadData.currentCountry || '',
       leadData.targetCountry  || '',
       leadData.serviceNeeded  || '',
       leadData.businessStage  || '',
       leadData.timeline       || '',
+      leadData.additionalInfo || '',
       conversationSummary     || '',
     ];
 
@@ -112,7 +117,7 @@ async function appendToSheet(leadData, conversationSummary) {
         spreadsheetId: GOOGLE_SHEET_ID,
         range: 'Sheet1!A1',
         valueInputOption: 'RAW',
-        requestBody: { values: [['Timestamp','Name','Phone','Current Country','Target Country','Service Needed','Business Stage','Timeline','Conversation Summary']] },
+        requestBody: { values: [['Timestamp','Name','Phone','Current Country','Target Country','Service Needed','Business Stage','Timeline','Additional Info','Conversation Summary']] },
       });
     }
 
@@ -256,7 +261,8 @@ Naturally collect these through conversation (never ask all at once):
 ✅ Full Name | ✅ Current Country | ✅ Target Country | ✅ Service Needed | ✅ Business Stage | ✅ Timeline
 
 Once you have Name + Current Country + Target Country + Service Needed → say:
-"Thank you [Name]! 🎉 Our expert will review your requirements and reach out to you on this WhatsApp number shortly. Is there anything else I can help you with?"
+"Thank you [Name]! 🎉 Our expert will review your requirements and reach out to you on this WhatsApp number shortly."
+Do NOT ask for additional info yourself — the system will handle that separately.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 HUMAN HANDOFF
@@ -293,10 +299,12 @@ function freshSession(phone) {
     leadData: {
       name: null, phone,
       currentCountry: null, targetCountry: null,
-      serviceNeeded: null, businessStage: null, timeline: null
+      serviceNeeded: null, businessStage: null,
+      timeline: null, additionalInfo: null
     },
     leadCollected: false,
     humanMode: false,
+    askedAdditionalInfo: false,
     createdAt: new Date(),
     lastActive: new Date()
   };
@@ -336,21 +344,46 @@ function extractLeadData(session, userMessage) {
   const lead = session.leadData;
   const msg  = userMessage.toLowerCase();
 
-  const nameMatch = userMessage.match(/(?:my name is|i am|i'm|this is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
+  // ── Name ──────────────────────────────────
+  // Match "my name is X", "I am X", "this is X", or standalone "X Kumar Y" patterns
+  const nameMatch = userMessage.match(/(?:my name is|i am|i'm|this is|name[:\-\s]+)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})/i)
+    || userMessage.match(/^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})[,\s]/); // "Anil Kumar Gupta, ..."
   if (nameMatch && !lead.name) {
-    lead.name = nameMatch[1];
-    console.log(`📝 Name: ${lead.name}`);
+    // Don't capture single common words as names
+    const candidate = nameMatch[1].trim();
+    const skipWords = ['based','from','india','uae','uk','usa','hi','hello','hey','yes','no','sir','madam'];
+    if (candidate.split(' ').length >= 1 && !skipWords.includes(candidate.toLowerCase())) {
+      lead.name = candidate;
+      console.log(`📝 Name: ${lead.name}`);
+    }
   }
 
   const countries = [
-    'india','uae','dubai','abu dhabi','usa','united states','uk','united kingdom',
+    'vietnam','india','uae','dubai','abu dhabi','usa','united states','uk','united kingdom',
     'singapore','hong kong','canada','netherlands','saudi arabia','mauritius',
     'egypt','nigeria','indonesia','thailand','malaysia','philippines','germany',
-    'france','italy','spain','portugal','ireland','luxembourg','cyprus','malta'
+    'france','italy','spain','portugal','ireland','luxembourg','cyprus','malta',
+    'bahrain','kuwait','oman','qatar','gcc'
   ];
-  const expansionKw = ['expand','open','setup','set up','register','incorporate','start','launch','move to','going to'];
 
-  if (expansionKw.some(k => msg.includes(k))) {
+  // Keywords that clearly indicate EXPANSION (target country)
+  const expansionKw = [
+    'expand to','expand in','open in','setup in','set up in','register in',
+    'incorporate in','start in','launch in','move to','going to','want in',
+    'looking at','considering','choose','between','option'
+  ];
+
+  // Keywords that clearly indicate CURRENT location
+  const currentKw = [
+    'based in','currently in','i am in','i\'m in','living in','located in',
+    'from','i represent','our company is in','we are in','we\'re in'
+  ];
+
+  const isCurrentMsg  = currentKw.some(k => msg.includes(k));
+  const isExpansionMsg = expansionKw.some(k => msg.includes(k));
+
+  if (isExpansionMsg && !isCurrentMsg) {
+    // This message is about where they WANT to go
     for (const c of countries) {
       if (msg.includes(c) && !lead.targetCountry) {
         lead.targetCountry = capitalize(c);
@@ -358,16 +391,29 @@ function extractLeadData(session, userMessage) {
         break;
       }
     }
-  } else if (!lead.currentCountry) {
+  } else if (isCurrentMsg && !isExpansionMsg) {
+    // This message is about where they ARE
     for (const c of countries) {
-      if (msg.includes(c)) {
+      if (msg.includes(c) && !lead.currentCountry) {
         lead.currentCountry = capitalize(c);
         console.log(`📝 Current: ${lead.currentCountry}`);
         break;
       }
     }
+  } else if (!isCurrentMsg && !isExpansionMsg) {
+    // Ambiguous — only set currentCountry if not yet captured
+    for (const c of countries) {
+      if (msg.includes(c)) {
+        if (!lead.currentCountry) {
+          lead.currentCountry = capitalize(c);
+          console.log(`📝 Current (inferred): ${lead.currentCountry}`);
+        }
+        break;
+      }
+    }
   }
 
+  // ── Service ───────────────────────────────
   if (!lead.serviceNeeded) {
     if      (msg.includes('company') || msg.includes('incorporat') || msg.includes('formation')) lead.serviceNeeded = 'Company Formation';
     else if (msg.includes('bank') || msg.includes('account'))                                    lead.serviceNeeded = 'Banking Setup';
@@ -378,21 +424,33 @@ function extractLeadData(session, userMessage) {
     if (lead.serviceNeeded) console.log(`📝 Service: ${lead.serviceNeeded}`);
   }
 
+  // ── Business Stage ────────────────────────
   if (!lead.businessStage) {
     if      (msg.includes('startup') || msg.includes('just started'))     lead.businessStage = 'Startup';
     else if (msg.includes('freelancer') || msg.includes('consultant'))    lead.businessStage = 'Freelancer';
     else if (msg.includes('sme') || msg.includes('small business'))       lead.businessStage = 'SME';
-    else if (msg.includes('established') || msg.includes('enterprise'))   lead.businessStage = 'Established Company';
+    else if (msg.includes('established') || msg.includes('enterprise') || msg.includes('represent')) lead.businessStage = 'Established Company';
+    else if (msg.includes('it services') || msg.includes('software') || msg.includes('tech')) lead.businessStage = 'Tech Company';
     if (lead.businessStage) console.log(`📝 Stage: ${lead.businessStage}`);
   }
 
+  // ── Timeline ──────────────────────────────
   if (!lead.timeline) {
-    if      (msg.includes('immediately') || msg.includes('asap') || msg.includes('urgent')) lead.timeline = 'Immediately';
-    else if (msg.includes('this month') || msg.includes('soon'))                             lead.timeline = 'Within 1 month';
-    else if (msg.includes('next month') || msg.includes('1-2 months'))                      lead.timeline = '1-2 months';
-    else if (msg.includes('3 months') || msg.includes('quarter'))                           lead.timeline = '3 months';
-    else if (msg.includes('6 months'))                                                       lead.timeline = '6 months';
+    if      (msg.includes('yesterday') || msg.includes('immediately') || msg.includes('asap') || msg.includes('urgent')) lead.timeline = 'Immediately';
+    else if (msg.includes('this month') || msg.includes('soon'))         lead.timeline = 'Within 1 month';
+    else if (msg.includes('next month') || msg.includes('1-2 months'))  lead.timeline = '1-2 months';
+    else if (msg.includes('3 months') || msg.includes('quarter'))       lead.timeline = '3 months';
+    else if (msg.includes('6 months'))                                   lead.timeline = '6 months';
     if (lead.timeline) console.log(`📝 Timeline: ${lead.timeline}`);
+  }
+
+  // ── Additional Info ───────────────────────
+  // Capture anything said AFTER the bot asked for additional info
+  if (session.askedAdditionalInfo && !lead.additionalInfo && userMessage.trim().length > 2) {
+    const noInfoPhrases = ['no','nope','nothing','that\'s all','thats all','no thanks','not really','all good','nah'];
+    const isNegative = noInfoPhrases.some(p => msg.trim() === p || msg.trim().startsWith(p + ' '));
+    lead.additionalInfo = isNegative ? 'None' : userMessage.trim();
+    console.log(`📝 Additional info: ${lead.additionalInfo}`);
   }
 }
 
@@ -400,7 +458,13 @@ function capitalize(str) {
   return str.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 }
 
+// Lead is "ready to log" only after additional info step is done
 function isLeadComplete(lead) {
+  return !!(lead.name && lead.currentCountry && lead.targetCountry && lead.serviceNeeded && lead.additionalInfo);
+}
+
+// Lead has core info — ready to ask additional info question
+function isLeadCoreComplete(lead) {
   return !!(lead.name && lead.currentCountry && lead.targetCountry && lead.serviceNeeded);
 }
 
@@ -557,13 +621,27 @@ app.post('/webhook', async (req, res) => {
     const reply = await getClaudeReply(session, rawMsg);
     await sendWhatsAppMessage(phone, reply);
 
-    // ── LEAD COMPLETE → log everything ────────
+    // ── CORE LEAD DONE → ask additional info ──
+    if (!session.askedAdditionalInfo && isLeadCoreComplete(session.leadData)) {
+      session.askedAdditionalInfo = true;
+      console.log(`💬 Asking additional info for ${phone}`);
+      const additionalQ = "Before I hand you over to our expert — is there anything else you'd like them to know? Any specific requirements, questions, or details you'd like to share? 📋";
+      await sendWhatsAppMessage(phone, additionalQ);
+      session.history.push({ role: 'assistant', content: additionalQ });
+    }
+
+    // ── LEAD FULLY COMPLETE → log everything ──
     const wasComplete = session.leadCollected;
     if (!wasComplete && isLeadComplete(session.leadData)) {
       session.leadCollected = true;
       console.log(`🎯 Lead complete for ${phone}`);
       const summary = await generateSummary(session.history);
-      await appendToSheet(session.leadData, summary);
+      // Log to sheet with verbose error output
+      try {
+        await appendToSheet(session.leadData, summary);
+      } catch (sheetErr) {
+        console.error('❌ Sheet append failed:', sheetErr.message);
+      }
       await saveLead({ ...session.leadData, summary, completedAt: new Date() });
       await sendLeadCapturedEmail(session.leadData);
     }
