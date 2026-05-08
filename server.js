@@ -20,6 +20,8 @@ const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS  || ''; // JSON string
 const RESEND_API_KEY     = (process.env.RESEND_API_KEY     || '').replace(/['"` \n\r]/g, '');
 const NOTIFY_EMAIL       = process.env.NOTIFY_EMAIL        || 'udhaymarwah96@gmail.com';
 const FROM_EMAIL         = process.env.FROM_EMAIL          || 'Comply Bot <onboarding@resend.dev>';
+const BASE_URL           = process.env.BASE_URL            || 'https://complybot.onrender.com';
+const HUMAN_TIMEOUT_MS   = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000'); // 2 hours default
 
 [
   ['INTERAKT_API_KEY',  INTERAKT_API_KEY],
@@ -176,6 +178,9 @@ async function sendHumanHandoffEmail(phone, leadData, lastMessages) {
       .map(m => `${m.role === 'user' ? '👤 Customer' : '🤖 Bot'}: ${m.content}`)
       .join('\n\n');
 
+    const resumeUrl = `${BASE_URL}/resume-bot/${phone}`;
+    const timeoutHours = Math.round(HUMAN_TIMEOUT_MS / 3600000);
+
     await sendEmail({
       subject: `🚨 Human Takeover Requested — ${leadData.name || phone}`,
       html: `
@@ -184,7 +189,10 @@ async function sendHumanHandoffEmail(phone, leadData, lastMessages) {
             <h2 style="margin:0">🌍 Comply Globally — Human Handoff Alert</h2>
           </div>
           <div style="background:#f9f9f9;padding:20px;border:1px solid #eee">
-            <h3>Customer Details</h3>
+            <div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin-bottom:16px">
+              ⏱️ <b>Bot is paused for this customer.</b> It will auto-resume in <b>${timeoutHours} hours</b> if no action is taken.
+            </div>
+            <h3 style="margin-top:0">Customer Details</h3>
             <table style="width:100%;border-collapse:collapse">
               <tr><td style="padding:6px;color:#666">Name</td><td style="padding:6px"><b>${leadData.name || 'Not captured'}</b></td></tr>
               <tr><td style="padding:6px;color:#666">Phone</td><td style="padding:6px"><b>+${phone}</b></td></tr>
@@ -196,8 +204,12 @@ async function sendHumanHandoffEmail(phone, leadData, lastMessages) {
             </table>
             <h3>Last 6 Messages</h3>
             <pre style="background:#fff;border:1px solid #ddd;padding:12px;border-radius:4px;white-space:pre-wrap;font-size:13px">${chatPreview}</pre>
-            <p style="color:#888;font-size:12px">Reply to this customer directly in your Interakt inbox. The bot has been paused for this user.</p>
-            <a href="https://app.interakt.ai" style="display:inline-block;background:#1a1a2e;color:white;padding:10px 20px;border-radius:6px;text-decoration:none;margin-top:10px">Open Interakt Inbox →</a>
+            <p style="color:#555;font-size:13px">Reply to this customer directly in your Interakt inbox. When your team is done, click below to hand back to the bot:</p>
+            <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+              <a href="https://app.interakt.ai" style="display:inline-block;background:#1a1a2e;color:white;padding:10px 20px;border-radius:6px;text-decoration:none">Open Interakt Inbox →</a>
+              <a href="${resumeUrl}" style="display:inline-block;background:#166534;color:white;padding:10px 20px;border-radius:6px;text-decoration:none">✅ Resume Bot for +${phone}</a>
+            </div>
+            <p style="color:#aaa;font-size:11px;margin-top:16px">Bot will auto-resume after ${timeoutHours}h regardless.</p>
           </div>
         </div>
       `
@@ -679,13 +691,25 @@ app.post('/webhook', async (req, res) => {
     const session = await getSession(phone);
 
     if (session.humanMode) {
-      console.log(`🧑 Human mode active for ${phone} — bot silent`);
-      return;
+      // ── Auto-resume check ──────────────────────
+      const handoffAge = Date.now() - new Date(session.humanModeAt || 0).getTime();
+      if (handoffAge >= HUMAN_TIMEOUT_MS) {
+        console.log(`⏰ Human timeout reached for ${phone} — auto-resuming bot`);
+        session.humanMode = false;
+        session.humanModeAt = null;
+        await saveSession(session);
+        // Fall through to normal bot flow below
+      } else {
+        const remainingMins = Math.ceil((HUMAN_TIMEOUT_MS - handoffAge) / 60000);
+        console.log(`🧑 Human mode active for ${phone} — bot silent (auto-resumes in ~${remainingMins}m)`);
+        return;
+      }
     }
 
     if (wantsHuman(rawMsg)) {
       console.log(`🙋 Human requested by ${phone}`);
       session.humanMode = true;
+      session.humanModeAt = new Date();
       const reply = "Of course! 🙏 I'm connecting you to one of our experts right now. They'll reach out to you on this WhatsApp number shortly. Please hold on!";
       await sendWhatsAppMessage(phone, reply);
       session.history.push({ role: 'assistant', content: reply });
@@ -756,9 +780,26 @@ app.post('/resume-bot/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   const session = await getSession(phone);
   session.humanMode = false;
+  session.humanModeAt = null;
   await saveSession(session);
   await sendWhatsAppMessage(phone, "Hi again! 👋 I'm Comply, back to assist you. How can I help?");
   res.json({ success: true, message: `Bot resumed for ${phone}` });
+});
+
+// GET version so the email button works directly in browser
+app.get('/resume-bot/:phone', async (req, res) => {
+  const phone = req.params.phone.replace(/\D/g, '');
+  const session = await getSession(phone);
+  session.humanMode = false;
+  session.humanModeAt = null;
+  await saveSession(session);
+  await sendWhatsAppMessage(phone, "Hi again! 👋 I'm Comply, back to assist you. How can I help?");
+  res.send(`
+    <html><body style="font-family:sans-serif;text-align:center;padding:60px">
+      <h2 style="color:#166534">✅ Bot resumed for +${phone}</h2>
+      <p>Comply will now respond to this customer's next message.</p>
+    </body></html>
+  `);
 });
 
 app.get('/status/:phone', async (req, res) => {
