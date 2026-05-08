@@ -405,9 +405,9 @@ function extractLeadData(session, userMessage) {
   // Strong current location signals
   const currentKw = [
     'based in','i am based','currently based',
-    'i'm in','i am in','currently in',
+    "i'm in",'i am in','currently in',
     'living in','located in','residing in',
-    'i'm from','i am from','we are from',
+    "i'm from",'i am from','we are from',
     'our office is','our company is in','we operate from'
   ];
 
