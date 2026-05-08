@@ -345,15 +345,25 @@ function extractLeadData(session, userMessage) {
   const msg  = userMessage.toLowerCase();
 
   // ── Name ──────────────────────────────────
-  // Match "my name is X", "I am X", "this is X", or standalone "X Kumar Y" patterns
-  const nameMatch = userMessage.match(/(?:my name is|i am|i'm|this is|name[:\-\s]+)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})/i)
-    || userMessage.match(/^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})[,\s]/); // "Anil Kumar Gupta, ..."
+  // Match "my name is X" stopping at "and/from/,/i " etc
+  const nameMatch = userMessage.match(/(?:my name is|i am|i'm|this is|name[:\-\s]+)\s*([A-Za-z]+(?:\s+[A-Za-z]+){0,2}?)(?:\s+(?:and|from|i |,|\.|I want|based|looking)|$)/i)
+    || userMessage.match(/(?:my name is|i am|i'm|this is)\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,2})/i)
+    || userMessage.match(/^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})[,\s]/);
   if (nameMatch && !lead.name) {
-    // Don't capture single common words as names
-    const candidate = nameMatch[1].trim();
-    const skipWords = ['based','from','india','uae','uk','usa','hi','hello','hey','yes','no','sir','madam'];
-    if (candidate.split(' ').length >= 1 && !skipWords.includes(candidate.toLowerCase())) {
-      lead.name = candidate;
+    const candidate = (nameMatch[1] || '').trim();
+    const skipWords = [
+      'based','from','india','uae','uk','usa','hi','hello','hey','yes','no',
+      'sir','madam','canada','singapore','vietnam','dubai','there','glad','happy',
+      'great','good','fine','well','not','just','and','the','for','with'
+    ];
+    const words = candidate.split(' ');
+    // Filter out trailing skip words (e.g. "stefan and" → "stefan")
+    while (words.length > 0 && skipWords.includes(words[words.length-1].toLowerCase())) {
+      words.pop();
+    }
+    const cleanName = words.join(' ').trim();
+    if (cleanName.length > 1 && !skipWords.includes(cleanName.toLowerCase())) {
+      lead.name = cleanName.charAt(0).toUpperCase() + cleanName.slice(1);
       console.log(`📝 Name: ${lead.name}`);
     }
   }
@@ -589,7 +599,9 @@ app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (body.type !== 'message_received') return;
 
-    const phone  = (body.data?.customer?.phone_number || '').replace(/^\+/, '').replace(/\D/g, '');
+    // Normalize phone: strip +, keep digits, ensure country code included
+    const rawPhone = (body.data?.customer?.phone_number || '').replace(/^\+/, '').replace(/\D/g, '');
+    const phone = rawPhone.length === 10 ? '91' + rawPhone : rawPhone;
     const rawMsg = body.data?.message?.message || '';
     if (!phone || !rawMsg) return;
 
