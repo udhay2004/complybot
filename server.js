@@ -62,6 +62,18 @@ async function getSession(phone) {
   if (!session) {
     session = freshSession(phone);
     await sessionsCol.insertOne(session);
+    console.log(`🆕 New session: ${phone}`);
+  } else {
+    // Migrate old sessions missing new fields
+    let dirty = false;
+    if (session.askedAdditionalInfo === undefined) { session.askedAdditionalInfo = false; dirty = true; }
+    if (session.leadData && session.leadData.additionalInfo === undefined) { session.leadData.additionalInfo = null; dirty = true; }
+    if (session.humanMode === undefined) { session.humanMode = false; dirty = true; }
+    if (dirty) {
+      await sessionsCol.replaceOne({ phone }, session, { upsert: true });
+      console.log(`🔧 Migrated session: ${phone}`);
+    }
+    console.log(`📂 Loaded session: ${phone} | name=${session.leadData?.name} | current=${session.leadData?.currentCountry} | target=${session.leadData?.targetCountry} | askedExtra=${session.askedAdditionalInfo} | leadCollected=${session.leadCollected}`);
   }
   return session;
 }
@@ -675,6 +687,9 @@ app.post('/webhook', async (req, res) => {
 
     const reply = await getClaudeReply(session, rawMsg);
     await sendWhatsAppMessage(phone, reply);
+
+    // ── DEBUG: log what was extracted ────────
+    console.log(`📊 Lead state: name=${session.leadData.name} | current=${session.leadData.currentCountry} | target=${session.leadData.targetCountry} | service=${session.leadData.serviceNeeded} | askedExtra=${session.askedAdditionalInfo} | coreComplete=${isLeadCoreComplete(session.leadData)}`);
 
     // ── CORE LEAD DONE → ask additional info ──
     if (!session.askedAdditionalInfo && isLeadCoreComplete(session.leadData)) {
