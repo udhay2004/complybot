@@ -342,125 +342,165 @@ function wantsHuman(msg) {
 // ─────────────────────────────────────────────
 function extractLeadData(session, userMessage) {
   const lead = session.leadData;
-  const msg  = userMessage.toLowerCase();
+  const msg  = userMessage.toLowerCase().trim();
 
   // ── Name ──────────────────────────────────
-  // Match "my name is X" stopping at "and/from/,/i " etc
-  const nameMatch = userMessage.match(/(?:my name is|i am|i'm|this is|name[:\-\s]+)\s*([A-Za-z]+(?:\s+[A-Za-z]+){0,2}?)(?:\s+(?:and|from|i |,|\.|I want|based|looking)|$)/i)
-    || userMessage.match(/(?:my name is|i am|i'm|this is)\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,2})/i)
-    || userMessage.match(/^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})[,\s]/);
-  if (nameMatch && !lead.name) {
-    const candidate = (nameMatch[1] || '').trim();
-    const skipWords = [
-      'based','from','india','uae','uk','usa','hi','hello','hey','yes','no',
-      'sir','madam','canada','singapore','vietnam','dubai','there','glad','happy',
-      'great','good','fine','well','not','just','and','the','for','with'
+  if (!lead.name) {
+    const namePatterns = [
+      /(?:my name is|name is|i'm|i am|this is|call me)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+){0,2})/i,
+      /^([a-zA-Z]+(?:\s+[a-zA-Z]+){1,2})\s*(?:here|,|$)/i,
     ];
-    const words = candidate.split(' ');
-    // Filter out trailing skip words (e.g. "stefan and" → "stefan")
-    while (words.length > 0 && skipWords.includes(words[words.length-1].toLowerCase())) {
-      words.pop();
-    }
-    const cleanName = words.join(' ').trim();
-    if (cleanName.length > 1 && !skipWords.includes(cleanName.toLowerCase())) {
-      lead.name = cleanName.charAt(0).toUpperCase() + cleanName.slice(1);
-      console.log(`📝 Name: ${lead.name}`);
+    const skipWords = new Set([
+      'based','from','india','uae','uk','usa','hi','hello','hey','yes','no',
+      'sir','madam','canada','singapore','vietnam','dubai','indonesia','there',
+      'glad','happy','great','good','fine','well','not','just','and','the',
+      'for','with','want','expand','going','looking','please','thanks'
+    ]);
+    for (const pat of namePatterns) {
+      const m = userMessage.match(pat);
+      if (m) {
+        const words = m[1].trim().split(/\s+/);
+        while (words.length > 0 && skipWords.has(words[words.length-1].toLowerCase())) words.pop();
+        const name = words.join(' ').trim();
+        if (name.length > 1 && !skipWords.has(name.toLowerCase())) {
+          lead.name = name.charAt(0).toUpperCase() + name.slice(1).toLowerCase()
+            .replace(/\b\w/g, c => c.toUpperCase());
+          console.log("📝 Name:", lead.name);
+          break;
+        }
+      }
     }
   }
 
   const countries = [
-    'vietnam','india','uae','dubai','abu dhabi','usa','united states','uk','united kingdom',
-    'singapore','hong kong','canada','netherlands','saudi arabia','mauritius',
-    'egypt','nigeria','indonesia','thailand','malaysia','philippines','germany',
-    'france','italy','spain','portugal','ireland','luxembourg','cyprus','malta',
-    'bahrain','kuwait','oman','qatar','gcc'
+    'vietnam','india','uae','dubai','abu dhabi','usa','united states','america',
+    'uk','united kingdom','britain','england','singapore','hong kong','canada',
+    'netherlands','holland','saudi arabia','saudi','mauritius','egypt','nigeria',
+    'indonesia','thailand','malaysia','philippines','germany','france','italy',
+    'spain','portugal','ireland','luxembourg','cyprus','malta','bahrain',
+    'kuwait','oman','qatar','bangladesh','pakistan','sri lanka','nepal'
   ];
 
-  // Keywords that clearly indicate EXPANSION (target country)
+  const countryMap = {
+    'dubai': 'UAE', 'abu dhabi': 'UAE', 'america': 'USA', 'united states': 'USA',
+    'britain': 'UK', 'england': 'UK', 'united kingdom': 'UK', 'holland': 'Netherlands',
+    'saudi': 'Saudi Arabia'
+  };
+
+  // Strong expansion signals
   const expansionKw = [
-    'expand to','expand in','open in','setup in','set up in','register in',
-    'incorporate in','start in','launch in','move to','going to','want in',
-    'looking at','considering','choose','between','option'
+    'expand to','expand in','expanding to','expanding in',
+    'open in','open a','opening in',
+    'setup in','set up in','setting up in',
+    'register in','registering in',
+    'incorporate in','incorporating in',
+    'start in','starting in','launch in',
+    'move to','moving to','relocate to',
+    'want to expand','want to go','want in','want to open',
+    'looking to expand','looking to open','looking to setup',
+    'planning to expand','planning to open',
+    'i mean','i meant'
   ];
 
-  // Keywords that clearly indicate CURRENT location
+  // Strong current location signals
   const currentKw = [
-    'based in','currently in','i am in','i\'m in','living in','located in',
-    'from','i represent','our company is in','we are in','we\'re in'
+    'based in','i am based','currently based',
+    'i'm in','i am in','currently in',
+    'living in','located in','residing in',
+    'i'm from','i am from','we are from',
+    'our office is','our company is in','we operate from'
   ];
 
-  const isCurrentMsg  = currentKw.some(k => msg.includes(k));
-  const isExpansionMsg = expansionKw.some(k => msg.includes(k));
+  const isExpansion = expansionKw.some(k => msg.includes(k));
+  const isCurrent   = currentKw.some(k => msg.includes(k));
 
-  if (isExpansionMsg && !isCurrentMsg) {
-    // This message is about where they WANT to go
-    for (const c of countries) {
-      if (msg.includes(c) && !lead.targetCountry) {
-        lead.targetCountry = capitalize(c);
-        console.log(`📝 Target: ${lead.targetCountry}`);
-        break;
+  for (const c of countries) {
+    if (!msg.includes(c)) continue;
+    const mapped = countryMap[c] || capitalize(c);
+
+    if (isExpansion && !isCurrent && !lead.targetCountry) {
+      lead.targetCountry = mapped;
+      console.log("📝 Target:", lead.targetCountry);
+      break;
+    } else if (isCurrent && !isExpansion && !lead.currentCountry) {
+      lead.currentCountry = mapped;
+      console.log("📝 Current:", lead.currentCountry);
+      break;
+    } else if (!isExpansion && !isCurrent) {
+      // Ambiguous: fill whichever is empty, prioritise current first
+      if (!lead.currentCountry) {
+        lead.currentCountry = mapped;
+        console.log("📝 Current (inferred):", lead.currentCountry);
+      } else if (!lead.targetCountry) {
+        lead.targetCountry = mapped;
+        console.log("📝 Target (inferred):", lead.targetCountry);
       }
-    }
-  } else if (isCurrentMsg && !isExpansionMsg) {
-    // This message is about where they ARE
-    for (const c of countries) {
-      if (msg.includes(c) && !lead.currentCountry) {
-        lead.currentCountry = capitalize(c);
-        console.log(`📝 Current: ${lead.currentCountry}`);
-        break;
+      break;
+    } else if (isExpansion && isCurrent) {
+      // Both signals in same message — pick target
+      if (!lead.targetCountry) {
+        lead.targetCountry = mapped;
+        console.log("📝 Target (mixed msg):", lead.targetCountry);
       }
-    }
-  } else if (!isCurrentMsg && !isExpansionMsg) {
-    // Ambiguous — only set currentCountry if not yet captured
-    for (const c of countries) {
-      if (msg.includes(c)) {
-        if (!lead.currentCountry) {
-          lead.currentCountry = capitalize(c);
-          console.log(`📝 Current (inferred): ${lead.currentCountry}`);
-        }
-        break;
-      }
+      break;
     }
   }
 
-  // ── Service ───────────────────────────────
+  // ── Service — wider keyword net ───────────
   if (!lead.serviceNeeded) {
-    if      (msg.includes('company') || msg.includes('incorporat') || msg.includes('formation')) lead.serviceNeeded = 'Company Formation';
-    else if (msg.includes('bank') || msg.includes('account'))                                    lead.serviceNeeded = 'Banking Setup';
-    else if (msg.includes('tax') || msg.includes('vat') || msg.includes('gst'))                 lead.serviceNeeded = 'Tax Compliance';
-    else if (msg.includes('fema') || msg.includes('rbi'))                                        lead.serviceNeeded = 'FEMA & Investment';
-    else if (msg.includes('visa') || msg.includes('residency') || msg.includes('golden'))       lead.serviceNeeded = 'Residency / Golden Visa';
-    else if (msg.includes('annual') || msg.includes('maintenance'))                              lead.serviceNeeded = 'Annual Maintenance';
-    if (lead.serviceNeeded) console.log(`📝 Service: ${lead.serviceNeeded}`);
+    if (msg.match(/compan|incorporat|formation|register|llc|llp|pvt|entity|business setup|establish/))
+      lead.serviceNeeded = 'Company Formation';
+    else if (msg.match(/bank|account|finance|payment|remit/))
+      lead.serviceNeeded = 'Banking Setup';
+    else if (msg.match(/tax|vat|gst|irs|filing|transfer pric/))
+      lead.serviceNeeded = 'Tax Compliance';
+    else if (msg.match(/fema|rbi|overseas invest|foreign invest/))
+      lead.serviceNeeded = 'FEMA & Investment';
+    else if (msg.match(/visa|residency|golden visa|pr |permanent resid/))
+      lead.serviceNeeded = 'Residency / Golden Visa';
+    else if (msg.match(/annual|maintenance|secretar|compliance|agent/))
+      lead.serviceNeeded = 'Annual Maintenance';
+    if (lead.serviceNeeded) console.log("📝 Service:", lead.serviceNeeded);
   }
 
-  // ── Business Stage ────────────────────────
+  // ── Business Stage — wider keyword net ────
   if (!lead.businessStage) {
-    if      (msg.includes('startup') || msg.includes('just started'))     lead.businessStage = 'Startup';
-    else if (msg.includes('freelancer') || msg.includes('consultant'))    lead.businessStage = 'Freelancer';
-    else if (msg.includes('sme') || msg.includes('small business'))       lead.businessStage = 'SME';
-    else if (msg.includes('established') || msg.includes('enterprise') || msg.includes('represent')) lead.businessStage = 'Established Company';
-    else if (msg.includes('it services') || msg.includes('software') || msg.includes('tech')) lead.businessStage = 'Tech Company';
-    if (lead.businessStage) console.log(`📝 Stage: ${lead.businessStage}`);
+    if (msg.match(/startup|start.?up|just start|new business|new company|early stage/))
+      lead.businessStage = 'Startup';
+    else if (msg.match(/freelanc|independ|consultant|solo/))
+      lead.businessStage = 'Freelancer';
+    else if (msg.match(/sme|small.?medium|small business|mid.?size/))
+      lead.businessStage = 'SME';
+    else if (msg.match(/established|enterprise|corporat|large|mnc|multinational/))
+      lead.businessStage = 'Established Company';
+    if (lead.businessStage) console.log("📝 Stage:", lead.businessStage);
   }
 
-  // ── Timeline ──────────────────────────────
+  // ── Timeline — catch "X months/weeks/years" ──
   if (!lead.timeline) {
-    if      (msg.includes('yesterday') || msg.includes('immediately') || msg.includes('asap') || msg.includes('urgent')) lead.timeline = 'Immediately';
-    else if (msg.includes('this month') || msg.includes('soon'))         lead.timeline = 'Within 1 month';
-    else if (msg.includes('next month') || msg.includes('1-2 months'))  lead.timeline = '1-2 months';
-    else if (msg.includes('3 months') || msg.includes('quarter'))       lead.timeline = '3 months';
-    else if (msg.includes('6 months'))                                   lead.timeline = '6 months';
-    if (lead.timeline) console.log(`📝 Timeline: ${lead.timeline}`);
+    const timeMatch = msg.match(/(\d+)\s*(?:month|week|year)/);
+    if (timeMatch) {
+      const n = parseInt(timeMatch[1]);
+      if (msg.includes('week'))       lead.timeline = n <= 2 ? 'Immediately' : 'Within 1 month';
+      else if (n <= 1)                 lead.timeline = 'Within 1 month';
+      else if (n <= 2)                 lead.timeline = '1-2 months';
+      else if (n <= 3)                 lead.timeline = '3 months';
+      else if (n <= 6)                 lead.timeline = '6 months';
+      else                             lead.timeline = '6+ months';
+    } else if (msg.match(/yesterday|immediately|asap|urgent|right now|today/)) {
+      lead.timeline = 'Immediately';
+    } else if (msg.match(/this month|soon|shortly|quickly/)) {
+      lead.timeline = 'Within 1 month';
+    }
+    if (lead.timeline) console.log("📝 Timeline:", lead.timeline);
   }
 
   // ── Additional Info ───────────────────────
-  // Capture anything said AFTER the bot asked for additional info
   if (session.askedAdditionalInfo && !lead.additionalInfo && userMessage.trim().length > 2) {
-    const noInfoPhrases = ['no','nope','nothing','that\'s all','thats all','no thanks','not really','all good','nah'];
-    const isNegative = noInfoPhrases.some(p => msg.trim() === p || msg.trim().startsWith(p + ' '));
+    const noInfoPhrases = ['no','nope','nothing','thats all','that\'s all','no thanks','not really','all good','nah','nothing else','no more','none'];
+    const isNegative = noInfoPhrases.some(p => msg === p || msg.startsWith(p + ' ') || msg.startsWith(p + ','));
     lead.additionalInfo = isNegative ? 'None' : userMessage.trim();
-    console.log(`📝 Additional info: ${lead.additionalInfo}`);
+    console.log("📝 Additional info:", lead.additionalInfo);
   }
 }
 
@@ -468,14 +508,14 @@ function capitalize(str) {
   return str.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 }
 
-// Lead is "ready to log" only after additional info step is done
+// Lead is "ready to log" — needs name, both countries, and additional info answered
 function isLeadComplete(lead) {
-  return !!(lead.name && lead.currentCountry && lead.targetCountry && lead.serviceNeeded && lead.additionalInfo);
+  return !!(lead.name && lead.currentCountry && lead.targetCountry && lead.additionalInfo);
 }
 
-// Lead has core info — ready to ask additional info question
+// Core lead ready — needs name + both countries (service is nice to have but not a blocker)
 function isLeadCoreComplete(lead) {
-  return !!(lead.name && lead.currentCountry && lead.targetCountry && lead.serviceNeeded);
+  return !!(lead.name && lead.currentCountry && lead.targetCountry);
 }
 
 async function generateSummary(history) {
