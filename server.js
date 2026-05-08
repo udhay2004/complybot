@@ -3,7 +3,6 @@ const path = require('path');
 const fetch = require('node-fetch');
 const { MongoClient } = require('mongodb');
 const { google } = require('googleapis');
-const nodemailer = require('nodemailer');
 require('dotenv').config();
 
 const app = express();
@@ -18,17 +17,16 @@ const ANTHROPIC_API_KEY  = (process.env.ANTHROPIC_API_KEY  || '').replace(/['"` 
 const MONGODB_URI        = process.env.MONGODB_URI         || '';
 const GOOGLE_SHEET_ID    = process.env.GOOGLE_SHEET_ID     || '';
 const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS  || ''; // JSON string
-const SMTP_USER          = process.env.SMTP_USER           || '';
-const SMTP_PASS          = process.env.SMTP_PASS           || '';
+const RESEND_API_KEY     = (process.env.RESEND_API_KEY     || '').replace(/['"` \n\r]/g, '');
 const NOTIFY_EMAIL       = process.env.NOTIFY_EMAIL        || 'udhaymarwah96@gmail.com';
+const FROM_EMAIL         = process.env.FROM_EMAIL          || 'Comply Bot <onboarding@resend.dev>';
 
 [
   ['INTERAKT_API_KEY',  INTERAKT_API_KEY],
   ['ANTHROPIC_API_KEY', ANTHROPIC_API_KEY],
   ['MONGODB_URI',       MONGODB_URI],
   ['GOOGLE_SHEET_ID',   GOOGLE_SHEET_ID],
-  ['SMTP_USER',         SMTP_USER],
-  ['SMTP_PASS',         SMTP_PASS],
+  ['RESEND_API_KEY',    RESEND_API_KEY],
 ].forEach(([k, v]) => {
   if (!v) console.error(`❌ ${k} missing!`);
   else    console.log(`✅ ${k} loaded`);
@@ -49,7 +47,7 @@ async function connectMongo() {
     sessionsCol = db.collection('sessions');
     leadsCol    = db.collection('leads');
     await sessionsCol.createIndex({ phone: 1 }, { unique: true });
-    await sessionsCol.createIndex({ lastActive: 1 }, { expireAfterSeconds: 86400 }); // auto-expire 24h
+    await sessionsCol.createIndex({ lastActive: 1 }, { expireAfterSeconds: 86400 });
     console.log('✅ MongoDB connected');
   } catch (err) {
     console.error('❌ MongoDB connection failed:', err.message);
@@ -64,7 +62,6 @@ async function getSession(phone) {
     await sessionsCol.insertOne(session);
     console.log(`🆕 New session: ${phone}`);
   } else {
-    // Migrate old sessions missing new fields
     let dirty = false;
     if (session.askedAdditionalInfo === undefined) { session.askedAdditionalInfo = false; dirty = true; }
     if (session.leadData && session.leadData.additionalInfo === undefined) { session.leadData.additionalInfo = null; dirty = true; }
@@ -119,7 +116,6 @@ async function appendToSheet(leadData, conversationSummary) {
       conversationSummary     || '',
     ];
 
-    // Check if header row exists; if not, add it
     const existing = await sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
       range: 'Sheet1!A1:A1',
@@ -146,27 +142,41 @@ async function appendToSheet(leadData, conversationSummary) {
 }
 
 // ─────────────────────────────────────────────
-// EMAIL (nodemailer via Gmail)
+// EMAIL (Resend — HTTPS, no SMTP ports)
 // ─────────────────────────────────────────────
-function createTransporter() {
-  return nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
+async function sendEmail({ subject, html }) {
+  if (!RESEND_API_KEY) {
+    console.warn('⚠️ RESEND_API_KEY missing — skipping email');
+    return;
+  }
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: FROM_EMAIL,
+      to: [NOTIFY_EMAIL],
+      subject,
+      html,
+    }),
   });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Resend API error: ${err}`);
+  }
+  return res.json();
 }
 
 async function sendHumanHandoffEmail(phone, leadData, lastMessages) {
-  if (!SMTP_USER || !SMTP_PASS) return;
   try {
-    const transporter = createTransporter();
     const chatPreview = lastMessages
       .slice(-6)
       .map(m => `${m.role === 'user' ? '👤 Customer' : '🤖 Bot'}: ${m.content}`)
       .join('\n\n');
 
-    await transporter.sendMail({
-      from: `"Comply Bot" <${SMTP_USER}>`,
-      to: NOTIFY_EMAIL,
+    await sendEmail({
       subject: `🚨 Human Takeover Requested — ${leadData.name || phone}`,
       html: `
         <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
@@ -199,12 +209,8 @@ async function sendHumanHandoffEmail(phone, leadData, lastMessages) {
 }
 
 async function sendLeadCapturedEmail(leadData) {
-  if (!SMTP_USER || !SMTP_PASS) return;
   try {
-    const transporter = createTransporter();
-    await transporter.sendMail({
-      from: `"Comply Bot" <${SMTP_USER}>`,
-      to: NOTIFY_EMAIL,
+    await sendEmail({
       subject: `✅ New Lead Captured — ${leadData.name || leadData.phone}`,
       html: `
         <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
@@ -372,7 +378,6 @@ function extractLeadData(session, userMessage) {
   const lead = session.leadData;
   const msg  = userMessage.toLowerCase().trim();
 
-  // ── Name ──────────────────────────────────
   if (!lead.name) {
     const namePatterns = [
       /(?:my name is|name is|i'm|i am|this is|call me)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+){0,2})/i,
@@ -415,7 +420,6 @@ function extractLeadData(session, userMessage) {
     'saudi': 'Saudi Arabia'
   };
 
-  // Strong expansion signals
   const expansionKw = [
     'expand to','expand in','expanding to','expanding in',
     'open in','open a','opening in',
@@ -430,7 +434,6 @@ function extractLeadData(session, userMessage) {
     'i mean','i meant'
   ];
 
-  // Strong current location signals
   const currentKw = [
     'based in','i am based','currently based',
     "i'm in",'i am in','currently in',
@@ -455,7 +458,6 @@ function extractLeadData(session, userMessage) {
       console.log("📝 Current:", lead.currentCountry);
       break;
     } else if (!isExpansion && !isCurrent) {
-      // Ambiguous: fill whichever is empty, prioritise current first
       if (!lead.currentCountry) {
         lead.currentCountry = mapped;
         console.log("📝 Current (inferred):", lead.currentCountry);
@@ -465,7 +467,6 @@ function extractLeadData(session, userMessage) {
       }
       break;
     } else if (isExpansion && isCurrent) {
-      // Both signals in same message — pick target
       if (!lead.targetCountry) {
         lead.targetCountry = mapped;
         console.log("📝 Target (mixed msg):", lead.targetCountry);
@@ -474,7 +475,6 @@ function extractLeadData(session, userMessage) {
     }
   }
 
-  // ── Service — wider keyword net ───────────
   if (!lead.serviceNeeded) {
     if (msg.match(/compan|incorporat|formation|register|llc|llp|pvt|entity|business setup|establish/))
       lead.serviceNeeded = 'Company Formation';
@@ -491,7 +491,6 @@ function extractLeadData(session, userMessage) {
     if (lead.serviceNeeded) console.log("📝 Service:", lead.serviceNeeded);
   }
 
-  // ── Business Stage — wider keyword net ────
   if (!lead.businessStage) {
     if (msg.match(/startup|start.?up|just start|new business|new company|early stage/))
       lead.businessStage = 'Startup';
@@ -504,7 +503,6 @@ function extractLeadData(session, userMessage) {
     if (lead.businessStage) console.log("📝 Stage:", lead.businessStage);
   }
 
-  // ── Timeline — catch "X months/weeks/years" ──
   if (!lead.timeline) {
     const timeMatch = msg.match(/(\d+)\s*(?:month|week|year)/);
     if (timeMatch) {
@@ -523,7 +521,6 @@ function extractLeadData(session, userMessage) {
     if (lead.timeline) console.log("📝 Timeline:", lead.timeline);
   }
 
-  // ── Additional Info ───────────────────────
   if (session.askedAdditionalInfo && !lead.additionalInfo && userMessage.trim().length > 2) {
     const noInfoPhrases = ['no','nope','nothing','thats all','that\'s all','no thanks','not really','all good','nah','nothing else','no more','none'];
     const isNegative = noInfoPhrases.some(p => msg === p || msg.startsWith(p + ' ') || msg.startsWith(p + ','));
@@ -536,12 +533,10 @@ function capitalize(str) {
   return str.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 }
 
-// Lead is "ready to log" — needs name, both countries, and additional info answered
 function isLeadComplete(lead) {
   return !!(lead.name && lead.currentCountry && lead.targetCountry && lead.additionalInfo);
 }
 
-// Core lead ready — needs name + both countries (service is nice to have but not a blocker)
 function isLeadCoreComplete(lead) {
   return !!(lead.name && lead.currentCountry && lead.targetCountry);
 }
@@ -576,7 +571,6 @@ async function getClaudeReply(session, userMessage) {
   session.history.push({ role: 'user', content: userMessage });
   if (session.history.length > 30) session.history = session.history.slice(-30);
 
-  // isReturning = session existed before this message (has prior history or lead data)
   const hasHistory = session.history.length > 1;
   const hasData = !!(session.leadData.name || session.leadData.currentCountry);
   const isReturning = hasHistory || hasData;
@@ -676,7 +670,6 @@ app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (body.type !== 'message_received') return;
 
-    // Keep full phone number as received from Interakt (includes country code)
     const phone = (body.data?.customer?.phone_number || '').replace(/^\+/, '').replace(/\D/g, '');
     const rawMsg = body.data?.message?.message || '';
     if (!phone || !rawMsg) return;
@@ -685,13 +678,11 @@ app.post('/webhook', async (req, res) => {
 
     const session = await getSession(phone);
 
-    // ── HUMAN MODE: bot stays silent ──────────
     if (session.humanMode) {
       console.log(`🧑 Human mode active for ${phone} — bot silent`);
       return;
     }
 
-    // ── HUMAN HANDOFF REQUESTED ───────────────
     if (wantsHuman(rawMsg)) {
       console.log(`🙋 Human requested by ${phone}`);
       session.humanMode = true;
@@ -703,7 +694,6 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // ── NORMAL FLOW ───────────────────────────
     extractLeadData(session, rawMsg);
 
     console.log(`📊 Lead: name=${session.leadData.name} | from=${session.leadData.currentCountry} | to=${session.leadData.targetCountry} | service=${session.leadData.serviceNeeded} | askedExtra=${session.askedAdditionalInfo} | collected=${session.leadCollected}`);
@@ -711,20 +701,17 @@ app.post('/webhook', async (req, res) => {
     const reply = await getClaudeReply(session, rawMsg);
     await sendWhatsAppMessage(phone, reply);
 
-    // ── CORE LEAD DONE → ask additional info (only once) ──
     if (!session.askedAdditionalInfo && !session.leadCollected && isLeadCoreComplete(session.leadData)) {
       session.askedAdditionalInfo = true;
-      const additionalQ = "One last thing before I connect you with our expert — is there anything specific you'd like them to know? Any additional details, questions, or requirements? 📋\n\n(Reply \'no\' if nothing else)";
+      const additionalQ = "One last thing before I connect you with our expert — is there anything specific you'd like them to know? Any additional details, questions, or requirements? 📋\n\n(Reply 'no' if nothing else)";
       console.log(`💬 Asking additional info for ${phone}`);
       await sendWhatsAppMessage(phone, additionalQ);
       session.history.push({ role: 'assistant', content: additionalQ });
       await saveSession(session);
-      return; // Stop here, wait for their reply
+      return;
     }
 
-    // ── ADDITIONAL INFO RECEIVED → finalize lead ──────────
     if (session.askedAdditionalInfo && !session.leadCollected) {
-      // Whatever they reply now is their additional info (if not already captured)
       if (!session.leadData.additionalInfo) {
         const noInfoPhrases = ['no','nope','nothing','thats all','no thanks','not really','none','nah','nothing else','no more'];
         const isNo = noInfoPhrases.some(p => rawMsg.toLowerCase().trim() === p || rawMsg.toLowerCase().trim().startsWith(p + ' '));
@@ -732,7 +719,6 @@ app.post('/webhook', async (req, res) => {
         console.log(`📝 Additional info captured: ${session.leadData.additionalInfo}`);
       }
 
-      // Now save everything
       session.leadCollected = true;
       console.log(`🎯 Lead complete for ${phone}! Saving...`);
       const summary = await generateSummary(session.history);
@@ -766,8 +752,6 @@ app.post('/webhook', async (req, res) => {
 // ─────────────────────────────────────────────
 // HUMAN CONTROL ENDPOINTS
 // ─────────────────────────────────────────────
-
-// Resume bot for a user (after human is done)
 app.post('/resume-bot/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   const session = await getSession(phone);
@@ -777,14 +761,12 @@ app.post('/resume-bot/:phone', async (req, res) => {
   res.json({ success: true, message: `Bot resumed for ${phone}` });
 });
 
-// Check human mode status
 app.get('/status/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   const session = await getSession(phone);
   res.json({ phone, humanMode: session.humanMode, leadData: session.leadData });
 });
 
-// View all leads
 app.get('/leads', async (req, res) => {
   if (!leadsCol) return res.json([]);
   const leads = await leadsCol.find({}).sort({ completedAt: -1 }).limit(100).toArray();
@@ -815,10 +797,11 @@ app.post('/chat', async (req, res) => {
   }
 });
 
-// Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
 
-// ── DEBUG: Test Google Sheets connection directly ──────────
+// ─────────────────────────────────────────────
+// DEBUG ENDPOINTS
+// ─────────────────────────────────────────────
 app.get('/debug-sheets', async (req, res) => {
   const results = { env: {}, parseOk: false, authOk: false, writeOk: false, error: null };
   results.env.GOOGLE_SHEET_ID = GOOGLE_SHEET_ID ? '✅ set' : '❌ missing';
@@ -840,14 +823,12 @@ app.get('/debug-sheets', async (req, res) => {
     const sheets = google.sheets({ version: 'v4', auth });
     results.authOk = true;
 
-    // Try to read the sheet first
     const readRes = await sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
       range: 'Sheet1!A1:A1',
     });
     results.sheetReadOk = true;
 
-    // Try to write a test row
     await sheets.spreadsheets.values.append({
       spreadsheetId: GOOGLE_SHEET_ID,
       range: 'Sheet1!A1',
@@ -864,7 +845,19 @@ app.get('/debug-sheets', async (req, res) => {
   res.json(results);
 });
 
-// ── Force-log a specific session to sheet ─────────────────
+// ── Test email directly ────────────────────────────────────
+app.get('/debug-email', async (req, res) => {
+  try {
+    await sendEmail({
+      subject: '✅ Resend test — Comply Bot',
+      html: '<p>If you see this, Resend email is working correctly! 🎉</p>'
+    });
+    res.json({ success: true, message: `Test email sent to ${NOTIFY_EMAIL}` });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
 app.get('/force-sheet/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   const session = await getSession(phone);
@@ -878,23 +871,21 @@ app.get('/force-sheet/:phone', async (req, res) => {
     res.json({ error: err.message });
   }
 });
-// ── Clear/reset a single session ──────────────────────────
+
 app.get('/clear-session/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   try {
     if (sessionsCol) {
       await sessionsCol.deleteOne({ phone });
-      // Also try with 91 prefix and without
       const alt = phone.startsWith('91') ? phone.slice(2) : '91' + phone;
       await sessionsCol.deleteOne({ phone: alt });
     }
-    res.json({ success: true, message: `Session cleared for ${phone} (and ${phone.startsWith('91') ? phone.slice(2) : '91' + phone}). Fresh start on next message.` });
+    res.json({ success: true, message: `Session cleared for ${phone}. Fresh start on next message.` });
   } catch (err) {
     res.json({ error: err.message });
   }
 });
 
-// ── Reset ALL sessions (nuclear option) ───────────────────
 app.get('/reset-all-sessions', async (req, res) => {
   try {
     if (sessionsCol) {
@@ -922,6 +913,7 @@ connectMongo().then(() => {
     console.log(`💬 Test chat:   POST /chat`);
     console.log(`▶️  Resume bot:  POST /resume-bot/:phone`);
     console.log(`📊 Leads:       GET  /leads`);
-    console.log(`❤️  Health:      GET  /health\n`);
+    console.log(`❤️  Health:      GET  /health`);
+    console.log(`📧 Test email:  GET  /debug-email\n`);
   });
 });
