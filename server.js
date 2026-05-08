@@ -259,12 +259,13 @@ COUNTRIES SERVED:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 CONTEXT-AWARE BEHAVIOUR
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-You maintain full memory of everything said in this conversation. Use it actively:
-- Once you know their current country → tailor answers to their local regulations
-- Once you know their target country → focus all suggestions on that jurisdiction
-- Once you know their business stage → adjust tone and depth accordingly
-- Never re-ask for information already given
+You have persistent memory of every customer. Use it actively:
+- If customer context is injected below → they are a KNOWN customer. Greet them by name.
+- If marked RETURNING CUSTOMER → acknowledge their previous interaction naturally.
+- Never re-ask for information already in the context.
+- If they say their expert hasn't called → apologise, reassure, and say the team will follow up.
 - Reference their details naturally: "Since you're in India expanding to UAE…"
+- If someone claims to be a teammate/colleague of a known customer → treat them as a new contact, collect their details separately.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 LEAD COLLECTION GOALS
@@ -272,9 +273,9 @@ LEAD COLLECTION GOALS
 Naturally collect these through conversation (never ask all at once):
 ✅ Full Name | ✅ Current Country | ✅ Target Country | ✅ Service Needed | ✅ Business Stage | ✅ Timeline
 
-Once you have Name + Current Country + Target Country + Service Needed → say:
-"Thank you [Name]! 🎉 Our expert will review your requirements and reach out to you on this WhatsApp number shortly."
-Do NOT ask for additional info yourself — the system will handle that separately.
+Once you have Name + Current Country + Target Country → give a helpful summary of next steps and say:
+"Our expert will review your requirements and reach out to you on this WhatsApp number shortly. 🎉"
+Do NOT ask for additional info yourself — the system sends that question automatically after you finish.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 HUMAN HANDOFF
@@ -322,17 +323,32 @@ function freshSession(phone) {
   };
 }
 
-function buildContextSummary(leadData) {
-  const parts = [];
-  if (leadData.name)           parts.push(`Customer name: ${leadData.name}`);
-  if (leadData.currentCountry) parts.push(`Based in: ${leadData.currentCountry}`);
-  if (leadData.targetCountry)  parts.push(`Wants to expand to: ${leadData.targetCountry}`);
-  if (leadData.serviceNeeded)  parts.push(`Service interested in: ${leadData.serviceNeeded}`);
-  if (leadData.businessStage)  parts.push(`Business stage: ${leadData.businessStage}`);
-  if (leadData.timeline)       parts.push(`Timeline: ${leadData.timeline}`);
-  return parts.length > 0
-    ? `\n\n[CUSTOMER CONTEXT SO FAR: ${parts.join(' | ')}]`
-    : '';
+function buildContextSummary(leadData, isReturning, leadCollected) {
+  const known = [];
+  if (leadData.name)           known.push(`Name: ${leadData.name}`);
+  if (leadData.currentCountry) known.push(`Based in: ${leadData.currentCountry}`);
+  if (leadData.targetCountry)  known.push(`Target country: ${leadData.targetCountry}`);
+  if (leadData.serviceNeeded)  known.push(`Service: ${leadData.serviceNeeded}`);
+  if (leadData.businessStage)  known.push(`Business stage: ${leadData.businessStage}`);
+  if (leadData.timeline)       known.push(`Timeline: ${leadData.timeline}`);
+  if (leadData.additionalInfo) known.push(`Additional info: ${leadData.additionalInfo}`);
+
+  if (known.length === 0) return '';
+
+  let ctx = '\n\n';
+  if (isReturning && leadData.name) {
+    ctx += `[RETURNING CUSTOMER — This phone number belongs to ${leadData.name}. `;
+    ctx += `They have spoken with us before. Greet them warmly by name. `;
+    ctx += `Do NOT ask for information you already have. `;
+    if (leadCollected) {
+      ctx += `Their requirements have already been submitted to our experts. `;
+      ctx += `If they are following up, acknowledge their previous request and reassure them an expert will be in touch. `;
+    }
+    ctx += `Known details: ${known.join(' | ')}]`;
+  } else {
+    ctx += `[CUSTOMER CONTEXT: ${known.join(' | ')}]`;
+  }
+  return ctx;
 }
 
 // ─────────────────────────────────────────────
@@ -560,7 +576,12 @@ async function getClaudeReply(session, userMessage) {
   session.history.push({ role: 'user', content: userMessage });
   if (session.history.length > 30) session.history = session.history.slice(-30);
 
-  const systemWithContext = SYSTEM_PROMPT + buildContextSummary(session.leadData);
+  // isReturning = session existed before this message (has prior history or lead data)
+  const hasHistory = session.history.length > 1;
+  const hasData = !!(session.leadData.name || session.leadData.currentCountry);
+  const isReturning = hasHistory || hasData;
+
+  const systemWithContext = SYSTEM_PROMPT + buildContextSummary(session.leadData, isReturning, session.leadCollected);
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -685,35 +706,54 @@ app.post('/webhook', async (req, res) => {
     // ── NORMAL FLOW ───────────────────────────
     extractLeadData(session, rawMsg);
 
+    console.log(`📊 Lead: name=${session.leadData.name} | from=${session.leadData.currentCountry} | to=${session.leadData.targetCountry} | service=${session.leadData.serviceNeeded} | askedExtra=${session.askedAdditionalInfo} | collected=${session.leadCollected}`);
+
     const reply = await getClaudeReply(session, rawMsg);
     await sendWhatsAppMessage(phone, reply);
 
-    // ── DEBUG: log what was extracted ────────
-    console.log(`📊 Lead state: name=${session.leadData.name} | current=${session.leadData.currentCountry} | target=${session.leadData.targetCountry} | service=${session.leadData.serviceNeeded} | askedExtra=${session.askedAdditionalInfo} | coreComplete=${isLeadCoreComplete(session.leadData)}`);
-
-    // ── CORE LEAD DONE → ask additional info ──
-    if (!session.askedAdditionalInfo && isLeadCoreComplete(session.leadData)) {
+    // ── CORE LEAD DONE → ask additional info (only once) ──
+    if (!session.askedAdditionalInfo && !session.leadCollected && isLeadCoreComplete(session.leadData)) {
       session.askedAdditionalInfo = true;
+      const additionalQ = "One last thing before I connect you with our expert — is there anything specific you'd like them to know? Any additional details, questions, or requirements? 📋\n\n(Reply \'no\' if nothing else)";
       console.log(`💬 Asking additional info for ${phone}`);
-      const additionalQ = "Before I hand you over to our expert — is there anything else you'd like them to know? Any specific requirements, questions, or details you'd like to share? 📋";
       await sendWhatsAppMessage(phone, additionalQ);
       session.history.push({ role: 'assistant', content: additionalQ });
+      await saveSession(session);
+      return; // Stop here, wait for their reply
     }
 
-    // ── LEAD FULLY COMPLETE → log everything ──
-    const wasComplete = session.leadCollected;
-    if (!wasComplete && isLeadComplete(session.leadData)) {
+    // ── ADDITIONAL INFO RECEIVED → finalize lead ──────────
+    if (session.askedAdditionalInfo && !session.leadCollected) {
+      // Whatever they reply now is their additional info (if not already captured)
+      if (!session.leadData.additionalInfo) {
+        const noInfoPhrases = ['no','nope','nothing','thats all','no thanks','not really','none','nah','nothing else','no more'];
+        const isNo = noInfoPhrases.some(p => rawMsg.toLowerCase().trim() === p || rawMsg.toLowerCase().trim().startsWith(p + ' '));
+        session.leadData.additionalInfo = isNo ? 'None' : rawMsg.trim();
+        console.log(`📝 Additional info captured: ${session.leadData.additionalInfo}`);
+      }
+
+      // Now save everything
       session.leadCollected = true;
-      console.log(`🎯 Lead complete for ${phone}`);
+      console.log(`🎯 Lead complete for ${phone}! Saving...`);
       const summary = await generateSummary(session.history);
-      // Log to sheet with verbose error output
       try {
         await appendToSheet(session.leadData, summary);
+        console.log('✅ Sheet updated');
       } catch (sheetErr) {
-        console.error('❌ Sheet append failed:', sheetErr.message);
+        console.error('❌ Sheet error:', sheetErr.message);
       }
-      await saveLead({ ...session.leadData, summary, completedAt: new Date() });
-      await sendLeadCapturedEmail(session.leadData);
+      try {
+        await saveLead({ ...session.leadData, summary, completedAt: new Date() });
+        console.log('✅ MongoDB lead saved');
+      } catch (dbErr) {
+        console.error('❌ DB save error:', dbErr.message);
+      }
+      try {
+        await sendLeadCapturedEmail(session.leadData);
+        console.log('✅ Email sent');
+      } catch (emailErr) {
+        console.error('❌ Email error:', emailErr.message);
+      }
     }
 
     await saveSession(session);
@@ -838,12 +878,31 @@ app.get('/force-sheet/:phone', async (req, res) => {
     res.json({ error: err.message });
   }
 });
-// ── Clear/reset a session (fixes stuck old sessions) ──────
+// ── Clear/reset a single session ──────────────────────────
 app.get('/clear-session/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   try {
-    if (sessionsCol) await sessionsCol.deleteOne({ phone });
-    res.json({ success: true, message: `Session cleared for ${phone}. Fresh start on next message.` });
+    if (sessionsCol) {
+      await sessionsCol.deleteOne({ phone });
+      // Also try with 91 prefix and without
+      const alt = phone.startsWith('91') ? phone.slice(2) : '91' + phone;
+      await sessionsCol.deleteOne({ phone: alt });
+    }
+    res.json({ success: true, message: `Session cleared for ${phone} (and ${phone.startsWith('91') ? phone.slice(2) : '91' + phone}). Fresh start on next message.` });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
+// ── Reset ALL sessions (nuclear option) ───────────────────
+app.get('/reset-all-sessions', async (req, res) => {
+  try {
+    if (sessionsCol) {
+      const result = await sessionsCol.deleteMany({});
+      res.json({ success: true, deleted: result.deletedCount, message: 'All sessions cleared.' });
+    } else {
+      res.json({ error: 'No DB connection' });
+    }
   } catch (err) {
     res.json({ error: err.message });
   }
