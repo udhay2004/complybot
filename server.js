@@ -558,7 +558,9 @@ async function sendTemplate(phone) {
     method: 'POST',
     headers: { Authorization: `Basic ${INTERAKT_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      countryCode: '+91', phoneNumber: phone, callbackData: 'template_fallback',
+      countryCode: '+91',
+      phoneNumber: phone.startsWith('91') ? phone.slice(2) : phone,
+      callbackData: 'template_fallback',
       type: 'Template', template: { name: 'welcome_reply', languageCode: 'en' }
     })
   }).catch(e => console.error('❌ Template error:', e.message));
@@ -573,7 +575,9 @@ async function sendWhatsAppMessage(phone, text) {
       method: 'POST',
       headers: { Authorization: `Basic ${INTERAKT_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        countryCode: '+91', phoneNumber: phone, callbackData: 'bot_reply',
+        countryCode: '+91',
+        phoneNumber: phone.startsWith('91') ? phone.slice(2) : phone,
+        callbackData: 'bot_reply',
         type: 'Text', data: { message: text }
       })
     });
@@ -599,9 +603,8 @@ app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (body.type !== 'message_received') return;
 
-    // Normalize phone: strip +, keep digits, ensure country code included
-    const rawPhone = (body.data?.customer?.phone_number || '').replace(/^\+/, '').replace(/\D/g, '');
-    const phone = rawPhone.length === 10 ? '91' + rawPhone : rawPhone;
+    // Keep full phone number as received from Interakt (includes country code)
+    const phone = (body.data?.customer?.phone_number || '').replace(/^\+/, '').replace(/\D/g, '');
     const rawMsg = body.data?.message?.message || '';
     if (!phone || !rawMsg) return;
 
