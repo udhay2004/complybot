@@ -943,6 +943,24 @@ app.get('/reset-all-sessions', async (req, res) => {
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 // ─────────────────────────────────────────────
+// KEEP-ALIVE (prevents Render free-tier spin-down)
+// ─────────────────────────────────────────────
+const KEEP_ALIVE_URL      = process.env.KEEP_ALIVE_URL || `${BASE_URL}/health`;
+const KEEP_ALIVE_INTERVAL = 14 * 60 * 1000; // 14 min — Render spins down after 15m
+
+function startKeepAlive() {
+  console.log(`💓 Keep-alive enabled → pinging ${KEEP_ALIVE_URL} every 14 min`);
+  setInterval(async () => {
+    try {
+      const res = await fetch(KEEP_ALIVE_URL);
+      console.log(`💓 Keep-alive ping OK [${res.status}] — ${new Date().toISOString()}`);
+    } catch (err) {
+      console.error(`💔 Keep-alive ping FAILED: ${err.message}`);
+    }
+  }, KEEP_ALIVE_INTERVAL);
+}
+
+// ─────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
@@ -956,5 +974,6 @@ connectMongo().then(() => {
     console.log(`📊 Leads:       GET  /leads`);
     console.log(`❤️  Health:      GET  /health`);
     console.log(`📧 Test email:  GET  /debug-email\n`);
+    startKeepAlive(); // ← only addition here
   });
 });
