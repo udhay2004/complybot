@@ -19,7 +19,7 @@ const GOOGLE_SHEET_ID    = process.env.GOOGLE_SHEET_ID     || '';
 const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS  || ''; // JSON string
 const RESEND_API_KEY     = (process.env.RESEND_API_KEY     || '').replace(/['"` \n\r]/g, '');
 const NOTIFY_EMAIL       = process.env.NOTIFY_EMAIL        || 'udhaymarwah96@gmail.com';
-const FROM_EMAIL         = process.env.FROM_EMAIL          || 'Comply Bot <onboarding@resend.dev>';
+const FROM_EMAIL         = process.env.FROM_EMAIL          || 'onboarding@resend.dev';
 const BASE_URL           = process.env.BASE_URL            || 'https://complybot.onrender.com';
 const HUMAN_TIMEOUT_MS   = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000'); // 2 hours default
 
@@ -144,32 +144,59 @@ async function appendToSheet(leadData, conversationSummary) {
 }
 
 // ─────────────────────────────────────────────
-// EMAIL (Resend — HTTPS, no SMTP ports)
+// EMAIL (Resend — with better error logging)
 // ─────────────────────────────────────────────
 async function sendEmail({ subject, html }) {
   if (!RESEND_API_KEY) {
     console.warn('⚠️ RESEND_API_KEY missing — skipping email');
-    return;
+    return { success: false, error: 'No API key' };
   }
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${RESEND_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: FROM_EMAIL,
-      to: [NOTIFY_EMAIL],
-      subject,
-      html,
-    }),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Resend API error: ${err}`);
+  
+  if (!NOTIFY_EMAIL) {
+    console.warn('⚠️ NOTIFY_EMAIL missing — skipping email');
+    return { success: false, error: 'No recipient email' };
   }
-  return res.json();
+
+  console.log(`📧 Attempting to send email to ${NOTIFY_EMAIL}...`);
+  
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: FROM_EMAIL,
+        to: [NOTIFY_EMAIL],
+        subject: subject,
+        html: html,
+      }),
+    });
+    
+    const responseText = await res.text();
+    let responseJson;
+    try {
+      responseJson = JSON.parse(responseText);
+    } catch (e) {
+      responseJson = { raw: responseText };
+    }
+    
+    if (!res.ok) {
+      console.error('❌ Resend API error:', res.status, responseJson);
+      throw new Error(`Resend API error (${res.status}): ${responseText}`);
+    }
+    
+    console.log('✅ Email sent successfully:', responseJson.id || 'sent');
+    return { success: true, id: responseJson.id };
+    
+  } catch (err) {
+    console.error('❌ Email send error:', err.message);
+    // Don't throw - just log and return failure
+    return { success: false, error: err.message };
+  }
 }
+
 
 async function sendHumanHandoffEmail(phone, leadData, lastMessages) {
   try {
@@ -887,15 +914,38 @@ app.get('/debug-sheets', async (req, res) => {
 });
 
 // ── Test email directly ────────────────────────────────────
+// ── Test email with detailed response ────────────────────
 app.get('/debug-email', async (req, res) => {
+  const result = {
+    timestamp: new Date().toISOString(),
+    config: {
+      hasResendKey: !!RESEND_API_KEY,
+      resendKeyPrefix: RESEND_API_KEY ? RESEND_API_KEY.substring(0, 8) + '...' : 'missing',
+      notifyEmail: NOTIFY_EMAIL,
+      fromEmail: FROM_EMAIL,
+    },
+    sendResult: null,
+    error: null
+  };
+  
   try {
-    await sendEmail({
-      subject: '✅ Resend test — Comply Bot',
-      html: '<p>If you see this, Resend email is working correctly! 🎉</p>'
+    const sendResult = await sendEmail({
+      subject: '✅ Comply Bot - Email Test',
+      html: `
+        <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+          <h2 style="color:#166534">Email Working! 🎉</h2>
+          <p>This test email was sent at: ${new Date().toLocaleString()}</p>
+          <p>Your Comply Globally bot emails should now work.</p>
+          <hr>
+          <p style="color:#666;font-size:12px">If you see this, Resend is configured correctly.</p>
+        </div>
+      `
     });
-    res.json({ success: true, message: `Test email sent to ${NOTIFY_EMAIL}` });
+    result.sendResult = sendResult;
+    res.json(result);
   } catch (err) {
-    res.json({ success: false, error: err.message });
+    result.error = err.message;
+    res.status(500).json(result);
   }
 });
 
