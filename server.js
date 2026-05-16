@@ -65,14 +65,17 @@ async function getSession(phone) {
     console.log(`🆕 New session: ${phone}`);
   } else {
     let dirty = false;
-    if (session.askedAdditionalInfo === undefined) { session.askedAdditionalInfo = false; dirty = true; }
+    if (session.askedAdditionalInfo === undefined)              { session.askedAdditionalInfo = false; dirty = true; }
+    // NEW: track whether we asked additional info before handoff
+    if (session.askedHandoffAdditionalInfo === undefined)       { session.askedHandoffAdditionalInfo = false; dirty = true; }
+    if (session.pendingHumanHandoff === undefined)              { session.pendingHumanHandoff = false; dirty = true; }
     if (session.leadData && session.leadData.additionalInfo === undefined) { session.leadData.additionalInfo = null; dirty = true; }
-    if (session.humanMode === undefined) { session.humanMode = false; dirty = true; }
+    if (session.humanMode === undefined)                        { session.humanMode = false; dirty = true; }
     if (dirty) {
       await sessionsCol.replaceOne({ phone }, session, { upsert: true });
       console.log(`🔧 Migrated session: ${phone}`);
     }
-    console.log(`📂 Loaded session: ${phone} | name=${session.leadData?.name} | current=${session.leadData?.currentCountry} | target=${session.leadData?.targetCountry} | askedExtra=${session.askedAdditionalInfo} | leadCollected=${session.leadCollected}`);
+    console.log(`📂 Loaded session: ${phone} | name=${session.leadData?.name} | current=${session.leadData?.currentCountry} | target=${session.leadData?.targetCountry} | askedExtra=${session.askedAdditionalInfo} | leadCollected=${session.leadCollected} | pendingHandoff=${session.pendingHumanHandoff}`);
   }
   return session;
 }
@@ -85,6 +88,8 @@ async function saveSession(session) {
 
 async function saveLead(leadData) {
   if (!leadsCol) return;
+  // Always stamp source so CRM dashboard knows where this lead came from
+  leadData.source = leadData.source || 'whatsapp';
   await leadsCol.replaceOne({ phone: leadData.phone }, leadData, { upsert: true });
 }
 
@@ -144,21 +149,19 @@ async function appendToSheet(leadData, conversationSummary) {
 }
 
 // ─────────────────────────────────────────────
-// EMAIL (Resend — with better error logging)
+// EMAIL
 // ─────────────────────────────────────────────
 async function sendEmail({ subject, html }) {
   if (!RESEND_API_KEY) {
     console.warn('⚠️ RESEND_API_KEY missing — skipping email');
     return { success: false, error: 'No API key' };
   }
-  
   if (!NOTIFY_EMAIL) {
     console.warn('⚠️ NOTIFY_EMAIL missing — skipping email');
     return { success: false, error: 'No recipient email' };
   }
 
   console.log(`📧 Attempting to send email to ${NOTIFY_EMAIL}...`);
-  
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -173,30 +176,23 @@ async function sendEmail({ subject, html }) {
         html: html,
       }),
     });
-    
+
     const responseText = await res.text();
     let responseJson;
-    try {
-      responseJson = JSON.parse(responseText);
-    } catch (e) {
-      responseJson = { raw: responseText };
-    }
-    
+    try { responseJson = JSON.parse(responseText); }
+    catch (e) { responseJson = { raw: responseText }; }
+
     if (!res.ok) {
       console.error('❌ Resend API error:', res.status, responseJson);
       throw new Error(`Resend API error (${res.status}): ${responseText}`);
     }
-    
     console.log('✅ Email sent successfully:', responseJson.id || 'sent');
     return { success: true, id: responseJson.id };
-    
   } catch (err) {
     console.error('❌ Email send error:', err.message);
-    // Don't throw - just log and return failure
     return { success: false, error: err.message };
   }
 }
-
 
 async function sendHumanHandoffEmail(phone, leadData, lastMessages) {
   try {
@@ -228,6 +224,7 @@ async function sendHumanHandoffEmail(phone, leadData, lastMessages) {
               <tr><td style="padding:6px;color:#666">Service</td><td style="padding:6px">${leadData.serviceNeeded || '—'}</td></tr>
               <tr><td style="padding:6px;color:#666">Stage</td><td style="padding:6px">${leadData.businessStage || '—'}</td></tr>
               <tr><td style="padding:6px;color:#666">Timeline</td><td style="padding:6px">${leadData.timeline || '—'}</td></tr>
+              <tr><td style="padding:6px;color:#666">Additional Info</td><td style="padding:6px">${leadData.additionalInfo || '—'}</td></tr>
             </table>
             <h3>Last 6 Messages</h3>
             <pre style="background:#fff;border:1px solid #ddd;padding:12px;border-radius:4px;white-space:pre-wrap;font-size:13px">${chatPreview}</pre>
@@ -265,6 +262,7 @@ async function sendLeadCapturedEmail(leadData) {
               <tr><td style="padding:6px;color:#666">Service</td><td style="padding:6px">${leadData.serviceNeeded || '—'}</td></tr>
               <tr><td style="padding:6px;color:#666">Stage</td><td style="padding:6px">${leadData.businessStage || '—'}</td></tr>
               <tr><td style="padding:6px;color:#666">Timeline</td><td style="padding:6px">${leadData.timeline || '—'}</td></tr>
+              <tr><td style="padding:6px;color:#666">Additional Info</td><td style="padding:6px">${leadData.additionalInfo || '—'}</td></tr>
             </table>
             <p style="margin-top:16px;color:#888;font-size:12px">This lead has also been logged to your Google Sheet.</p>
           </div>
@@ -363,6 +361,9 @@ function freshSession(phone) {
     leadCollected: false,
     humanMode: false,
     askedAdditionalInfo: false,
+    // NEW: tracks the two-step human handoff flow
+    pendingHumanHandoff: false,
+    askedHandoffAdditionalInfo: false,
     createdAt: new Date(),
     lastActive: new Date()
   };
@@ -560,11 +561,20 @@ function extractLeadData(session, userMessage) {
     if (lead.timeline) console.log("📝 Timeline:", lead.timeline);
   }
 
+  // Capture additional info for the normal lead flow
   if (session.askedAdditionalInfo && !lead.additionalInfo && userMessage.trim().length > 2) {
     const noInfoPhrases = ['no','nope','nothing','thats all','that\'s all','no thanks','not really','all good','nah','nothing else','no more','none'];
     const isNegative = noInfoPhrases.some(p => msg === p || msg.startsWith(p + ' ') || msg.startsWith(p + ','));
     lead.additionalInfo = isNegative ? 'None' : userMessage.trim();
-    console.log("📝 Additional info:", lead.additionalInfo);
+    console.log("📝 Additional info (lead flow):", lead.additionalInfo);
+  }
+
+  // Capture additional info for the human handoff flow
+  if (session.askedHandoffAdditionalInfo && !lead.additionalInfo && userMessage.trim().length > 2) {
+    const noInfoPhrases = ['no','nope','nothing','thats all','that\'s all','no thanks','not really','all good','nah','nothing else','no more','none'];
+    const isNegative = noInfoPhrases.some(p => msg === p || msg.startsWith(p + ' ') || msg.startsWith(p + ','));
+    lead.additionalInfo = isNegative ? 'None' : userMessage.trim();
+    console.log("📝 Additional info (handoff flow):", lead.additionalInfo);
   }
 }
 
@@ -657,21 +667,11 @@ async function getClaudeReply(session, userMessage) {
 
 // ─────────────────────────────────────────────
 // INTERAKT: SEND TEXT
+// NOTE: sendTemplate() has been REMOVED intentionally.
+// The old welcome template is no longer used now that the chatbot
+// handles all first-contact conversations. Sending the template
+// as a fallback was causing unexpected messages to customers.
 // ─────────────────────────────────────────────
-async function sendTemplate(phone) {
-  if (!INTERAKT_API_KEY) return;
-  await fetch('https://api.interakt.ai/v1/public/message/', {
-    method: 'POST',
-    headers: { Authorization: `Basic ${INTERAKT_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      countryCode: '+91',
-      phoneNumber: phone.startsWith('91') ? phone.slice(2) : phone,
-      callbackData: 'template_fallback',
-      type: 'Template', template: { name: 'welcome_reply', languageCode: 'en' }
-    })
-  }).catch(e => console.error('❌ Template error:', e.message));
-}
-
 async function sendWhatsAppMessage(phone, text) {
   console.log('🤖 BOT:', text);
   if (!INTERAKT_API_KEY) { console.warn('⚠️ No Interakt key'); return; }
@@ -689,13 +689,42 @@ async function sendWhatsAppMessage(phone, text) {
     });
     const txt = await res.text();
     if (!res.ok) {
-      console.error('❌ Interakt error:', txt);
-      if (txt.includes('24 hours')) await sendTemplate(phone);
+      // ⚠️  Template fallback REMOVED — if the 24-hour window has passed,
+      // Interakt will reject the message. Log the error and do nothing else.
+      // Your human team should re-initiate contact through Interakt directly.
+      console.error('❌ Interakt error (message not delivered):', txt);
     } else {
       console.log('✅ Message sent');
     }
   } catch (err) {
     console.error('❌ Send error:', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// SAVE LEAD HELPER (used in both flows)
+// ─────────────────────────────────────────────
+async function finalizeLead(session) {
+  session.leadCollected = true;
+  console.log(`🎯 Lead complete for ${session.phone}! Saving...`);
+  const summary = await generateSummary(session.history);
+  try {
+    await appendToSheet(session.leadData, summary);
+    console.log('✅ Sheet updated');
+  } catch (sheetErr) {
+    console.error('❌ Sheet error:', sheetErr.message);
+  }
+  try {
+    await saveLead({ ...session.leadData, source: 'whatsapp', summary, completedAt: new Date() });
+    console.log('✅ MongoDB lead saved');
+  } catch (dbErr) {
+    console.error('❌ DB save error:', dbErr.message);
+  }
+  try {
+    await sendLeadCapturedEmail(session.leadData);
+    console.log('✅ Lead email sent');
+  } catch (emailErr) {
+    console.error('❌ Email error:', emailErr.message);
   }
 }
 
@@ -717,15 +746,15 @@ app.post('/webhook', async (req, res) => {
 
     const session = await getSession(phone);
 
+    // ── Auto-resume check ──────────────────────
     if (session.humanMode) {
-      // ── Auto-resume check ──────────────────────
       const handoffAge = Date.now() - new Date(session.humanModeAt || 0).getTime();
       if (handoffAge >= HUMAN_TIMEOUT_MS) {
         console.log(`⏰ Human timeout reached for ${phone} — auto-resuming bot`);
         session.humanMode = false;
         session.humanModeAt = null;
         await saveSession(session);
-        // Fall through to normal bot flow below
+        // Fall through to normal bot flow
       } else {
         const remainingMins = Math.ceil((HUMAN_TIMEOUT_MS - handoffAge) / 60000);
         console.log(`🧑 Human mode active for ${phone} — bot silent (auto-resumes in ~${remainingMins}m)`);
@@ -733,18 +762,57 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    if (wantsHuman(rawMsg)) {
-      console.log(`🙋 Human requested by ${phone}`);
+    // ── STEP 2 of human handoff: receive additional info, then hand off ──
+    // The customer already said they want a human. We asked for extra info.
+    // Now we receive their reply and complete the handoff.
+    if (session.pendingHumanHandoff && session.askedHandoffAdditionalInfo) {
+      console.log(`📝 Receiving handoff additional info for ${phone}`);
+      extractLeadData(session, rawMsg); // This captures additionalInfo via askedHandoffAdditionalInfo flag
+
+      // Confirm to customer
+      const handoffMsg = "Of course! 🙏 I'm connecting you to one of our experts right now. They'll reach out to you on this WhatsApp number shortly. Please hold on!";
+      await sendWhatsAppMessage(phone, handoffMsg);
+      session.history.push({ role: 'assistant', content: handoffMsg });
+
+      // Activate human mode
       session.humanMode = true;
       session.humanModeAt = new Date();
-      const reply = "Of course! 🙏 I'm connecting you to one of our experts right now. They'll reach out to you on this WhatsApp number shortly. Please hold on!";
-      await sendWhatsAppMessage(phone, reply);
-      session.history.push({ role: 'assistant', content: reply });
+      session.pendingHumanHandoff = false;
+
+      // Save lead to MongoDB + Sheet + email (even if not fully complete)
+      if (!session.leadCollected) {
+        await finalizeLead(session);
+      }
+
+      // Send handoff email to team
       await sendHumanHandoffEmail(phone, session.leadData, session.history);
       await saveSession(session);
       return;
     }
 
+    // ── STEP 1 of human handoff: customer says "connect me to a human" ──
+    if (wantsHuman(rawMsg)) {
+      console.log(`🙋 Human requested by ${phone} — asking additional info first`);
+
+      // Ask for any additional info before connecting
+      const additionalQ = `Before I connect you to our expert, is there anything specific you'd like them to know? 📋
+
+For example: preferred meeting time, number of team members joining, specific questions, or any other details.
+
+(Reply 'no' if nothing else)`;
+
+      await sendWhatsAppMessage(phone, additionalQ);
+      session.history.push({ role: 'assistant', content: additionalQ });
+
+      // Mark that we're in a pending handoff state
+      session.pendingHumanHandoff = true;
+      session.askedHandoffAdditionalInfo = true;
+
+      await saveSession(session);
+      return;
+    }
+
+    // ── Normal bot flow ──
     extractLeadData(session, rawMsg);
 
     console.log(`📊 Lead: name=${session.leadData.name} | from=${session.leadData.currentCountry} | to=${session.leadData.targetCountry} | service=${session.leadData.serviceNeeded} | askedExtra=${session.askedAdditionalInfo} | collected=${session.leadCollected}`);
@@ -752,6 +820,7 @@ app.post('/webhook', async (req, res) => {
     const reply = await getClaudeReply(session, rawMsg);
     await sendWhatsAppMessage(phone, reply);
 
+    // Ask additional info once core lead is complete (normal flow, not handoff)
     if (!session.askedAdditionalInfo && !session.leadCollected && isLeadCoreComplete(session.leadData)) {
       session.askedAdditionalInfo = true;
       const additionalQ = "One last thing before I connect you with our expert — is there anything specific you'd like them to know? Any additional details, questions, or requirements? 📋\n\n(Reply 'no' if nothing else)";
@@ -762,6 +831,7 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
+    // Receive additional info reply (normal flow) and finalize lead
     if (session.askedAdditionalInfo && !session.leadCollected) {
       if (!session.leadData.additionalInfo) {
         const noInfoPhrases = ['no','nope','nothing','thats all','no thanks','not really','none','nah','nothing else','no more'];
@@ -769,28 +839,7 @@ app.post('/webhook', async (req, res) => {
         session.leadData.additionalInfo = isNo ? 'None' : rawMsg.trim();
         console.log(`📝 Additional info captured: ${session.leadData.additionalInfo}`);
       }
-
-      session.leadCollected = true;
-      console.log(`🎯 Lead complete for ${phone}! Saving...`);
-      const summary = await generateSummary(session.history);
-      try {
-        await appendToSheet(session.leadData, summary);
-        console.log('✅ Sheet updated');
-      } catch (sheetErr) {
-        console.error('❌ Sheet error:', sheetErr.message);
-      }
-      try {
-        await saveLead({ ...session.leadData, summary, completedAt: new Date() });
-        console.log('✅ MongoDB lead saved');
-      } catch (dbErr) {
-        console.error('❌ DB save error:', dbErr.message);
-      }
-      try {
-        await sendLeadCapturedEmail(session.leadData);
-        console.log('✅ Email sent');
-      } catch (emailErr) {
-        console.error('❌ Email error:', emailErr.message);
-      }
+      await finalizeLead(session);
     }
 
     await saveSession(session);
@@ -813,7 +862,6 @@ app.post('/resume-bot/:phone', async (req, res) => {
   res.json({ success: true, message: `Bot resumed for ${phone}` });
 });
 
-// GET version so the email button works directly in browser
 app.get('/resume-bot/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   const session = await getSession(phone);
@@ -891,7 +939,7 @@ app.get('/debug-sheets', async (req, res) => {
     const sheets = google.sheets({ version: 'v4', auth });
     results.authOk = true;
 
-    const readRes = await sheets.spreadsheets.values.get({
+    await sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
       range: 'Sheet1!A1:A1',
     });
@@ -913,8 +961,6 @@ app.get('/debug-sheets', async (req, res) => {
   res.json(results);
 });
 
-// ── Test email directly ────────────────────────────────────
-// ── Test email with detailed response ────────────────────
 app.get('/debug-email', async (req, res) => {
   const result = {
     timestamp: new Date().toISOString(),
@@ -927,7 +973,7 @@ app.get('/debug-email', async (req, res) => {
     sendResult: null,
     error: null
   };
-  
+
   try {
     const sendResult = await sendEmail({
       subject: '✅ Comply Bot - Email Test',
@@ -956,7 +1002,7 @@ app.get('/force-sheet/:phone', async (req, res) => {
   try {
     const summary = await generateSummary(session.history);
     await appendToSheet(session.leadData, summary);
-    await saveLead({ ...session.leadData, summary, completedAt: new Date() });
+    await saveLead({ ...session.leadData, source: 'whatsapp', summary, completedAt: new Date() });
     res.json({ success: true, leadData: session.leadData, summary });
   } catch (err) {
     res.json({ error: err.message });
@@ -993,10 +1039,10 @@ app.get('/reset-all-sessions', async (req, res) => {
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 // ─────────────────────────────────────────────
-// KEEP-ALIVE (prevents Render free-tier spin-down)
+// KEEP-ALIVE
 // ─────────────────────────────────────────────
 const KEEP_ALIVE_URL      = process.env.KEEP_ALIVE_URL || `${BASE_URL}/health`;
-const KEEP_ALIVE_INTERVAL = 14 * 60 * 1000; // 14 min — Render spins down after 15m
+const KEEP_ALIVE_INTERVAL = 14 * 60 * 1000;
 
 function startKeepAlive() {
   console.log(`💓 Keep-alive enabled → pinging ${KEEP_ALIVE_URL} every 14 min`);
@@ -1024,6 +1070,6 @@ connectMongo().then(() => {
     console.log(`📊 Leads:       GET  /leads`);
     console.log(`❤️  Health:      GET  /health`);
     console.log(`📧 Test email:  GET  /debug-email\n`);
-    startKeepAlive(); // ← only addition here
+    startKeepAlive();
   });
 });
