@@ -9,6 +9,15 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Allow the CRM dashboard (served from any origin) to call this API
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 // ─────────────────────────────────────────────
 // ENV
 // ─────────────────────────────────────────────
@@ -1033,6 +1042,23 @@ app.get('/reset-all-sessions', async (req, res) => {
     }
   } catch (err) {
     res.json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// RESET LEADS — wipes all leads from MongoDB so the CRM starts fresh.
+// Sessions are kept intact so existing customers are still recognised.
+// Called by the CRM dashboard "Reset CRM" button.
+// ─────────────────────────────────────────────
+app.delete('/reset-leads', async (req, res) => {
+  try {
+    if (!leadsCol) return res.status(503).json({ error: 'No DB connection' });
+    const result = await leadsCol.deleteMany({});
+    console.log(`🗑️  CRM reset — ${result.deletedCount} leads deleted`);
+    res.json({ success: true, deleted: result.deletedCount, message: 'All leads cleared. CRM will now show only new leads going forward.' });
+  } catch (err) {
+    console.error('❌ Reset leads error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
