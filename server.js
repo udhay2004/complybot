@@ -64,6 +64,88 @@ async function connectMongo() {
     console.error('❌ MongoDB connection failed:', err.message);
   }
 }
+// ─────────────────────────────────────────────
+// DYNAMIC KNOWLEDGE BASE SELECTOR
+// Sends only relevant KB sections to stay under token limits
+// ─────────────────────────────────────────────
+function getRelevantKnowledge(session, userMessage) {
+  const msg = (userMessage + ' ' + (session.leadData.targetCountry || '')).toLowerCase();
+  
+  const sections = [];
+  
+  if (msg.match(/usa|america|united states|wyoming|delaware|florida|nevada|llc|c-corp|ein|form 5472/))
+    sections.push('USA');
+  if (msg.match(/fema|odi|rbi|apr|fla return|form oi|uin|lrs|compounding|ad bank/))
+    sections.push('FEMA');
+  if (msg.match(/canada|ontario|british columbia|cra|gst.*canada|sr&ed/))
+    sections.push('CANADA');
+  if (msg.match(/uk|united kingdom|britain|england|companies house|hmrc|vat.*uk/))
+    sections.push('UK');
+  if (msg.match(/singapore|acra|pte.*ltd|iras|cpf|mas/))
+    sections.push('SINGAPORE');
+  if (msg.match(/uae|dubai|abu dhabi|free zone|mainland.*uae|dmcc|difc|emara/))
+    sections.push('UAE');
+  if (msg.match(/philippines|peza|bir|sec.*phil|boi.*phil/))
+    sections.push('PHILIPPINES');
+  if (msg.match(/thailand|boi.*thai|fba|dbd|thai baht/))
+    sections.push('THAILAND');
+  if (msg.match(/estonia|e-residency|ou|acra.*estonia/))
+    sections.push('ESTONIA');
+  if (msg.match(/italy|srl|ires|irap|registro/))
+    sections.push('ITALY');
+  if (msg.match(/vietnam|acra.*viet|llc.*viet|vnd/))
+    sections.push('VIETNAM');
+  if (msg.match(/indonesia|pt pma|kbli|bkpm|oss/))
+    sections.push('INDONESIA');
+
+  // If nothing matched or it's a general question, send a compact summary
+  if (sections.length === 0) {
+    return `
+COMPLY GLOBALLY — QUICK REFERENCE:
+- 47+ jurisdictions: USA, Canada, UK, Singapore, UAE, Philippines, Thailand, Estonia, Italy, Vietnam, Indonesia, and more
+- Services: Company formation, Banking, Tax compliance, FEMA/ODI, EXIM, Investment Advisory, Residency/Golden Visas
+- For Indian founders: FEMA ODI compliance is mandatory before any overseas investment
+- USA top picks: Wyoming LLC ($62/yr) for most; Delaware C-Corp only for VC fundraising
+- UK: incorporate in 24hrs, £50, no resident director needed, no withholding tax on dividends  
+- Singapore: 17% CIT, no capital gains tax, needs 1 local resident director
+- UAE: 0% personal tax, mainland vs free zone is the key decision, 9% CIT above AED 375K
+- Canada: 15% federal CIT, 25% directors must be Canadian residents
+- Contact: sales@complyglobally.com | +1 (302) 214-1717 | +91 99999 81613
+`;
+  }
+
+  // Build relevant sections from the full KNOWLEDGE_BASE string
+  // Extract only matching country blocks
+  const relevantParts = [];
+  
+  const kbSections = {
+    'USA': extractKBSection('USA INCORPORATION', 'FEMA ODI'),
+    'FEMA': extractKBSection('FEMA ODI COMPLIANCE', 'CANADA'),
+    'CANADA': extractKBSection('CANADA', 'UNITED KINGDOM'),
+    'UK': extractKBSection('UNITED KINGDOM', 'SINGAPORE'),
+    'SINGAPORE': extractKBSection('SINGAPORE', 'UAE'),
+    'UAE': extractKBSection('UAE', 'DOCUMENTS REQUIRED'),
+    'PHILIPPINES': extractKBSection('PHILIPPINES', 'THAILAND'),
+    'THAILAND': extractKBSection('THAILAND', 'ESTONIA'),
+    'ESTONIA': extractKBSection('ESTONIA', 'ITALY'),
+    'ITALY': extractKBSection('ITALY', 'VIETNAM'),
+    'VIETNAM': extractKBSection('VIETNAM', 'INDONESIA'),
+    'INDONESIA': extractKBSection('INDONESIA', 'DOCUMENT REQUIREMENTS'),
+  };
+
+  for (const s of sections) {
+    if (kbSections[s]) relevantParts.push(kbSections[s]);
+  }
+
+  return relevantParts.join('\n\n');
+}
+
+function extractKBSection(startMarker, endMarker) {
+  const start = KNOWLEDGE_BASE.indexOf(startMarker);
+  if (start === -1) return '';
+  const end = endMarker ? KNOWLEDGE_BASE.indexOf(endMarker, start + startMarker.length) : KNOWLEDGE_BASE.length;
+  return KNOWLEDGE_BASE.slice(start, end === -1 ? undefined : end).trim();
+}
 
 async function getSession(phone) {
   if (!sessionsCol) return freshSession(phone);
@@ -74,19 +156,21 @@ async function getSession(phone) {
     await sessionsCol.insertOne(session);
     console.log(`🆕 New session: ${phone}`);
 
-    // Send welcome intro for brand new contacts
-    const introMsg = `👋 Welcome to *Comply Globally!*
+    const introMsg = `👋 Hi there! I'm *Compliance Advisor*, your Global Expansion Assistant from *Comply Globally*.
 
-I'm your AI-powered Global Expansion Advisor. We help businesses incorporate and expand across *47+ countries* — USA, UK, UAE, Singapore, Canada, and more.
+We specialize in:
+🏢 Foreign Corporation Formation
+🏦 Banking & Finance
+📊 International Tax & Secretarial Compliance
+🚢 EXIM & Trade
+💼 Investment Advisory
+🌏 Residency & Golden Visas
 
-🌍 *What can I help you with today?*
-- Company formation & incorporation
-- Banking & financial setup
-- Tax & compliance (FEMA, GST, VAT, IRS)
-- Residency & Golden Visas
-- Import/Export licensing
+We cover *47+ countries* worldwide — USA, UK, UAE, Singapore, Canada, Germany, and many more.
 
-Just tell me — *which country are you looking to expand to?* 🚀`;
+I'd love to help you expand globally! 🚀
+
+*Where are you currently based, and what should I call you?*`;
 
     await sendWhatsAppMessage(phone, introMsg);
     session.history.push({ role: 'assistant', content: introMsg });
@@ -2555,6 +2639,20 @@ function stripSuggestTopics(text) {
   return text.replace(/SUGGEST_TOPICS:\[.*?\]/gs, '').trim();
 }
 
+function formatSuggestTopicsForWhatsApp(text) {
+  const match = text.match(/SUGGEST_TOPICS:\[(.*?)\]/s);
+  if (!match) return stripSuggestTopics(text);
+
+  const cleanText = stripSuggestTopics(text);
+  
+  try {
+    const topics = JSON.parse('[' + match[1] + ']');
+    const numbered = topics.map((t, i) => `${i + 1}️⃣ ${t}`).join('\n');
+    return `${cleanText}\n\n*Quick replies — tap a number to ask:*\n${numbered}`;
+  } catch {
+    return cleanText;
+  }
+}
 // ─────────────────────────────────────────────
 // LEAD EXTRACTION
 // ─────────────────────────────────────────────
@@ -2764,13 +2862,17 @@ async function generateSummary(history) {
 // ─────────────────────────────────────────────
 async function getClaudeReply(session, userMessage) {
   session.history.push({ role: 'user', content: userMessage });
-  if (session.history.length > 30) session.history = session.history.slice(-30);
+  if (session.history.length > 20) session.history = session.history.slice(-20);
 
   const hasHistory = session.history.length > 1;
   const hasData = !!(session.leadData.name || session.leadData.currentCountry);
   const isReturning = hasHistory || hasData;
 
-  const systemWithContext = SYSTEM_PROMPT + buildContextSummary(session.leadData, isReturning, session.leadCollected);
+  // Use only relevant KB sections instead of the full 30K+ token KB
+  const relevantKB = getRelevantKnowledge(session, userMessage);
+  
+  const dynamicPrompt = SYSTEM_PROMPT.replace(KNOWLEDGE_BASE, relevantKB);
+  const systemWithContext = dynamicPrompt + buildContextSummary(session.leadData, isReturning, session.leadCollected);
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -2815,7 +2917,7 @@ async function getClaudeReply(session, userMessage) {
 // INTERAKT: SEND TEXT
 // ─────────────────────────────────────────────
 async function sendWhatsAppMessage(phone, text) {
-  const cleanText = stripSuggestTopics(text);  // ← STRIPS SUGGEST_TOPICS before sending
+  const cleanText = formatSuggestTopicsForWhatsApp(text);
   console.log('🤖 BOT:', cleanText);
   if (!INTERAKT_API_KEY) { console.warn('⚠️ No Interakt key'); return; }
 
