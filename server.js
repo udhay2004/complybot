@@ -2920,56 +2920,78 @@ async function sendWhatsAppMessage(phone, text) {
   console.log('🤖 BOT:', cleanText);
   if (!INTERAKT_API_KEY) { console.warn('⚠️ No Interakt key'); return; }
 
-  // Determine country code and local number from E.164-style phone string
+  // Interakt sometimes strips the country code from the stored phone number.
+  // This parser handles both cases: number WITH country code prefix, and WITHOUT.
   function parsePhone(rawPhone) {
-    // Common country code lengths: try longest match first
-    const countryCodes = [
-      { code: '1',   len: 1  }, // USA/Canada
-      { code: '44',  len: 2  }, // UK
-      { code: '91',  len: 2  }, // India
-      { code: '971', len: 3  }, // UAE
-      { code: '65',  len: 2  }, // Singapore
-      { code: '61',  len: 2  }, // Australia
-      { code: '49',  len: 2  }, // Germany
-      { code: '33',  len: 2  }, // France
-      { code: '39',  len: 2  }, // Italy
-      { code: '34',  len: 2  }, // Spain
-      { code: '55',  len: 2  }, // Brazil
-      { code: '52',  len: 2  }, // Mexico
-      { code: '966', len: 3  }, // Saudi Arabia
-      { code: '974', len: 3  }, // Qatar
-      { code: '973', len: 3  }, // Bahrain
-      { code: '968', len: 3  }, // Oman
-      { code: '965', len: 3  }, // Kuwait
-      { code: '60',  len: 2  }, // Malaysia
-      { code: '66',  len: 2  }, // Thailand
-      { code: '62',  len: 2  }, // Indonesia
-      { code: '63',  len: 2  }, // Philippines
-      { code: '84',  len: 2  }, // Vietnam
-      { code: '82',  len: 2  }, // South Korea
-      { code: '81',  len: 2  }, // Japan
-      { code: '64',  len: 2  }, // New Zealand
-      { code: '27',  len: 2  }, // South Africa
-      { code: '234', len: 3  }, // Nigeria
-      { code: '20',  len: 2  }, // Egypt
-      { code: '230', len: 3  }, // Mauritius
-    ];
+    // ── Numbers that already include country code (E.164 style) ──
 
-    // Try 3-digit codes first, then 2-digit, then 1-digit
-    const sorted = [...countryCodes].sort((a, b) => b.code.length - a.code.length);
-    for (const { code } of sorted) {
-      if (rawPhone.startsWith(code)) {
-        return {
-          countryCode: '+' + code,
-          phoneNumber: rawPhone.slice(code.length)
-        };
-      }
+    // 12 digits starting with 91 + Indian mobile (6-9) → India
+    if (/^91[6-9]\d{9}$/.test(rawPhone)) {
+      return { countryCode: '+91', phoneNumber: rawPhone.slice(2) };
     }
-    // Fallback: assume India
+    // 11 digits starting with 1 → US/Canada
+    if (/^1[2-9]\d{9}$/.test(rawPhone)) {
+      return { countryCode: '+1', phoneNumber: rawPhone.slice(1) };
+    }
+    // 12 digits starting with 971 → UAE
+    if (/^971[0-9]{9}$/.test(rawPhone)) {
+      return { countryCode: '+971', phoneNumber: rawPhone.slice(3) };
+    }
+    // 12 digits starting with 966 → Saudi Arabia
+    if (/^966[0-9]{9}$/.test(rawPhone)) {
+      return { countryCode: '+966', phoneNumber: rawPhone.slice(3) };
+    }
+    // 11 digits starting with 44 → UK (UK local numbers are 10 digits)
+    if (/^44[0-9]{10}$/.test(rawPhone)) {
+      return { countryCode: '+44', phoneNumber: rawPhone.slice(2) };
+    }
+    // 10 digits starting with 65 → Singapore (local numbers are 8 digits)
+    if (/^65[689][0-9]{7}$/.test(rawPhone)) {
+      return { countryCode: '+65', phoneNumber: rawPhone.slice(2) };
+    }
+    // 13 digits starting with 234 → Nigeria
+    if (/^234[0-9]{10}$/.test(rawPhone)) {
+      return { countryCode: '+234', phoneNumber: rawPhone.slice(3) };
+    }
+    // 13 digits starting with 230 → Mauritius
+    if (/^230[0-9]{8}$/.test(rawPhone)) {
+      return { countryCode: '+230', phoneNumber: rawPhone.slice(3) };
+    }
+
+    // ── Numbers WITHOUT country code (Interakt stripped it) ──
+
+    // 10 digits, Indian mobile range (starts 6-9) → India
+    if (/^[6-9]\d{9}$/.test(rawPhone)) {
+      return { countryCode: '+91', phoneNumber: rawPhone };
+    }
+    // 10 digits, NANP range (starts 2-9, valid area code) → US/Canada
+    if (/^[2-9]\d{9}$/.test(rawPhone)) {
+      return { countryCode: '+1', phoneNumber: rawPhone };
+    }
+    // 9 digits starting with 5 or 0 → UAE local
+    if (/^[05]\d{8}$/.test(rawPhone)) {
+      return { countryCode: '+971', phoneNumber: rawPhone };
+    }
+    // 8 digits starting with 6, 8, or 9 → Singapore local
+    if (/^[689]\d{7}$/.test(rawPhone)) {
+      return { countryCode: '+65', phoneNumber: rawPhone };
+    }
+    // 10 digits starting with 07 or 08 → UK local
+    if (/^0[78]\d{9}$/.test(rawPhone)) {
+      return { countryCode: '+44', phoneNumber: rawPhone };
+    }
+    // 11 digits starting with 08 → Nigeria local
+    if (/^0[789]\d{9}$/.test(rawPhone)) {
+      return { countryCode: '+234', phoneNumber: rawPhone };
+    }
+
+    // ── Fallback: assume India and log a warning ──
+    console.warn(`⚠️ parsePhone: unrecognised format for "${rawPhone}" — defaulting to +91`);
     return { countryCode: '+91', phoneNumber: rawPhone };
   }
 
   const { countryCode, phoneNumber } = parsePhone(phone);
+  console.log(`📞 Parsed: countryCode=${countryCode} phoneNumber=${phoneNumber} (raw: ${phone})`);
 
   try {
     const res = await fetch('https://api.interakt.ai/v1/public/message/', {
@@ -2979,12 +3001,14 @@ async function sendWhatsAppMessage(phone, text) {
         countryCode: countryCode,
         phoneNumber: phoneNumber,
         callbackData: 'bot_reply',
-        type: 'Text', data: { message: cleanText }
+        type: 'Text',
+        data: { message: cleanText }
       })
     });
     const txt = await res.text();
     if (!res.ok) {
       console.error('❌ Interakt error (message not delivered):', txt);
+      console.error(`   → countryCode=${countryCode} phoneNumber=${phoneNumber} raw=${phone}`);
     } else {
       console.log('✅ Message sent');
     }
