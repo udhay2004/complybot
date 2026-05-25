@@ -2920,13 +2920,64 @@ async function sendWhatsAppMessage(phone, text) {
   console.log('🤖 BOT:', cleanText);
   if (!INTERAKT_API_KEY) { console.warn('⚠️ No Interakt key'); return; }
 
+  // Determine country code and local number from E.164-style phone string
+  function parsePhone(rawPhone) {
+    // Common country code lengths: try longest match first
+    const countryCodes = [
+      { code: '1',   len: 1  }, // USA/Canada
+      { code: '44',  len: 2  }, // UK
+      { code: '91',  len: 2  }, // India
+      { code: '971', len: 3  }, // UAE
+      { code: '65',  len: 2  }, // Singapore
+      { code: '61',  len: 2  }, // Australia
+      { code: '49',  len: 2  }, // Germany
+      { code: '33',  len: 2  }, // France
+      { code: '39',  len: 2  }, // Italy
+      { code: '34',  len: 2  }, // Spain
+      { code: '55',  len: 2  }, // Brazil
+      { code: '52',  len: 2  }, // Mexico
+      { code: '966', len: 3  }, // Saudi Arabia
+      { code: '974', len: 3  }, // Qatar
+      { code: '973', len: 3  }, // Bahrain
+      { code: '968', len: 3  }, // Oman
+      { code: '965', len: 3  }, // Kuwait
+      { code: '60',  len: 2  }, // Malaysia
+      { code: '66',  len: 2  }, // Thailand
+      { code: '62',  len: 2  }, // Indonesia
+      { code: '63',  len: 2  }, // Philippines
+      { code: '84',  len: 2  }, // Vietnam
+      { code: '82',  len: 2  }, // South Korea
+      { code: '81',  len: 2  }, // Japan
+      { code: '64',  len: 2  }, // New Zealand
+      { code: '27',  len: 2  }, // South Africa
+      { code: '234', len: 3  }, // Nigeria
+      { code: '20',  len: 2  }, // Egypt
+      { code: '230', len: 3  }, // Mauritius
+    ];
+
+    // Try 3-digit codes first, then 2-digit, then 1-digit
+    const sorted = [...countryCodes].sort((a, b) => b.code.length - a.code.length);
+    for (const { code } of sorted) {
+      if (rawPhone.startsWith(code)) {
+        return {
+          countryCode: '+' + code,
+          phoneNumber: rawPhone.slice(code.length)
+        };
+      }
+    }
+    // Fallback: assume India
+    return { countryCode: '+91', phoneNumber: rawPhone };
+  }
+
+  const { countryCode, phoneNumber } = parsePhone(phone);
+
   try {
     const res = await fetch('https://api.interakt.ai/v1/public/message/', {
       method: 'POST',
       headers: { Authorization: `Basic ${INTERAKT_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        countryCode: '+91',
-        phoneNumber: phone.startsWith('91') ? phone.slice(2) : phone,
+        countryCode: countryCode,
+        phoneNumber: phoneNumber,
         callbackData: 'bot_reply',
         type: 'Text', data: { message: cleanText }
       })
