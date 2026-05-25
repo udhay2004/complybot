@@ -68,14 +68,33 @@ async function connectMongo() {
 async function getSession(phone) {
   if (!sessionsCol) return freshSession(phone);
   let session = await sessionsCol.findOne({ phone });
+
   if (!session) {
     session = freshSession(phone);
     await sessionsCol.insertOne(session);
     console.log(`🆕 New session: ${phone}`);
+
+    // Send welcome intro for brand new contacts
+    const introMsg = `👋 Welcome to *Comply Globally!*
+
+I'm your AI-powered Global Expansion Advisor. We help businesses incorporate and expand across *47+ countries* — USA, UK, UAE, Singapore, Canada, and more.
+
+🌍 *What can I help you with today?*
+- Company formation & incorporation
+- Banking & financial setup
+- Tax & compliance (FEMA, GST, VAT, IRS)
+- Residency & Golden Visas
+- Import/Export licensing
+
+Just tell me — *which country are you looking to expand to?* 🚀`;
+
+    await sendWhatsAppMessage(phone, introMsg);
+    session.history.push({ role: 'assistant', content: introMsg });
+    await sessionsCol.replaceOne({ phone }, session, { upsert: true });
+
   } else {
     let dirty = false;
     if (session.askedAdditionalInfo === undefined)              { session.askedAdditionalInfo = false; dirty = true; }
-    // NEW: track whether we asked additional info before handoff
     if (session.askedHandoffAdditionalInfo === undefined)       { session.askedHandoffAdditionalInfo = false; dirty = true; }
     if (session.pendingHumanHandoff === undefined)              { session.pendingHumanHandoff = false; dirty = true; }
     if (session.leadData && session.leadData.additionalInfo === undefined) { session.leadData.additionalInfo = null; dirty = true; }
@@ -1216,7 +1235,12 @@ ${KNOWLEDGE_BASE}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 FIRST MESSAGE BEHAVIOR (CRITICAL)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-The frontend already displays a greeting and introduction to the user before they type anything. Do NOT send any introduction or greeting message. Respond directly and substantively to whatever the user has written. Never open with "Hi there! I'm Comply..." or any variation of that intro.
+This bot runs on WhatsApp. New users receive an automated intro message before their first reply reaches you — so you will never need to introduce yourself or the company again. DO NOT re-introduce yourself or repeat what Comply Globally does.
+
+When a user sends a casual opener like "hello", "hi", or "what are you" — respond warmly and briefly, ask what country they're looking to expand to, and wait. Do NOT dump a wall of information unprompted. One short, friendly question is enough.
+
+Example of a good response to "hello":
+"Hi there! 👋 Which country are you looking to expand your business to? I can walk you through everything — incorporation, taxes, banking, and compliance."
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 INFORMATION GATHERING (NATURAL FLOW)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
