@@ -2475,7 +2475,6 @@ function freshSession(phone) {
     leadCollected: false,
     humanMode: false,
     askedAdditionalInfo: false,
-    // NEW: tracks the two-step human handoff flow
     pendingHumanHandoff: false,
     askedHandoffAdditionalInfo: false,
     createdAt: new Date(),
@@ -2523,6 +2522,13 @@ const HUMAN_TRIGGERS = [
 function wantsHuman(msg) {
   const lower = msg.toLowerCase();
   return HUMAN_TRIGGERS.some(t => lower.includes(t));
+}
+
+// ─────────────────────────────────────────────
+// STRIP SUGGEST TOPICS (NEW)
+// ─────────────────────────────────────────────
+function stripSuggestTopics(text) {
+  return text.replace(/SUGGEST_TOPICS:\[.*?\]/gs, '').trim();
 }
 
 // ─────────────────────────────────────────────
@@ -2675,7 +2681,6 @@ function extractLeadData(session, userMessage) {
     if (lead.timeline) console.log("📝 Timeline:", lead.timeline);
   }
 
-  // Capture additional info for the normal lead flow
   if (session.askedAdditionalInfo && !lead.additionalInfo && userMessage.trim().length > 2) {
     const noInfoPhrases = ['no','nope','nothing','thats all','that\'s all','no thanks','not really','all good','nah','nothing else','no more','none'];
     const isNegative = noInfoPhrases.some(p => msg === p || msg.startsWith(p + ' ') || msg.startsWith(p + ','));
@@ -2683,7 +2688,6 @@ function extractLeadData(session, userMessage) {
     console.log("📝 Additional info (lead flow):", lead.additionalInfo);
   }
 
-  // Capture additional info for the human handoff flow
   if (session.askedHandoffAdditionalInfo && !lead.additionalInfo && userMessage.trim().length > 2) {
     const noInfoPhrases = ['no','nope','nothing','thats all','that\'s all','no thanks','not really','all good','nah','nothing else','no more','none'];
     const isNegative = noInfoPhrases.some(p => msg === p || msg.startsWith(p + ' ') || msg.startsWith(p + ','));
@@ -2701,9 +2705,6 @@ function isLeadComplete(lead) {
 }
 
 function isLeadCoreComplete(lead) {
-  // Wait for all 6 fields before triggering the wrap-up and additional-info question.
-  // If a field is still null after the full conversation, we still proceed — the bot
-  // may have moved on when the customer declined to share it.
   const hasCore     = !!(lead.name && lead.currentCountry && lead.targetCountry);
   const hasService  = !!lead.serviceNeeded;
   const hasStage    = !!lead.businessStage;
@@ -2788,13 +2789,10 @@ async function getClaudeReply(session, userMessage) {
 
 // ─────────────────────────────────────────────
 // INTERAKT: SEND TEXT
-// NOTE: sendTemplate() has been REMOVED intentionally.
-// The old welcome template is no longer used now that the chatbot
-// handles all first-contact conversations. Sending the template
-// as a fallback was causing unexpected messages to customers.
 // ─────────────────────────────────────────────
 async function sendWhatsAppMessage(phone, text) {
-  console.log('🤖 BOT:', text);
+  const cleanText = stripSuggestTopics(text);  // ← STRIPS SUGGEST_TOPICS before sending
+  console.log('🤖 BOT:', cleanText);
   if (!INTERAKT_API_KEY) { console.warn('⚠️ No Interakt key'); return; }
 
   try {
@@ -2805,14 +2803,11 @@ async function sendWhatsAppMessage(phone, text) {
         countryCode: '+91',
         phoneNumber: phone.startsWith('91') ? phone.slice(2) : phone,
         callbackData: 'bot_reply',
-        type: 'Text', data: { message: text }
+        type: 'Text', data: { message: cleanText }
       })
     });
     const txt = await res.text();
     if (!res.ok) {
-      // ⚠️  Template fallback REMOVED — if the 24-hour window has passed,
-      // Interakt will reject the message. Log the error and do nothing else.
-      // Your human team should re-initiate contact through Interakt directly.
       console.error('❌ Interakt error (message not delivered):', txt);
     } else {
       console.log('✅ Message sent');
@@ -2823,7 +2818,7 @@ async function sendWhatsAppMessage(phone, text) {
 }
 
 // ─────────────────────────────────────────────
-// SAVE LEAD HELPER (used in both flows)
+// SAVE LEAD HELPER
 // ─────────────────────────────────────────────
 async function finalizeLead(session) {
   session.leadCollected = true;
@@ -2865,7 +2860,16 @@ app.post('/webhook', async (req, res) => {
 
     console.log(`\n📩 From ${phone}: "${rawMsg}"`);
 
+    // ── Check if brand new BEFORE getSession creates the record ──
+    const isNewUser = sessionsCol ? !(await sessionsCol.findOne({ phone })) : false;
+
     const session = await getSession(phone);
+
+    // ── New user: intro already sent inside getSession, skip Claude reply ──
+    if (isNewUser) {
+      await saveSession(session);
+      return;
+    }
 
     // ── Auto-resume check ──────────────────────
     if (session.humanMode) {
@@ -2875,7 +2879,6 @@ app.post('/webhook', async (req, res) => {
         session.humanMode = false;
         session.humanModeAt = null;
         await saveSession(session);
-        // Fall through to normal bot flow
       } else {
         const remainingMins = Math.ceil((HUMAN_TIMEOUT_MS - handoffAge) / 60000);
         console.log(`🧑 Human mode active for ${phone} — bot silent (auto-resumes in ~${remainingMins}m)`);
@@ -2883,39 +2886,32 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // ── STEP 2 of human handoff: receive additional info, then hand off ──
-    // The customer already said they want a human. We asked for extra info.
-    // Now we receive their reply and complete the handoff.
+    // ── STEP 2 of human handoff ──
     if (session.pendingHumanHandoff && session.askedHandoffAdditionalInfo) {
       console.log(`📝 Receiving handoff additional info for ${phone}`);
-      extractLeadData(session, rawMsg); // This captures additionalInfo via askedHandoffAdditionalInfo flag
+      extractLeadData(session, rawMsg);
 
-      // Confirm to customer
       const handoffMsg = "Of course! 🙏 I'm connecting you to one of our experts right now. They'll reach out to you on this WhatsApp number shortly. Please hold on!";
       await sendWhatsAppMessage(phone, handoffMsg);
       session.history.push({ role: 'assistant', content: handoffMsg });
 
-      // Activate human mode
       session.humanMode = true;
       session.humanModeAt = new Date();
       session.pendingHumanHandoff = false;
 
-      // Save lead to MongoDB + Sheet + email (even if not fully complete)
       if (!session.leadCollected) {
         await finalizeLead(session);
       }
 
-      // Send handoff email to team
       await sendHumanHandoffEmail(phone, session.leadData, session.history);
       await saveSession(session);
       return;
     }
 
-    // ── STEP 1 of human handoff: customer says "connect me to a human" ──
+    // ── STEP 1 of human handoff ──
     if (wantsHuman(rawMsg)) {
       console.log(`🙋 Human requested by ${phone} — asking additional info first`);
 
-      // Ask for any additional info before connecting
       const additionalQ = `Before I connect you to our expert, is there anything specific you'd like them to know? 📋
 
 For example: preferred meeting time, number of team members joining, specific questions, or any other details.
@@ -2925,7 +2921,6 @@ For example: preferred meeting time, number of team members joining, specific qu
       await sendWhatsAppMessage(phone, additionalQ);
       session.history.push({ role: 'assistant', content: additionalQ });
 
-      // Mark that we're in a pending handoff state
       session.pendingHumanHandoff = true;
       session.askedHandoffAdditionalInfo = true;
 
@@ -2941,7 +2936,6 @@ For example: preferred meeting time, number of team members joining, specific qu
     const reply = await getClaudeReply(session, rawMsg);
     await sendWhatsAppMessage(phone, reply);
 
-    // Ask additional info once core lead is complete (normal flow, not handoff)
     if (!session.askedAdditionalInfo && !session.leadCollected && isLeadCoreComplete(session.leadData)) {
       session.askedAdditionalInfo = true;
       const additionalQ = "One last thing before I connect you with our expert — is there anything specific you'd like them to know? Any additional details, questions, or requirements? 📋\n\n(Reply 'no' if nothing else)";
@@ -2952,7 +2946,6 @@ For example: preferred meeting time, number of team members joining, specific qu
       return;
     }
 
-    // Receive additional info reply (normal flow) and finalize lead
     if (session.askedAdditionalInfo && !session.leadCollected) {
       if (!session.leadData.additionalInfo) {
         const noInfoPhrases = ['no','nope','nothing','thats all','no thanks','not really','none','nah','nothing else','no more'];
@@ -3157,11 +3150,6 @@ app.get('/reset-all-sessions', async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────
-// RESET LEADS — wipes all leads from MongoDB so the CRM starts fresh.
-// Sessions are kept intact so existing customers are still recognised.
-// Called by the CRM dashboard "Reset CRM" button.
-// ─────────────────────────────────────────────
 app.delete('/reset-leads', async (req, res) => {
   try {
     if (!leadsCol) return res.status(503).json({ error: 'No DB connection' });
