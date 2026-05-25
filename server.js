@@ -3304,8 +3304,7 @@ app.get('/clear-session/:phone', async (req, res) => {
   try {
     if (sessionsCol) {
       await sessionsCol.deleteOne({ phone });
-      const alt = phone.startsWith('91') ? phone.slice(2) : '91' + phone;
-      await sessionsCol.deleteOne({ phone: alt });
+      // Removed hardcoded +91 logic - phone is now stored consistently
     }
     res.json({ success: true, message: `Session cleared for ${phone}. Fresh start on next message.` });
   } catch (err) {
