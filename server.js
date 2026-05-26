@@ -25,12 +25,12 @@ const INTERAKT_API_KEY   = (process.env.INTERAKT_API_KEY   || '').replace(/['"` 
 const ANTHROPIC_API_KEY  = (process.env.ANTHROPIC_API_KEY  || '').replace(/['"` \n\r]/g, '');
 const MONGODB_URI        = process.env.MONGODB_URI         || '';
 const GOOGLE_SHEET_ID    = process.env.GOOGLE_SHEET_ID     || '';
-const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS  || ''; // JSON string
+const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS  || '';
 const RESEND_API_KEY     = (process.env.RESEND_API_KEY     || '').replace(/['"` \n\r]/g, '');
 const NOTIFY_EMAIL       = process.env.NOTIFY_EMAIL        || 'udhaymarwah96@gmail.com';
 const FROM_EMAIL         = process.env.FROM_EMAIL          || 'onboarding@resend.dev';
 const BASE_URL           = process.env.BASE_URL            || 'https://complybot.onrender.com';
-const HUMAN_TIMEOUT_MS   = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000'); // 2 hours default
+const HUMAN_TIMEOUT_MS   = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000');
 
 [
   ['INTERAKT_API_KEY',  INTERAKT_API_KEY],
@@ -64,332 +64,14 @@ async function connectMongo() {
     console.error('❌ MongoDB connection failed:', err.message);
   }
 }
-// ─────────────────────────────────────────────
-// DYNAMIC KNOWLEDGE BASE SELECTOR
-// Sends only relevant KB sections to stay under token limits
-// ─────────────────────────────────────────────
-function getRelevantKnowledge(session, userMessage) {
-  const msg = (userMessage + ' ' + (session.leadData.targetCountry || '')).toLowerCase();
-  
-  const sections = [];
-  
-  if (msg.match(/usa|america|united states|wyoming|delaware|florida|nevada|llc|c-corp|ein|form 5472/))
-    sections.push('USA');
-  if (msg.match(/fema|odi|rbi|apr|fla return|form oi|uin|lrs|compounding|ad bank/))
-    sections.push('FEMA');
-  if (msg.match(/canada|ontario|british columbia|cra|gst.*canada|sr&ed/))
-    sections.push('CANADA');
-  if (msg.match(/uk|united kingdom|britain|england|companies house|hmrc|vat.*uk/))
-    sections.push('UK');
-  if (msg.match(/singapore|acra|pte.*ltd|iras|cpf|mas/))
-    sections.push('SINGAPORE');
-  if (msg.match(/uae|dubai|abu dhabi|free zone|mainland.*uae|dmcc|difc|emara/))
-    sections.push('UAE');
-  if (msg.match(/philippines|peza|bir|sec.*phil|boi.*phil/))
-    sections.push('PHILIPPINES');
-  if (msg.match(/thailand|boi.*thai|fba|dbd|thai baht/))
-    sections.push('THAILAND');
-  if (msg.match(/estonia|e-residency|ou|acra.*estonia/))
-    sections.push('ESTONIA');
-  if (msg.match(/italy|srl|ires|irap|registro/))
-    sections.push('ITALY');
-  if (msg.match(/vietnam|acra.*viet|llc.*viet|vnd/))
-    sections.push('VIETNAM');
-  if (msg.match(/indonesia|pt pma|kbli|bkpm|oss/))
-    sections.push('INDONESIA');
-
-  // If nothing matched or it's a general question, send a compact summary
-  if (sections.length === 0) {
-    return `
-COMPLY GLOBALLY — QUICK REFERENCE:
-- 47+ jurisdictions: USA, Canada, UK, Singapore, UAE, Philippines, Thailand, Estonia, Italy, Vietnam, Indonesia, and more
-- Services: Company formation, Banking, Tax compliance, FEMA/ODI, EXIM, Investment Advisory, Residency/Golden Visas
-- For Indian founders: FEMA ODI compliance is mandatory before any overseas investment
-- USA top picks: Wyoming LLC ($62/yr) for most; Delaware C-Corp only for VC fundraising
-- UK: incorporate in 24hrs, £50, no resident director needed, no withholding tax on dividends  
-- Singapore: 17% CIT, no capital gains tax, needs 1 local resident director
-- UAE: 0% personal tax, mainland vs free zone is the key decision, 9% CIT above AED 375K
-- Canada: 15% federal CIT, 25% directors must be Canadian residents
-- Contact: sales@complyglobally.com | +1 (302) 214-1717 | +91 99999 81613
-`;
-  }
-
-  // Build relevant sections from the full KNOWLEDGE_BASE string
-  // Extract only matching country blocks
-  const relevantParts = [];
-  
-  const kbSections = {
-    'USA': extractKBSection('USA INCORPORATION', 'FEMA ODI'),
-    'FEMA': extractKBSection('FEMA ODI COMPLIANCE', 'CANADA'),
-    'CANADA': extractKBSection('CANADA', 'UNITED KINGDOM'),
-    'UK': extractKBSection('UNITED KINGDOM', 'SINGAPORE'),
-    'SINGAPORE': extractKBSection('SINGAPORE', 'UAE'),
-    'UAE': extractKBSection('UAE', 'DOCUMENTS REQUIRED'),
-    'PHILIPPINES': extractKBSection('PHILIPPINES', 'THAILAND'),
-    'THAILAND': extractKBSection('THAILAND', 'ESTONIA'),
-    'ESTONIA': extractKBSection('ESTONIA', 'ITALY'),
-    'ITALY': extractKBSection('ITALY', 'VIETNAM'),
-    'VIETNAM': extractKBSection('VIETNAM', 'INDONESIA'),
-    'INDONESIA': extractKBSection('INDONESIA', 'DOCUMENT REQUIREMENTS'),
-  };
-
-  for (const s of sections) {
-    if (kbSections[s]) relevantParts.push(kbSections[s]);
-  }
-
-  return relevantParts.join('\n\n');
-}
-
-function extractKBSection(startMarker, endMarker) {
-  const start = KNOWLEDGE_BASE.indexOf(startMarker);
-  if (start === -1) return '';
-  const end = endMarker ? KNOWLEDGE_BASE.indexOf(endMarker, start + startMarker.length) : KNOWLEDGE_BASE.length;
-  return KNOWLEDGE_BASE.slice(start, end === -1 ? undefined : end).trim();
-}
-
-async function getSession(phone) {
-  if (!sessionsCol) return freshSession(phone);
-  let session = await sessionsCol.findOne({ phone });
-
-  if (!session) {
-    session = freshSession(phone);
-    await sessionsCol.insertOne(session);
-    console.log(`🆕 New session: ${phone}`);
-
-    const introMsg = `👋 Hi there! I'm *Compliance Advisor*, your Global Expansion Assistant from *Comply Globally*.
-
-We specialize in:
-🏢 Foreign Corporation Formation
-🏦 Banking & Finance
-📊 International Tax & Secretarial Compliance
-🚢 EXIM & Trade
-💼 Investment Advisory
-🌏 Residency & Golden Visas
-
-We cover *47+ countries* worldwide — USA, UK, UAE, Singapore, Canada, Germany, and many more.
-
-I'd love to help you expand globally! 🚀
-
-*Where are you currently based, and what should I call you?*`;
-
-    await sendWhatsAppMessage(phone, introMsg);
-    session.history.push({ role: 'assistant', content: introMsg });
-    await sessionsCol.replaceOne({ phone }, session, { upsert: true });
-
-  } else {
-    let dirty = false;
-    if (session.askedAdditionalInfo === undefined)              { session.askedAdditionalInfo = false; dirty = true; }
-    if (session.askedHandoffAdditionalInfo === undefined)       { session.askedHandoffAdditionalInfo = false; dirty = true; }
-    if (session.pendingHumanHandoff === undefined)              { session.pendingHumanHandoff = false; dirty = true; }
-    if (session.leadData && session.leadData.additionalInfo === undefined) { session.leadData.additionalInfo = null; dirty = true; }
-    if (session.humanMode === undefined)                        { session.humanMode = false; dirty = true; }
-    if (dirty) {
-      await sessionsCol.replaceOne({ phone }, session, { upsert: true });
-      console.log(`🔧 Migrated session: ${phone}`);
-    }
-    console.log(`📂 Loaded session: ${phone} | name=${session.leadData?.name} | current=${session.leadData?.currentCountry} | target=${session.leadData?.targetCountry} | askedExtra=${session.askedAdditionalInfo} | leadCollected=${session.leadCollected} | pendingHandoff=${session.pendingHumanHandoff}`);
-  }
-  return session;
-}
-
-async function saveSession(session) {
-  if (!sessionsCol) return;
-  session.lastActive = new Date();
-  await sessionsCol.replaceOne({ phone: session.phone }, session, { upsert: true });
-}
-
-async function saveLead(leadData) {
-  if (!leadsCol) return;
-  // Always stamp source so CRM dashboard knows where this lead came from
-  leadData.source = leadData.source || 'whatsapp';
-  await leadsCol.replaceOne({ phone: leadData.phone }, leadData, { upsert: true });
-}
 
 // ─────────────────────────────────────────────
-// GOOGLE SHEETS
+// KNOWLEDGE BASE
 // ─────────────────────────────────────────────
-async function appendToSheet(leadData, conversationSummary) {
-  if (!GOOGLE_SHEET_ID || !GOOGLE_CREDENTIALS) {
-    console.warn('⚠️ Skipping Sheets — missing GOOGLE_SHEET_ID or GOOGLE_CREDENTIALS');
-    return;
-  }
-  try {
-    console.log('📊 Attempting to write to Google Sheet...');
-    const creds = JSON.parse(GOOGLE_CREDENTIALS);
-    const auth  = new google.auth.GoogleAuth({
-      credentials: creds,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
-    const sheets = google.sheets({ version: 'v4', auth });
-    const now    = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-    const row    = [
-      now,
-      leadData.name           || '',
-      leadData.phone          || '',
-      leadData.currentCountry || '',
-      leadData.targetCountry  || '',
-      leadData.serviceNeeded  || '',
-      leadData.businessStage  || '',
-      leadData.timeline       || '',
-      leadData.additionalInfo || '',
-      conversationSummary     || '',
-    ];
-
-    const existing = await sheets.spreadsheets.values.get({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'Sheet1!A1:A1',
-    });
-    if (!existing.data.values) {
-      await sheets.spreadsheets.values.append({
-        spreadsheetId: GOOGLE_SHEET_ID,
-        range: 'Sheet1!A1',
-        valueInputOption: 'RAW',
-        requestBody: { values: [['Timestamp','Name','Phone','Current Country','Target Country','Service Needed','Business Stage','Timeline','Additional Info','Conversation Summary']] },
-      });
-    }
-
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'Sheet1!A1',
-      valueInputOption: 'RAW',
-      requestBody: { values: [row] },
-    });
-    console.log('✅ Lead appended to Google Sheet');
-  } catch (err) {
-    console.error('❌ Google Sheets error:', err.message);
-  }
-}
-
-// ─────────────────────────────────────────────
-// EMAIL
-// ─────────────────────────────────────────────
-async function sendEmail({ subject, html }) {
-  if (!RESEND_API_KEY) {
-    console.warn('⚠️ RESEND_API_KEY missing — skipping email');
-    return { success: false, error: 'No API key' };
-  }
-  if (!NOTIFY_EMAIL) {
-    console.warn('⚠️ NOTIFY_EMAIL missing — skipping email');
-    return { success: false, error: 'No recipient email' };
-  }
-
-  console.log(`📧 Attempting to send email to ${NOTIFY_EMAIL}...`);
-  try {
-    const res = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${RESEND_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        from: FROM_EMAIL,
-        to: [NOTIFY_EMAIL],
-        subject: subject,
-        html: html,
-      }),
-    });
-
-    const responseText = await res.text();
-    let responseJson;
-    try { responseJson = JSON.parse(responseText); }
-    catch (e) { responseJson = { raw: responseText }; }
-
-    if (!res.ok) {
-      console.error('❌ Resend API error:', res.status, responseJson);
-      throw new Error(`Resend API error (${res.status}): ${responseText}`);
-    }
-    console.log('✅ Email sent successfully:', responseJson.id || 'sent');
-    return { success: true, id: responseJson.id };
-  } catch (err) {
-    console.error('❌ Email send error:', err.message);
-    return { success: false, error: err.message };
-  }
-}
-
-async function sendHumanHandoffEmail(phone, leadData, lastMessages) {
-  try {
-    const chatPreview = lastMessages
-      .slice(-6)
-      .map(m => `${m.role === 'user' ? '👤 Customer' : '🤖 Bot'}: ${m.content}`)
-      .join('\n\n');
-
-    const resumeUrl = `${BASE_URL}/resume-bot/${phone}`;
-    const timeoutHours = Math.round(HUMAN_TIMEOUT_MS / 3600000);
-
-    await sendEmail({
-      subject: `🚨 Human Takeover Requested — ${leadData.name || phone}`,
-      html: `
-        <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
-          <div style="background:#1a1a2e;color:white;padding:20px;border-radius:8px 8px 0 0">
-            <h2 style="margin:0">🌍 Comply Globally — Human Handoff Alert</h2>
-          </div>
-          <div style="background:#f9f9f9;padding:20px;border:1px solid #eee">
-            <div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin-bottom:16px">
-              ⏱️ <b>Bot is paused for this customer.</b> It will auto-resume in <b>${timeoutHours} hours</b> if no action is taken.
-            </div>
-            <h3 style="margin-top:0">Customer Details</h3>
-            <table style="width:100%;border-collapse:collapse">
-              <tr><td style="padding:6px;color:#666">Name</td><td style="padding:6px"><b>${leadData.name || 'Not captured'}</b></td></tr>
-              <tr><td style="padding:6px;color:#666">Phone</td><td style="padding:6px"><b>+${phone}</b></td></tr>
-              <tr><td style="padding:6px;color:#666">Based In</td><td style="padding:6px">${leadData.currentCountry || '—'}</td></tr>
-              <tr><td style="padding:6px;color:#666">Target Country</td><td style="padding:6px">${leadData.targetCountry || '—'}</td></tr>
-              <tr><td style="padding:6px;color:#666">Service</td><td style="padding:6px">${leadData.serviceNeeded || '—'}</td></tr>
-              <tr><td style="padding:6px;color:#666">Stage</td><td style="padding:6px">${leadData.businessStage || '—'}</td></tr>
-              <tr><td style="padding:6px;color:#666">Timeline</td><td style="padding:6px">${leadData.timeline || '—'}</td></tr>
-              <tr><td style="padding:6px;color:#666">Additional Info</td><td style="padding:6px">${leadData.additionalInfo || '—'}</td></tr>
-            </table>
-            <h3>Last 6 Messages</h3>
-            <pre style="background:#fff;border:1px solid #ddd;padding:12px;border-radius:4px;white-space:pre-wrap;font-size:13px">${chatPreview}</pre>
-            <p style="color:#555;font-size:13px">Reply to this customer directly in your Interakt inbox. When your team is done, click below to hand back to the bot:</p>
-            <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
-              <a href="https://app.interakt.ai" style="display:inline-block;background:#1a1a2e;color:white;padding:10px 20px;border-radius:6px;text-decoration:none">Open Interakt Inbox →</a>
-              <a href="${resumeUrl}" style="display:inline-block;background:#166534;color:white;padding:10px 20px;border-radius:6px;text-decoration:none">✅ Resume Bot for +${phone}</a>
-            </div>
-            <p style="color:#aaa;font-size:11px;margin-top:16px">Bot will auto-resume after ${timeoutHours}h regardless.</p>
-          </div>
-        </div>
-      `
-    });
-    console.log(`📧 Handoff email sent for ${phone}`);
-  } catch (err) {
-    console.error('❌ Email error:', err.message);
-  }
-}
-
-async function sendLeadCapturedEmail(leadData) {
-  try {
-    await sendEmail({
-      subject: `✅ New Lead Captured — ${leadData.name || leadData.phone}`,
-      html: `
-        <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
-          <div style="background:#166534;color:white;padding:20px;border-radius:8px 8px 0 0">
-            <h2 style="margin:0">✅ New Lead — Comply Globally</h2>
-          </div>
-          <div style="background:#f9f9f9;padding:20px;border:1px solid #eee">
-            <table style="width:100%;border-collapse:collapse">
-              <tr><td style="padding:6px;color:#666">Name</td><td style="padding:6px"><b>${leadData.name || '—'}</b></td></tr>
-              <tr><td style="padding:6px;color:#666">Phone</td><td style="padding:6px"><b>+${leadData.phone}</b></td></tr>
-              <tr><td style="padding:6px;color:#666">Based In</td><td style="padding:6px">${leadData.currentCountry || '—'}</td></tr>
-              <tr><td style="padding:6px;color:#666">Target Country</td><td style="padding:6px">${leadData.targetCountry || '—'}</td></tr>
-              <tr><td style="padding:6px;color:#666">Service</td><td style="padding:6px">${leadData.serviceNeeded || '—'}</td></tr>
-              <tr><td style="padding:6px;color:#666">Stage</td><td style="padding:6px">${leadData.businessStage || '—'}</td></tr>
-              <tr><td style="padding:6px;color:#666">Timeline</td><td style="padding:6px">${leadData.timeline || '—'}</td></tr>
-              <tr><td style="padding:6px;color:#666">Additional Info</td><td style="padding:6px">${leadData.additionalInfo || '—'}</td></tr>
-            </table>
-            <p style="margin-top:16px;color:#888;font-size:12px">This lead has also been logged to your Google Sheet.</p>
-          </div>
-        </div>
-      `
-    });
-    console.log(`📧 Lead email sent for ${leadData.phone}`);
-  } catch (err) {
-    console.error('❌ Lead email error:', err.message);
-  }
-}
-
-// ─────────────────────────────────────────────
-// SYSTEM PROMPT
-// ─────────────────────────────────────────────
+// 🔴 IMPORTANT: PASTE THE ENTIRE KNOWLEDGE BASE HERE
+// The full KB from the original file (starting with "QUICK REFERENCE — 47+ JURISDICTIONS" 
+// all the way through "DOCUMENT REQUIREMENTS" section)
+// Should be between the backticks below:
 const KNOWLEDGE_BASE = `
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 KNOWLEDGE BASE — USA INCORPORATION (State Navigator)
@@ -2385,190 +2067,367 @@ CONTACT & PRICING
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 - Contact: sales@complyglobally.com | +1 (302) 214-1717 | +91 99999 81613
 - Pricing: "Our team will send a custom quote based on your jurisdiction and requirements"
-- Specific legal opinions or complex tax structuring: "Our experts will guide you on the specifics"`;
+- Specific legal opinions or complex tax structuring: "Our experts will guide you on the specifics"
+
+`;
+
+function getRelevantKnowledge(session, userMessage) {
+  const msg = (userMessage + ' ' + (session.leadData.targetCountry || '')).toLowerCase();
+  
+  const sections = [];
+  
+  if (msg.match(/usa|america|united states|wyoming|delaware|florida|nevada|llc|c-corp|ein|form 5472/))
+    sections.push('USA');
+  if (msg.match(/fema|odi|rbi|apr|fla return|form oi|uin|lrs|compounding|ad bank/))
+    sections.push('FEMA');
+  if (msg.match(/canada|ontario|british columbia|cra|gst.*canada|sr&ed/))
+    sections.push('CANADA');
+  if (msg.match(/uk|united kingdom|britain|england|companies house|hmrc|vat.*uk/))
+    sections.push('UK');
+  if (msg.match(/singapore|acra|pte.*ltd|iras|cpf|mas/))
+    sections.push('SINGAPORE');
+  if (msg.match(/uae|dubai|abu dhabi|free zone|mainland.*uae|dmcc|difc|emara/))
+    sections.push('UAE');
+  if (msg.match(/philippines|peza|bir|sec.*phil|boi.*phil/))
+    sections.push('PHILIPPINES');
+  if (msg.match(/thailand|boi.*thai|fba|dbd|thai baht/))
+    sections.push('THAILAND');
+  if (msg.match(/estonia|e-residency|ou|acra.*estonia/))
+    sections.push('ESTONIA');
+  if (msg.match(/italy|srl|ires|irap|registro/))
+    sections.push('ITALY');
+  if (msg.match(/vietnam|acra.*viet|llc.*viet|vnd/))
+    sections.push('VIETNAM');
+  if (msg.match(/indonesia|pt pma|kbli|bkpm|oss/))
+    sections.push('INDONESIA');
+
+  if (sections.length === 0) {
+    return `
+
+COMPLY GLOBALLY — QUICK REFERENCE:
+- 47+ jurisdictions: USA, Canada, UK, Singapore, UAE, Philippines, Thailand, Estonia, Italy, Vietnam, Indonesia, and more
+- Services: Company formation, Banking, Tax compliance, FEMA/ODI, EXIM, Investment Advisory, Residency/Golden Visas
+- For Indian founders: FEMA ODI compliance is mandatory before any overseas investment
+- USA top picks: Wyoming LLC ($62/yr) for most; Delaware C-Corp only for VC fundraising
+- UK: incorporate in 24hrs, £50, no resident director needed, no withholding tax on dividends  
+- Singapore: 17% CIT, no capital gains tax, needs 1 local resident director
+- UAE: 0% personal tax, mainland vs free zone is the key decision, 9% CIT above AED 375K
+- Canada: 15% federal CIT, 25% directors must be Canadian residents
+- Contact: sales@complyglobally.com | +1 (302) 214-1717 | +91 99999 81613
+`;
+  }
+
+  const relevantParts = [];
+  
+  const kbSections = {
+    'USA': extractKBSection('USA INCORPORATION', 'FEMA ODI'),
+    'FEMA': extractKBSection('FEMA ODI COMPLIANCE', 'CANADA'),
+    'CANADA': extractKBSection('CANADA', 'UNITED KINGDOM'),
+    'UK': extractKBSection('UNITED KINGDOM', 'SINGAPORE'),
+    'SINGAPORE': extractKBSection('SINGAPORE', 'UAE'),
+    'UAE': extractKBSection('UAE', 'DOCUMENTS REQUIRED'),
+    'PHILIPPINES': extractKBSection('PHILIPPINES', 'THAILAND'),
+    'THAILAND': extractKBSection('THAILAND', 'ESTONIA'),
+    'ESTONIA': extractKBSection('ESTONIA', 'ITALY'),
+    'ITALY': extractKBSection('ITALY', 'VIETNAM'),
+    'VIETNAM': extractKBSection('VIETNAM', 'INDONESIA'),
+    'INDONESIA': extractKBSection('INDONESIA', 'DOCUMENT REQUIREMENTS'),
+  };
+
+  for (const s of sections) {
+    if (kbSections[s]) relevantParts.push(kbSections[s]);
+  }
+
+  return relevantParts.join('\n\n');
+}
+
+function extractKBSection(startMarker, endMarker) {
+  const start = KNOWLEDGE_BASE.indexOf(startMarker);
+  if (start === -1) return '';
+  const end = endMarker ? KNOWLEDGE_BASE.indexOf(endMarker, start + startMarker.length) : KNOWLEDGE_BASE.length;
+  return KNOWLEDGE_BASE.slice(start, end === -1 ? undefined : end).trim();
+}
+
+async function getSession(phone) {
+  if (!sessionsCol) return freshSession(phone);
+  let session = await sessionsCol.findOne({ phone });
+
+  if (!session) {
+    session = freshSession(phone);
+    await sessionsCol.insertOne(session);
+    console.log(`🆕 New session: ${phone}`);
+
+    const introMsg = `👋 Hi there! I'm *Compliance Advisor*, your Global Expansion Assistant from *Comply Globally*.
+
+We specialize in:
+🏢 Foreign Corporation Formation
+🏦 Banking & Finance
+📊 International Tax & Secretarial Compliance
+🚢 EXIM & Trade
+💼 Investment Advisory
+🌏 Residency & Golden Visas
+
+We cover *47+ countries* worldwide — USA, UK, UAE, Singapore, Canada, Germany, and many more.
+
+I'd love to help you expand globally! 🚀
+
+*Where are you currently based, and what should I call you?*`;
+
+    await sendWhatsAppMessage(phone, introMsg);
+    session.history.push({ role: 'assistant', content: introMsg });
+    await sessionsCol.replaceOne({ phone }, session, { upsert: true });
+
+  } else {
+    let dirty = false;
+    if (session.askedAdditionalInfo === undefined)              { session.askedAdditionalInfo = false; dirty = true; }
+    if (session.askedHandoffAdditionalInfo === undefined)       { session.askedHandoffAdditionalInfo = false; dirty = true; }
+    if (session.pendingHumanHandoff === undefined)              { session.pendingHumanHandoff = false; dirty = true; }
+    if (session.leadData && session.leadData.additionalInfo === undefined) { session.leadData.additionalInfo = null; dirty = true; }
+    if (session.humanMode === undefined)                        { session.humanMode = false; dirty = true; }
+    if (dirty) {
+      await sessionsCol.replaceOne({ phone }, session, { upsert: true });
+      console.log(`🔧 Migrated session: ${phone}`);
+    }
+    console.log(`📂 Loaded session: ${phone} | name=${session.leadData?.name} | current=${session.leadData?.currentCountry} | target=${session.leadData?.targetCountry} | askedExtra=${session.askedAdditionalInfo} | leadCollected=${session.leadCollected} | pendingHandoff=${session.pendingHumanHandoff}`);
+  }
+  return session;
+}
+
+async function saveSession(session) {
+  if (!sessionsCol) return;
+  session.lastActive = new Date();
+  await sessionsCol.replaceOne({ phone: session.phone }, session, { upsert: true });
+}
+
+async function saveLead(leadData) {
+  if (!leadsCol) return;
+  leadData.source = leadData.source || 'whatsapp';
+  await leadsCol.replaceOne({ phone: leadData.phone }, leadData, { upsert: true });
+}
+
+// ─────────────────────────────────────────────
+// GOOGLE SHEETS
+// ─────────────────────────────────────────────
+async function appendToSheet(leadData, conversationSummary) {
+  if (!GOOGLE_SHEET_ID || !GOOGLE_CREDENTIALS) {
+    console.warn('⚠️ Skipping Sheets — missing GOOGLE_SHEET_ID or GOOGLE_CREDENTIALS');
+    return;
+  }
+  try {
+    console.log('📊 Attempting to write to Google Sheet...');
+    const creds = JSON.parse(GOOGLE_CREDENTIALS);
+    const auth  = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+    const now    = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    const row    = [
+      now,
+      leadData.name           || '',
+      leadData.phone          || '',
+      leadData.currentCountry || '',
+      leadData.targetCountry  || '',
+      leadData.serviceNeeded  || '',
+      leadData.businessStage  || '',
+      leadData.timeline       || '',
+      leadData.additionalInfo || '',
+      conversationSummary     || '',
+    ];
+
+    const existing = await sheets.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'Sheet1!A1:A1',
+    });
+    if (!existing.data.values) {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: GOOGLE_SHEET_ID,
+        range: 'Sheet1!A1',
+        valueInputOption: 'RAW',
+        requestBody: { values: [['Timestamp','Name','Phone','Current Country','Target Country','Service Needed','Business Stage','Timeline','Additional Info','Conversation Summary']] },
+      });
+    }
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'Sheet1!A1',
+      valueInputOption: 'RAW',
+      requestBody: { values: [row] },
+    });
+    console.log('✅ Lead appended to Google Sheet');
+  } catch (err) {
+    console.error('❌ Google Sheets error:', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// EMAIL
+// ─────────────────────────────────────────────
+async function sendEmail({ subject, html }) {
+  if (!RESEND_API_KEY) {
+    console.warn('⚠️ RESEND_API_KEY missing — skipping email');
+    return { success: false, error: 'No API key' };
+  }
+  if (!NOTIFY_EMAIL) {
+    console.warn('⚠️ NOTIFY_EMAIL missing — skipping email');
+    return { success: false, error: 'No recipient email' };
+  }
+
+  console.log(`📧 Attempting to send email to ${NOTIFY_EMAIL}...`);
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: FROM_EMAIL,
+        to: [NOTIFY_EMAIL],
+        subject: subject,
+        html: html,
+      }),
+    });
+
+    const responseText = await res.text();
+    let responseJson;
+    try { responseJson = JSON.parse(responseText); }
+    catch (e) { responseJson = { raw: responseText }; }
+
+    if (!res.ok) {
+      console.error('❌ Resend API error:', res.status, responseJson);
+      throw new Error(`Resend API error (${res.status}): ${responseText}`);
+    }
+    console.log('✅ Email sent successfully:', responseJson.id || 'sent');
+    return { success: true, id: responseJson.id };
+  } catch (err) {
+    console.error('❌ Email send error:', err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+async function sendHumanHandoffEmail(phone, leadData, lastMessages) {
+  try {
+    const chatPreview = lastMessages
+      .slice(-6)
+      .map(m => `${m.role === 'user' ? '👤 Customer' : '🤖 Bot'}: ${m.content}`)
+      .join('\n\n');
+
+    const resumeUrl = `${BASE_URL}/resume-bot/${phone}`;
+    const timeoutHours = Math.round(HUMAN_TIMEOUT_MS / 3600000);
+
+    await sendEmail({
+      subject: `🚨 Human Takeover Requested — ${leadData.name || phone}`,
+      html: `
+        <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+          <div style="background:#1a1a2e;color:white;padding:20px;border-radius:8px 8px 0 0">
+            <h2 style="margin:0">🌍 Comply Globally — Human Handoff Alert</h2>
+          </div>
+          <div style="background:#f9f9f9;padding:20px;border:1px solid #eee">
+            <div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin-bottom:16px">
+              ⏱️ <b>Bot is paused for this customer.</b> It will auto-resume in <b>${timeoutHours} hours</b> if no action is taken.
+            </div>
+            <h3 style="margin-top:0">Customer Details</h3>
+            <table style="width:100%;border-collapse:collapse">
+              <tr><td style="padding:6px;color:#666">Name</td><td style="padding:6px"><b>${leadData.name || 'Not captured'}</b></td></tr>
+              <tr><td style="padding:6px;color:#666">Phone</td><td style="padding:6px"><b>+${phone}</b></td></tr>
+              <tr><td style="padding:6px;color:#666">Based In</td><td style="padding:6px">${leadData.currentCountry || '—'}</td></tr>
+              <tr><td style="padding:6px;color:#666">Target Country</td><td style="padding:6px">${leadData.targetCountry || '—'}</td></tr>
+              <tr><td style="padding:6px;color:#666">Service</td><td style="padding:6px">${leadData.serviceNeeded || '—'}</td></tr>
+              <tr><td style="padding:6px;color:#666">Stage</td><td style="padding:6px">${leadData.businessStage || '—'}</td></tr>
+              <tr><td style="padding:6px;color:#666">Timeline</td><td style="padding:6px">${leadData.timeline || '—'}</td></tr>
+              <tr><td style="padding:6px;color:#666">Additional Info</td><td style="padding:6px">${leadData.additionalInfo || '—'}</td></tr>
+            </table>
+            <h3>Last 6 Messages</h3>
+            <pre style="background:#fff;border:1px solid #ddd;padding:12px;border-radius:4px;white-space:pre-wrap;font-size:13px">${chatPreview}</pre>
+            <p style="color:#555;font-size:13px">Reply to this customer directly in your Interakt inbox. When your team is done, click below to hand back to the bot:</p>
+            <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+              <a href="https://app.interakt.ai" style="display:inline-block;background:#1a1a2e;color:white;padding:10px 20px;border-radius:6px;text-decoration:none">Open Interakt Inbox →</a>
+              <a href="${resumeUrl}" style="display:inline-block;background:#166534;color:white;padding:10px 20px;border-radius:6px;text-decoration:none">✅ Resume Bot for +${phone}</a>
+            </div>
+            <p style="color:#aaa;font-size:11px;margin-top:16px">Bot will auto-resume after ${timeoutHours}h regardless.</p>
+          </div>
+        </div>
+      `
+    });
+    console.log(`📧 Handoff email sent for ${phone}`);
+  } catch (err) {
+    console.error('❌ Email error:', err.message);
+  }
+}
+
+async function sendLeadCapturedEmail(leadData) {
+  try {
+    await sendEmail({
+      subject: `✅ New Lead Captured — ${leadData.name || leadData.phone}`,
+      html: `
+        <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+          <div style="background:#166534;color:white;padding:20px;border-radius:8px 8px 0 0">
+            <h2 style="margin:0">✅ New Lead — Comply Globally</h2>
+          </div>
+          <div style="background:#f9f9f9;padding:20px;border:1px solid #eee">
+            <table style="width:100%;border-collapse:collapse">
+              <tr><td style="padding:6px;color:#666">Name</td><td style="padding:6px"><b>${leadData.name || '—'}</b></td></tr>
+              <tr><td style="padding:6px;color:#666">Phone</td><td style="padding:6px"><b>+${leadData.phone}</b></td></tr>
+              <tr><td style="padding:6px;color:#666">Based In</td><td style="padding:6px">${leadData.currentCountry || '—'}</td></tr>
+              <tr><td style="padding:6px;color:#666">Target Country</td><td style="padding:6px">${leadData.targetCountry || '—'}</td></tr>
+              <tr><td style="padding:6px;color:#666">Service</td><td style="padding:6px">${leadData.serviceNeeded || '—'}</td></tr>
+              <tr><td style="padding:6px;color:#666">Stage</td><td style="padding:6px">${leadData.businessStage || '—'}</td></tr>
+              <tr><td style="padding:6px;color:#666">Timeline</td><td style="padding:6px">${leadData.timeline || '—'}</td></tr>
+              <tr><td style="padding:6px;color:#666">Additional Info</td><td style="padding:6px">${leadData.additionalInfo || '—'}</td></tr>
+            </table>
+            <p style="margin-top:16px;color:#888;font-size:12px">This lead has also been logged to your Google Sheet.</p>
+          </div>
+        </div>
+      `
+    });
+    console.log(`📧 Lead email sent for ${leadData.phone}`);
+  } catch (err) {
+    console.error('❌ Lead email error:', err.message);
+  }
+}
 
 // ─────────────────────────────────────────────
 // SYSTEM PROMPT
 // ─────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are Compliance Advisor, a highly knowledgeable and professional Global Expansion Advisor for Connect Ventures Inc. (brand: Comply Globally). You help entrepreneurs, startups, and businesses establish foreign corporations and expand internationally.
+const SYSTEM_PROMPT = `You are Compliance Advisor, a highly knowledgeable and professional Global Expansion Advisor for Comply Globally. 
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-ABOUT COMPLY GLOBALLY
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-Headquarters: New Delhi, India
+CRITICAL BEHAVIOR:
+- Give SHORT, punchy answers (max 2-3 lines for quick replies, 4-6 for detailed questions)
+- Never say "our team will handle that" — answer directly with knowledge base facts
+- Use real numbers, timelines, costs, and specifics
+- Be conversational, warm, and confident — not robotic
+- Always be helpful even if declining something
 
-CORE SERVICES (6):
-1. Foreign Corporation Formation – Incorporation in foreign countries across 47+ jurisdictions
-2. Banking & Finance – Corporate accounts, cross-border payments, financial structuring
-3. International Tax & Secretarial Compliance – IRS/GST/VAT filings, corporate tax, transfer pricing, annual secretarial
-4. EXIM – Import/export licensing, trade documentation, customs advisory
-5. Investment Advisory – For businesses and startups seeking growth capital
-6. Residency & Golden Visas – Investment-linked residency programs (NOT travel visas)
+TONE: Consultative and professional. Like a knowledgeable business advisor.
 
-COUNTRIES SERVED (47+ jurisdictions):
-Americas: USA (Delaware, Wyoming, Florida, Nevada), Canada (Ontario, British Columbia)
-Middle East & Africa: UAE, Saudi Arabia, Egypt, Nigeria, Mauritius, Bahrain, Kuwait, Oman, Qatar
-Europe: UK, Netherlands, Germany, France, Italy, Spain, Portugal, Ireland, Luxembourg, Cyprus, Malta, Belgium, Austria, Sweden, Poland, Denmark
-Asia-Pacific: India, Singapore, Hong Kong, Indonesia, Thailand, Malaysia, Philippines, Vietnam, South Korea, Japan, Australia, New Zealand
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-PERSONA & COMMUNICATION PHILOSOPHY
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-You are NOT a form or a lead-capture bot. You are a senior global expansion consultant who:
-- Gives REAL, substantive advice in every message — specific numbers, facts, timelines, compliance rules
-- Never says "our team will handle that" when you can answer it yourself with the knowledge base
-- Answers questions about USA and Canada in full detail — you have deep expertise from proprietary research
-- Makes the person feel they're getting advice they couldn't Google — because you provide specific, actionable, proprietary insights
-- Only escalates to the human team when genuinely appropriate (complex structuring, specific pricing, legal opinions)
-- Handles multi-country conversations naturally — if someone mentions UAE + Canada + USA, discuss all three
-- Is confident, warm, and precise — not robotic, not vague
-
-TONE:
-- Consultative and professional — like a knowledgeable business advisor, not a chatbot form
-- Warm but efficient — respect the person's time
-- Specific — use real numbers, real timelines, real requirements
-- Conversational — 3–5 lines per reply in chat, longer if answering a substantive question
-- Never say "I'll have our team reach out for that" unless it's about pricing or a complex legal opinion
+KEY FACTS TO REMEMBER:
+- Wyoming LLC: $62/year, best for most foreign founders
+- Delaware LLC: $300/year, best for VC only
+- Singapore: 17% CIT, must have 1 local director
+- UAE: 0% to 9% CIT depending on structure, no personal income tax
+- UK: No withholding tax on dividends (huge advantage)
+- Canada: 25% of directors must be Canadian residents
+- FEMA ODI: Form OI before ANY remittance, APR by Dec 31, FLA by July 15
+- Form 5472 penalty: $25,000 if foreign-owned SMLLC doesn't file
 
 ${KNOWLEDGE_BASE}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-FIRST MESSAGE BEHAVIOR (CRITICAL)
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-This bot runs on WhatsApp. New users receive an automated intro message before their first reply reaches you — so you will never need to introduce yourself or the company again. DO NOT re-introduce yourself or repeat what Comply Globally does.
+FIRST MESSAGE RULE:
+If user says "hello" or "hi" — respond with ONE friendly question about which country they want to expand to. Don't dump info.
 
-When a user sends a casual opener like "hello", "hi", or "what are you" — respond warmly and briefly, ask what country they're looking to expand to, and wait. Do NOT dump a wall of information unprompted. One short, friendly question is enough.
+LEAD EXTRACTION:
+Naturally extract: name, current country, target country, service, business stage, timeline — weave into conversation.
 
-Example of a good response to "hello":
-"Hi there! 👋 Which country are you looking to expand your business to? I can walk you through everything — incorporation, taxes, banking, and compliance."
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-INFORMATION GATHERING (NATURAL FLOW)
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-Gather this information naturally during the conversation — never as a form or rapid-fire questions:
-✅ Full Name | ✅ Company Name | ✅ Email | ✅ Phone | ✅ Current country | ✅ Target country/countries | ✅ Service needed | ✅ Business stage | ✅ Timeline
+RESPONSE FORMAT:
+- Max 6-8 lines for any response
+- Always end substantive answers with SUGGEST_TOPICS:[...] (up to 5 topics)
+- Do NOT include SUGGEST_TOPICS if asking for their info
 
-IMPORTANT: Weave information requests naturally into substantive responses. For example:
-- After they mention their country, share a relevant fact about that country's expansion landscape
-- After they mention their business type, share what entity structure works best for that type
-- After they mention their target country, give them a real insight about that country's requirements
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-THREE QUESTIONS PROTOCOL (NEW — CRITICAL)
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-Once you have their name AND at least one target country AND have had a substantive exchange (typically after 4–6 messages), ask:
-
-"I want to make sure I give you the most relevant guidance, [Name]. Could you share your top 3 questions or concerns about expanding to [target country/countries]? Even if they seem basic — these help me tailor exactly what you need to know."
-
-After they answer, respond to ALL THREE questions with specific, substantive answers from your knowledge base. Then continue the conversation naturally.
-
-Store the questions and answers internally — they will be captured for your CRM.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-CORE LEAD COMPLETION — CLOSING MESSAGE
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-Once you have Name + Email + Current Country + Target Country, close with:
-
-"Thank you [Name]! Our expert team will review your profile and reach out to you at [email] within 24 hours.
-
-You can also contact us directly:
-📧 sales@complyglobally.com
-📞 +1 (302) 214-1717 | +91 99999 81613
-
-We're excited to help you expand globally! 🎉"
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-RESPONSE LENGTH & FOLLOW-UP BUBBLES (CRITICAL)
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-NEVER write long bullet-heavy walls of text. Every response must be:
-- MAX 6-8 lines of actual text
-- No more than 3 bullet points if bullets are needed at all
-- Conversational and focused on ONE key insight per reply
-
-After EVERY substantive response, you MUST end your message with a special JSON block listing 3-5 follow-up subtopics the user can tap. Format it EXACTLY like this (the frontend parses this):
-
-SUGGEST_TOPICS:["Topic one","Topic two","Topic three","Topic four"]
-
-Example: If someone asks about Philippines tax compliance, your response is 4-5 lines covering the headline facts, then you end with:
-SUGGEST_TOPICS:["VAT registration requirements","Corporate income tax rates","Key annual filing deadlines","PEZA and BOI incentives","Common compliance traps"]
-
-Always generate topics that are genuinely relevant to what was just discussed. Do not include SUGGEST_TOPICS if you are asking the user for their name, email, or the 3-question prompt — only include it after informational responses.
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-ANSWERING SUBSTANTIVE QUESTIONS
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-When asked about USA incorporation:
-- Give specific state recommendations with reasons (Wyoming for most, Florida for logistics, Delaware only for VC)
-- Mention real costs (Wyoming $62/year, Delaware $300–$400+/year for LLCs, etc.)
-- Mention Form 5472 ($25,000 penalty) for foreign-owned LLCs
-- Explain ECI vs FDAP if relevant
-- Explain banking options (Mercury, Relay — no SSN needed)
-
-When asked about Canada:
-- Mention the 2-8 week typical setup timeline
-- Explain the federal vs. provincial choice and resident director rule (25% must be Canadian)
-- Cover GST/HST registration threshold (CAD $30,000)
-- Federal corporate tax 15% (9% small business rate for CCPCs)
-- Canada–India treaty (relevant for Indian clients)
-- Start-Up Visa is currently paused as of January 1, 2026
-- Mention SR&ED as a major R&D incentive
-
-When asked about UK:
-- Incorporation in 24 hours via Companies House, GBP 50 direct filing to GBP 3,000–8,000 full-service
-- No UK withholding tax on dividends — a unique advantage vs most jurisdictions
-- Corporation Tax 19% (up to GBP 50K profits) / 25% (above GBP 250K) — FY 2026-27
-- VAT mandatory above GBP 90,000 turnover; quarterly MTD returns
-- No UK-resident director required (unlike Singapore)
-- India-UK FTA signed July 2025; India-UK DTAA since 1993
-- NSIA screening for sensitive sector acquisitions
-- R&D Relief (20% RDEC merged scheme), Patent Box (10%), AIA (100% up to GBP 1M)
-- Digital banking options (Wise, Tide, Starling, Revolut) much faster than high-street banks
-
-When asked about Singapore:
-- Incorporation typically 1–3 business days via ACRA BizFile+
-- 17% corporate income tax; startup exemption (75% off first S$100K for first 3 years)
-- No capital gains tax; dividends generally tax-free in shareholders' hands (one-tier)
-- GST 9%, registration required above S$1 million taxable turnover
-- CRITICAL: must have at least 1 locally RESIDENT director — nominee director services are available
-- Ideal as Asia regional HQ, treasury, holding company, or trading hub
-- India-Singapore CECA and tax treaty in force
-- Bank account opening 2–8 weeks (DBS, OCBC, UOB)
-
-When asked about UAE:
-- The KEY decision is mainland vs free zone — explain clearly
-- Free zone: full foreign ownership, 0% tax on qualifying income (QFZP), faster setup — but generally cannot sell to UAE mainland customers without additional approvals
-- Mainland: direct UAE market access, 100% foreign ownership available for most commercial activities
-- Corporate tax: 0% up to AED 375,000 / 9% above — among the lowest globally
-- Small Business Relief available for businesses under AED 3 million revenue
-- VAT: 5% — mandatory registration above AED 375,000; one of the world's lowest rates
-- No personal income tax
-- No broad withholding tax on outbound payments
-- AED pegged to USD — exchange rate stability
-- India-UAE CEPA in force; no US-UAE tax treaty (important: 30% withholding on US-source income)
-- Popular free zones: DMCC, JAFZA, DAFZA, DIFC, ADGM, RAKEZ, Dubai South
-- Bank account opening often the slowest step; in-person visits typically required
-
-When asked about FEMA / ODI / India-side compliance:
-- Always clarify that FEMA is the India-side obligation — separate from the foreign country's local compliance
-- The 3 most common violations: (1) not filing Form OI to get a UIN before remitting funds, (2) missing the annual APR (December 31 deadline every year, even for dormant entities), (3) missing the FLA Return (July 15 deadline)
-- For sweat equity: always flag that acquisition of foreign equity — even without cash outflow — requires Form OI within 30 days
-- For flips/share-swaps: permitted under automatic route but both sides must be reported; valuation must be certified
-- For rectification: LSF for simple filing delays, Compounding for structural violations — FEMA is civil not criminal
-- Always mention Comply Globally's FEMA services: Form OI, APR, FLA Return, Compounding, Health Check audits
-- Offer the 12-question FEMA Health Check if the user seems to have an existing foreign structure or is unsure of their compliance status
-- Penalties can reach 300% of the transaction amount if ED detects the breach — so early voluntary compliance via LSF is always better
-
-When asked about multiple countries:
-- Address each country specifically with real facts and numbers
-- Compare tax rates, timelines, costs, and entity requirements
-- Make a clear recommendation based on their business type and goals
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-HUMAN HANDOFF RULE
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-If the user asks to speak with a person/agent/human/expert:
-1. If name missing: "Of course! May I have your name first so our team knows who to reach out to?"
-2. Once name known: "Is there anything specific you'd like to share — such as the country you're targeting or the service you need?"
-3. Then: "Perfect! Our team will reach out shortly. You can also contact us directly at sales@complyglobally.com or call +1 (302) 214-1717 / +91 99999 81613. 😊"
-
+HUMAN HANDOFF:
+If they ask for human/agent/person/expert → ask name first, then "anything specific you want to share?", then connect them.
 `;
+
 function freshSession(phone) {
   return {
     phone,
@@ -2603,23 +2462,17 @@ function buildContextSummary(leadData, isReturning, leadCollected) {
 
   let ctx = '\n\n';
   if (isReturning && leadData.name) {
-    ctx += `[RETURNING CUSTOMER — This phone number belongs to ${leadData.name}. `;
-    ctx += `They have spoken with us before. Greet them warmly by name. `;
-    ctx += `Do NOT ask for information you already have. `;
+    ctx += `[RETURNING CUSTOMER: ${leadData.name}. Greet warmly by name. Do NOT ask for info you already have. `;
     if (leadCollected) {
-      ctx += `Their requirements have already been submitted to our experts. `;
-      ctx += `If they are following up, acknowledge their previous request and reassure them an expert will be in touch. `;
+      ctx += `Lead already submitted. If following up, acknowledge and reassure expert will contact them. `;
     }
-    ctx += `Known details: ${known.join(' | ')}]`;
+    ctx += `Known: ${known.join(' | ')}]`;
   } else {
     ctx += `[CUSTOMER CONTEXT: ${known.join(' | ')}]`;
   }
   return ctx;
 }
 
-// ─────────────────────────────────────────────
-// HUMAN HANDOFF DETECTION
-// ─────────────────────────────────────────────
 const HUMAN_TRIGGERS = [
   'human', 'agent', 'real person', 'speak to someone', 'talk to someone',
   'call me', 'speak with', 'talk with', 'connect me', 'senior', 'manager',
@@ -2631,9 +2484,6 @@ function wantsHuman(msg) {
   return HUMAN_TRIGGERS.some(t => lower.includes(t));
 }
 
-// ─────────────────────────────────────────────
-// STRIP SUGGEST TOPICS (NEW)
-// ─────────────────────────────────────────────
 function stripSuggestTopics(text) {
   return text.replace(/SUGGEST_TOPICS:\[.*?\]/gs, '').trim();
 }
@@ -2647,173 +2497,134 @@ function formatSuggestTopicsForWhatsApp(text) {
   try {
     const topics = JSON.parse('[' + match[1] + ']');
     const numbered = topics.map((t, i) => `${i + 1}️⃣ ${t}`).join('\n');
-    return `${cleanText}\n\n*Quick replies — tap a number to ask:*\n${numbered}`;
+    return `${cleanText}\n\n*Quick replies:*\n${numbered}`;
   } catch {
     return cleanText;
   }
 }
-// ─────────────────────────────────────────────
-// LEAD EXTRACTION
-// ─────────────────────────────────────────────
+
 function extractLeadData(session, userMessage) {
   const lead = session.leadData;
   const msg  = userMessage.toLowerCase().trim();
 
-  if (!lead.name) {
-    const namePatterns = [
-      /(?:my name is|name is|i'm|i am|this is|call me)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+){0,2})/i,
-      /^([a-zA-Z]+(?:\s+[a-zA-Z]+){1,2})\s*(?:here|,|$)/i,
-    ];
+  // Better name extraction
+  if (!lead.name && userMessage.trim().length > 0) {
+    let cleanName = userMessage
+      .replace(/^(hi|hello|hey|thanks|ok|sure)[,\s]*/i, '')
+      .replace(/\b(my name is|i'm|i am|this is|call me|it's|its)\s+/i, '')
+      .trim();
+
+    const words = cleanName.split(/[\s,\.!?]+/).filter(w => w.length > 1);
+    
     const skipWords = new Set([
-      'based','from','india','uae','uk','usa','hi','hello','hey','yes','no',
-      'sir','madam','canada','singapore','vietnam','dubai','indonesia','there',
-      'glad','happy','great','good','fine','well','not','just','and','the',
-      'for','with','want','expand','going','looking','please','thanks'
+      'based','from','india','uae','uk','usa','hi','hello','hey','yes','no','sir','madam',
+      'canada','singapore','vietnam','dubai','indonesia','thailand','expand','expanding',
+      'looking','going','want','needs','help','please','thanks','thank','company','business',
+      'startup','there','great','good','fine','well','not','just','and','the','for','with',
+      'in','to','at','my','your','our','can','will','am','is','are','have','has','do','does'
     ]);
-    for (const pat of namePatterns) {
-      const m = userMessage.match(pat);
-      if (m) {
-        const words = m[1].trim().split(/\s+/);
-        while (words.length > 0 && skipWords.has(words[words.length-1].toLowerCase())) words.pop();
-        const name = words.join(' ').trim();
-        if (name.length > 1 && !skipWords.has(name.toLowerCase())) {
-          lead.name = name.charAt(0).toUpperCase() + name.slice(1).toLowerCase()
-            .replace(/\b\w/g, c => c.toUpperCase());
-          console.log("📝 Name:", lead.name);
-          break;
-        }
+
+    let name = '';
+    for (const word of words) {
+      if (!skipWords.has(word.toLowerCase()) && word.length > 2) {
+        name = word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+        break;
       }
+    }
+
+    if (name && name.length > 2) {
+      lead.name = name;
+      console.log("✅ Name extracted:", lead.name);
     }
   }
 
-  const countries = [
-    'vietnam','india','uae','dubai','abu dhabi','usa','united states','america',
-    'uk','united kingdom','britain','england','singapore','hong kong','canada',
-    'netherlands','holland','saudi arabia','saudi','mauritius','egypt','nigeria',
-    'indonesia','thailand','malaysia','philippines','germany','france','italy',
-    'spain','portugal','ireland','luxembourg','cyprus','malta','bahrain',
-    'kuwait','oman','qatar','bangladesh','pakistan','sri lanka','nepal'
-  ];
-
-  const countryMap = {
-    'dubai': 'UAE', 'abu dhabi': 'UAE', 'america': 'USA', 'united states': 'USA',
-    'britain': 'UK', 'england': 'UK', 'united kingdom': 'UK', 'holland': 'Netherlands',
-    'saudi': 'Saudi Arabia'
+  // Better country extraction
+  const countryPatterns = {
+    'USA': /\b(usa|u\.s\.|united states?|america|american|new york|california|florida|texas|delaware|wyoming)\b/i,
+    'Canada': /\b(canada|canadian|toronto|vancouver|ontario|british columbia|quebec)\b/i,
+    'UK': /\b(uk|u\.k\.|united kingdom|britain|england|england|scotland|london|manchester)\b/i,
+    'UAE': /\b(uae|dubai|abu dhabi|emirates|emirate)\b/i,
+    'Singapore': /\b(singapore|singaporean|sg)\b/i,
+    'India': /\b(india|indian|delhi|mumbai|bangalore|hyderabad)\b/i,
+    'Pakistan': /\b(pakistan|pakistani|karachi|lahore)\b/i,
+    'Thailand': /\b(thailand|thai|bangkok|chiang mai)\b/i,
+    'Philippines': /\b(philippines|philippine|manila|cebu)\b/i,
+    'Indonesia': /\b(indonesia|indonesian|jakarta|surabaya)\b/i,
+    'Vietnam': /\b(vietnam|vietnamese|hanoi|ho chi minh|saigon)\b/i,
+    'Estonia': /\b(estonia|estonian|tallinn)\b/i,
   };
 
-  const expansionKw = [
-    'expand to','expand in','expanding to','expanding in',
-    'open in','open a','opening in',
-    'setup in','set up in','setting up in',
-    'register in','registering in',
-    'incorporate in','incorporating in',
-    'start in','starting in','launch in',
-    'move to','moving to','relocate to',
-    'want to expand','want to go','want in','want to open',
-    'looking to expand','looking to open','looking to setup',
-    'planning to expand','planning to open',
-    'i mean','i meant'
-  ];
+  const expandKw = /\b(expand|expanding to|expand to|set up|open|incorporate|register|launch|move to|headquarter|hq)\b/i;
+  const isExpanding = expandKw.test(userMessage);
 
-  const currentKw = [
-    'based in','i am based','currently based',
-    "i'm in",'i am in','currently in',
-    'living in','located in','residing in',
-    "i'm from",'i am from','we are from',
-    'our office is','our company is in','we operate from'
-  ];
+  for (const [country, pattern] of Object.entries(countryPatterns)) {
+    if (!pattern.test(userMessage)) continue;
 
-  const isExpansion = expansionKw.some(k => msg.includes(k));
-  const isCurrent   = currentKw.some(k => msg.includes(k));
-
-  for (const c of countries) {
-    if (!msg.includes(c)) continue;
-    const mapped = countryMap[c] || capitalize(c);
-
-    if (isExpansion && !isCurrent && !lead.targetCountry) {
-      lead.targetCountry = mapped;
-      console.log("📝 Target:", lead.targetCountry);
-      break;
-    } else if (isCurrent && !isExpansion && !lead.currentCountry) {
-      lead.currentCountry = mapped;
-      console.log("📝 Current:", lead.currentCountry);
-      break;
-    } else if (!isExpansion && !isCurrent) {
-      if (!lead.currentCountry) {
-        lead.currentCountry = mapped;
-        console.log("📝 Current (inferred):", lead.currentCountry);
-      } else if (!lead.targetCountry) {
-        lead.targetCountry = mapped;
-        console.log("📝 Target (inferred):", lead.targetCountry);
-      }
-      break;
-    } else if (isExpansion && isCurrent) {
+    if (isExpanding) {
       if (!lead.targetCountry) {
-        lead.targetCountry = mapped;
-        console.log("📝 Target (mixed msg):", lead.targetCountry);
+        lead.targetCountry = country;
+        console.log("🎯 Target country:", country);
       }
-      break;
+    } else {
+      if (!lead.currentCountry) {
+        lead.currentCountry = country;
+        console.log("📍 Current country:", country);
+      } else if (!lead.targetCountry && country !== lead.currentCountry) {
+        lead.targetCountry = country;
+        console.log("🎯 Target country (inferred):", country);
+      }
     }
   }
 
+  // Service type
   if (!lead.serviceNeeded) {
-    if (msg.match(/compan|incorporat|formation|register|llc|llp|pvt|entity|business setup|establish/))
+    if (msg.match(/incorporat|formation|register|setup|company|entity|llc|corp|pvt|entity|business setup|establish/))
       lead.serviceNeeded = 'Company Formation';
-    else if (msg.match(/bank|account|finance|payment|remit/))
+    else if (msg.match(/bank|account|finance|payment|remit|wire/))
       lead.serviceNeeded = 'Banking Setup';
-    else if (msg.match(/tax|vat|gst|irs|filing|transfer pric/))
+    else if (msg.match(/tax|vat|gst|irs|filing|compliance|return/))
       lead.serviceNeeded = 'Tax Compliance';
-    else if (msg.match(/fema|rbi|overseas invest|foreign invest/))
-      lead.serviceNeeded = 'FEMA & Investment';
-    else if (msg.match(/visa|residency|golden visa|pr |permanent resid/))
-      lead.serviceNeeded = 'Residency / Golden Visa';
-    else if (msg.match(/annual|maintenance|secretar|compliance|agent/))
-      lead.serviceNeeded = 'Annual Maintenance';
-    if (lead.serviceNeeded) console.log("📝 Service:", lead.serviceNeeded);
+    else if (msg.match(/fema|rbi|overseas|foreign invest|odor/))
+      lead.serviceNeeded = 'FEMA / ODI';
+    else if (msg.match(/visa|residency|golden|permit|pr|immigration/))
+      lead.serviceNeeded = 'Residency / Visa';
+    if (lead.serviceNeeded) console.log("📋 Service:", lead.serviceNeeded);
   }
 
+  // Business stage
   if (!lead.businessStage) {
-    if (msg.match(/startup|start.?up|just start|new business|new company|early stage/))
+    if (msg.match(/startup|just start|new|early stage|founder/))
       lead.businessStage = 'Startup';
-    else if (msg.match(/freelanc|independ|consultant|solo/))
+    else if (msg.match(/freelanc|consultant|solo|self-employed|individual/))
       lead.businessStage = 'Freelancer';
-    else if (msg.match(/sme|small.?medium|small business|mid.?size/))
+    else if (msg.match(/small|medium|sme|growing|scale/))
       lead.businessStage = 'SME';
-    else if (msg.match(/established|enterprise|corporat|large|mnc|multinational/))
+    else if (msg.match(/large|enterprise|multinational|established|years/))
       lead.businessStage = 'Established Company';
-    if (lead.businessStage) console.log("📝 Stage:", lead.businessStage);
+    if (lead.businessStage) console.log("📊 Stage:", lead.businessStage);
   }
 
+  // Timeline
   if (!lead.timeline) {
-    const timeMatch = msg.match(/(\d+)\s*(?:month|week|year)/);
-    if (timeMatch) {
-      const n = parseInt(timeMatch[1]);
-      if (msg.includes('week'))       lead.timeline = n <= 2 ? 'Immediately' : 'Within 1 month';
-      else if (n <= 1)                 lead.timeline = 'Within 1 month';
-      else if (n <= 2)                 lead.timeline = '1-2 months';
-      else if (n <= 3)                 lead.timeline = '3 months';
-      else if (n <= 6)                 lead.timeline = '6 months';
-      else                             lead.timeline = '6+ months';
-    } else if (msg.match(/yesterday|immediately|asap|urgent|right now|today/)) {
-      lead.timeline = 'Immediately';
-    } else if (msg.match(/this month|soon|shortly|quickly/)) {
+    if (msg.match(/now|today|asap|urgent|immediately|right away/))
+      lead.timeline = 'ASAP';
+    else if (msg.match(/week|soon|quickly|fast/))
       lead.timeline = 'Within 1 month';
-    }
-    if (lead.timeline) console.log("📝 Timeline:", lead.timeline);
+    else if (msg.match(/month|in \d months?/))
+      lead.timeline = '1-3 months';
+    if (lead.timeline) console.log("⏱️  Timeline:", lead.timeline);
   }
 
+  // Additional info
   if (session.askedAdditionalInfo && !lead.additionalInfo && userMessage.trim().length > 2) {
-    const noInfoPhrases = ['no','nope','nothing','thats all','that\'s all','no thanks','not really','all good','nah','nothing else','no more','none'];
-    const isNegative = noInfoPhrases.some(p => msg === p || msg.startsWith(p + ' ') || msg.startsWith(p + ','));
-    lead.additionalInfo = isNegative ? 'None' : userMessage.trim();
-    console.log("📝 Additional info (lead flow):", lead.additionalInfo);
+    const isNo = /^(no|nope|nothing|nah|none|not really|thats all|that's all)$/i.test(userMessage.trim());
+    lead.additionalInfo = isNo ? 'None' : userMessage.trim();
+    console.log("📝 Additional info:", lead.additionalInfo.substring(0, 50));
   }
-
   if (session.askedHandoffAdditionalInfo && !lead.additionalInfo && userMessage.trim().length > 2) {
-    const noInfoPhrases = ['no','nope','nothing','thats all','that\'s all','no thanks','not really','all good','nah','nothing else','no more','none'];
-    const isNegative = noInfoPhrases.some(p => msg === p || msg.startsWith(p + ' ') || msg.startsWith(p + ','));
-    lead.additionalInfo = isNegative ? 'None' : userMessage.trim();
-    console.log("📝 Additional info (handoff flow):", lead.additionalInfo);
+    const isNo = /^(no|nope|nothing|nah|none|not really|thats all|that's all)$/i.test(userMessage.trim());
+    lead.additionalInfo = isNo ? 'None' : userMessage.trim();
+    console.log("📝 Additional info (handoff):", lead.additionalInfo.substring(0, 50));
   }
 }
 
@@ -2826,11 +2637,7 @@ function isLeadComplete(lead) {
 }
 
 function isLeadCoreComplete(lead) {
-  const hasCore     = !!(lead.name && lead.currentCountry && lead.targetCountry);
-  const hasService  = !!lead.serviceNeeded;
-  const hasStage    = !!lead.businessStage;
-  const hasTimeline = !!lead.timeline;
-  return hasCore && hasService && hasStage && hasTimeline;
+  return !!(lead.name && lead.currentCountry && lead.targetCountry && lead.serviceNeeded);
 }
 
 async function generateSummary(history) {
@@ -2847,7 +2654,7 @@ async function generateSummary(history) {
         max_tokens: 200,
         messages: [{
           role: 'user',
-          content: `Summarize this WhatsApp conversation in 2-3 sentences, focusing on what the customer wants and their business context:\n\n${history.slice(-10).map(m => `${m.role}: ${m.content}`).join('\n')}`
+          content: `Summarize in 2-3 sentences: ${history.slice(-10).map(m => `${m.role}: ${m.content}`).join('\n')}`
         }]
       })
     });
@@ -2856,9 +2663,6 @@ async function generateSummary(history) {
   } catch { return ''; }
 }
 
-// ─────────────────────────────────────────────
-// CLAUDE AI
-// ─────────────────────────────────────────────
 async function getClaudeReply(session, userMessage) {
   session.history.push({ role: 'user', content: userMessage });
   if (session.history.length > 20) session.history = session.history.slice(-20);
@@ -2867,9 +2671,7 @@ async function getClaudeReply(session, userMessage) {
   const hasData = !!(session.leadData.name || session.leadData.currentCountry);
   const isReturning = hasHistory || hasData;
 
-  // Use only relevant KB sections instead of the full 30K+ token KB
   const relevantKB = getRelevantKnowledge(session, userMessage);
-  
   const dynamicPrompt = SYSTEM_PROMPT.replace(KNOWLEDGE_BASE, relevantKB);
   const systemWithContext = dynamicPrompt + buildContextSummary(session.leadData, isReturning, session.leadCollected);
 
@@ -2879,173 +2681,88 @@ async function getClaudeReply(session, userMessage) {
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta': 'web-search-2025-03-05'
+        'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 600,
+        max_tokens: 400,
         system: systemWithContext,
-        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         messages: session.history
       })
     });
 
     const data = await response.json();
     if (!response.ok) {
-      console.error('❌ Claude error:', JSON.stringify(data));
-      return "I'm having trouble right now. Please try again in a moment. 🙏";
+      console.error('❌ Claude error:', data);
+      return "I'm having trouble right now. Try again in a moment! 🙏";
     }
 
     const reply = (data.content || [])
       .filter(b => b.type === 'text')
       .map(b => b.text)
       .join('\n')
-      .trim() || "I'm looking into that. Could you give me a moment? 🙏";
+      .trim() || "Let me look into that. 🙏";
 
     session.history.push({ role: 'assistant', content: reply });
     return reply;
 
   } catch (err) {
-    console.error('❌ Claude network error:', err.message);
-    return "I'm having trouble connecting right now. Please try again in a moment. 🙏";
+    console.error('❌ Claude error:', err.message);
+    return "Connection issue. Try again in a moment! 🙏";
   }
 }
 
-// ─────────────────────────────────────────────
-// INTERAKT: SEND TEXT
-// ─────────────────────────────────────────────
 async function sendWhatsAppMessage(phone, text) {
   const cleanText = formatSuggestTopicsForWhatsApp(text);
-  console.log('🤖 BOT:', cleanText);
-  if (!INTERAKT_API_KEY) { console.warn('⚠️ No Interakt key'); return; }
+  console.log('📤 Sending:', cleanText.substring(0, 80) + '...');
+  if (!INTERAKT_API_KEY) return;
 
-  // Interakt sometimes strips the country code from the stored phone number.
-  // This parser handles both cases: number WITH country code prefix, and WITHOUT.
   function parsePhone(rawPhone) {
-    // ── Numbers that already include country code (E.164 style) ──
-
-    // 12 digits starting with 91 + Indian mobile (6-9) → India
-    if (/^91[6-9]\d{9}$/.test(rawPhone)) {
-      return { countryCode: '+91', phoneNumber: rawPhone.slice(2) };
-    }
-    // 11 digits starting with 1 → US/Canada
-    if (/^1[2-9]\d{9}$/.test(rawPhone)) {
-      return { countryCode: '+1', phoneNumber: rawPhone.slice(1) };
-    }
-    // 12 digits starting with 971 → UAE
-    if (/^971[0-9]{9}$/.test(rawPhone)) {
-      return { countryCode: '+971', phoneNumber: rawPhone.slice(3) };
-    }
-    // 12 digits starting with 966 → Saudi Arabia
-    if (/^966[0-9]{9}$/.test(rawPhone)) {
-      return { countryCode: '+966', phoneNumber: rawPhone.slice(3) };
-    }
-    // 11 digits starting with 44 → UK (UK local numbers are 10 digits)
-    if (/^44[0-9]{10}$/.test(rawPhone)) {
-      return { countryCode: '+44', phoneNumber: rawPhone.slice(2) };
-    }
-    // 10 digits starting with 65 → Singapore (local numbers are 8 digits)
-    if (/^65[689][0-9]{7}$/.test(rawPhone)) {
-      return { countryCode: '+65', phoneNumber: rawPhone.slice(2) };
-    }
-    // 13 digits starting with 234 → Nigeria
-    if (/^234[0-9]{10}$/.test(rawPhone)) {
-      return { countryCode: '+234', phoneNumber: rawPhone.slice(3) };
-    }
-    // 13 digits starting with 230 → Mauritius
-    if (/^230[0-9]{8}$/.test(rawPhone)) {
-      return { countryCode: '+230', phoneNumber: rawPhone.slice(3) };
-    }
-
-    // ── Numbers WITHOUT country code (Interakt stripped it) ──
-
-    // 10 digits, Indian mobile range (starts 6-9) → India
-    if (/^[6-9]\d{9}$/.test(rawPhone)) {
-      return { countryCode: '+91', phoneNumber: rawPhone };
-    }
-    // 10 digits, NANP range (starts 2-9, valid area code) → US/Canada
-    if (/^[2-9]\d{9}$/.test(rawPhone)) {
-      return { countryCode: '+1', phoneNumber: rawPhone };
-    }
-    // 9 digits starting with 5 or 0 → UAE local
-    if (/^[05]\d{8}$/.test(rawPhone)) {
-      return { countryCode: '+971', phoneNumber: rawPhone };
-    }
-    // 8 digits starting with 6, 8, or 9 → Singapore local
-    if (/^[689]\d{7}$/.test(rawPhone)) {
-      return { countryCode: '+65', phoneNumber: rawPhone };
-    }
-    // 10 digits starting with 07 or 08 → UK local
-    if (/^0[78]\d{9}$/.test(rawPhone)) {
-      return { countryCode: '+44', phoneNumber: rawPhone };
-    }
-    // 11 digits starting with 08 → Nigeria local
-    if (/^0[789]\d{9}$/.test(rawPhone)) {
-      return { countryCode: '+234', phoneNumber: rawPhone };
-    }
-
-    // ── Fallback: assume India and log a warning ──
-    console.warn(`⚠️ parsePhone: unrecognised format for "${rawPhone}" — defaulting to +91`);
+    if (/^91[6-9]\d{9}$/.test(rawPhone)) return { countryCode: '+91', phoneNumber: rawPhone.slice(2) };
+    if (/^1[2-9]\d{9}$/.test(rawPhone)) return { countryCode: '+1', phoneNumber: rawPhone.slice(1) };
+    if (/^971[0-9]{9}$/.test(rawPhone)) return { countryCode: '+971', phoneNumber: rawPhone.slice(3) };
+    if (/^[6-9]\d{9}$/.test(rawPhone)) return { countryCode: '+91', phoneNumber: rawPhone };
+    if (/^[2-9]\d{9}$/.test(rawPhone)) return { countryCode: '+1', phoneNumber: rawPhone };
+    console.warn(`⚠️ Unknown format: ${rawPhone}`);
     return { countryCode: '+91', phoneNumber: rawPhone };
   }
 
   const { countryCode, phoneNumber } = parsePhone(phone);
-  console.log(`📞 Parsed: countryCode=${countryCode} phoneNumber=${phoneNumber} (raw: ${phone})`);
 
   try {
     const res = await fetch('https://api.interakt.ai/v1/public/message/', {
       method: 'POST',
       headers: { Authorization: `Basic ${INTERAKT_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        countryCode: countryCode,
-        phoneNumber: phoneNumber,
+        countryCode, phoneNumber,
         callbackData: 'bot_reply',
         type: 'Text',
         data: { message: cleanText }
       })
     });
-    const txt = await res.text();
-    if (!res.ok) {
-      console.error('❌ Interakt error (message not delivered):', txt);
-      console.error(`   → countryCode=${countryCode} phoneNumber=${phoneNumber} raw=${phone}`);
-    } else {
-      console.log('✅ Message sent');
-    }
+
+    if (!res.ok) console.error('❌ Interakt error:', res.status);
+    else console.log('✅ Sent');
   } catch (err) {
     console.error('❌ Send error:', err.message);
   }
 }
 
-// ─────────────────────────────────────────────
-// SAVE LEAD HELPER
-// ─────────────────────────────────────────────
 async function finalizeLead(session) {
   session.leadCollected = true;
-  console.log(`🎯 Lead complete for ${session.phone}! Saving...`);
+  console.log(`🎯 Lead complete for ${session.phone}!`);
   const summary = await generateSummary(session.history);
   try {
     await appendToSheet(session.leadData, summary);
-    console.log('✅ Sheet updated');
-  } catch (sheetErr) {
-    console.error('❌ Sheet error:', sheetErr.message);
-  }
-  try {
     await saveLead({ ...session.leadData, source: 'whatsapp', summary, completedAt: new Date() });
-    console.log('✅ MongoDB lead saved');
-  } catch (dbErr) {
-    console.error('❌ DB save error:', dbErr.message);
-  }
-  try {
     await sendLeadCapturedEmail(session.leadData);
-    console.log('✅ Lead email sent');
-  } catch (emailErr) {
-    console.error('❌ Email error:', emailErr.message);
+  } catch (err) {
+    console.error('❌ Finalize error:', err.message);
   }
 }
 
 // ─────────────────────────────────────────────
-// WEBHOOK
+// WEBHOOK (MAIN BOT)
 // ─────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
@@ -3054,106 +2771,83 @@ app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (body.type !== 'message_received') return;
 
-    const phone = (body.data?.customer?.phone_number || '').replace(/^\+/, '').replace(/\D/g, '');
+    const phone = (body.data?.customer?.phone_number || '').replace(/\D/g, '');
     const rawMsg = body.data?.message?.message || '';
     if (!phone || !rawMsg) return;
 
-    console.log(`\n📩 From ${phone}: "${rawMsg}"`);
+    console.log(`📩 ${phone}: "${rawMsg}"`);
 
-    // ── Check if brand new BEFORE getSession creates the record ──
     const isNewUser = sessionsCol ? !(await sessionsCol.findOne({ phone })) : false;
-
     const session = await getSession(phone);
 
-    // ── New user: intro already sent inside getSession, skip Claude reply ──
     if (isNewUser) {
       await saveSession(session);
       return;
     }
 
-    // ── Auto-resume check ──────────────────────
+    // Auto-resume from human mode
     if (session.humanMode) {
-      const handoffAge = Date.now() - new Date(session.humanModeAt || 0).getTime();
-      if (handoffAge >= HUMAN_TIMEOUT_MS) {
-        console.log(`⏰ Human timeout reached for ${phone} — auto-resuming bot`);
+      const age = Date.now() - new Date(session.humanModeAt || 0).getTime();
+      if (age >= HUMAN_TIMEOUT_MS) {
+        console.log(`⏰ Auto-resume for ${phone}`);
         session.humanMode = false;
         session.humanModeAt = null;
         await saveSession(session);
       } else {
-        const remainingMins = Math.ceil((HUMAN_TIMEOUT_MS - handoffAge) / 60000);
-        console.log(`🧑 Human mode active for ${phone} — bot silent (auto-resumes in ~${remainingMins}m)`);
+        console.log(`🧑 Human mode active`);
         return;
       }
     }
 
-    // ── STEP 2 of human handoff ──
+    // Step 2: Handoff additional info
     if (session.pendingHumanHandoff && session.askedHandoffAdditionalInfo) {
-      console.log(`📝 Receiving handoff additional info for ${phone}`);
+      console.log(`📝 Handoff info received`);
       extractLeadData(session, rawMsg);
-
-      const handoffMsg = "Of course! 🙏 I'm connecting you to one of our experts right now. They'll reach out to you on this WhatsApp number shortly. Please hold on!";
-      await sendWhatsAppMessage(phone, handoffMsg);
-      session.history.push({ role: 'assistant', content: handoffMsg });
-
+      await sendWhatsAppMessage(phone, "🙏 Our expert will reach out shortly!");
+      session.history.push({ role: 'assistant', content: 'Connecting to expert...' });
       session.humanMode = true;
       session.humanModeAt = new Date();
       session.pendingHumanHandoff = false;
-
       if (!session.leadCollected) {
         await finalizeLead(session);
+        await sendHumanHandoffEmail(phone, session.leadData, session.history);
       }
-
-      await sendHumanHandoffEmail(phone, session.leadData, session.history);
       await saveSession(session);
       return;
     }
 
-    // ── STEP 1 of human handoff ──
+    // Step 1: Human request
     if (wantsHuman(rawMsg)) {
-      console.log(`🙋 Human requested by ${phone} — asking additional info first`);
-
-      const additionalQ = `Before I connect you to our expert, is there anything specific you'd like them to know? 📋
-
-For example: preferred meeting time, number of team members joining, specific questions, or any other details.
-
-(Reply 'no' if nothing else)`;
-
-      await sendWhatsAppMessage(phone, additionalQ);
-      session.history.push({ role: 'assistant', content: additionalQ });
-
+      console.log(`🙋 Human requested`);
+      await sendWhatsAppMessage(phone, "Any specific details you'd like our expert to know? (reply 'no' if not)");
+      session.history.push({ role: 'assistant', content: 'Connecting to expert...' });
       session.pendingHumanHandoff = true;
       session.askedHandoffAdditionalInfo = true;
-
       await saveSession(session);
       return;
     }
 
-    // ── Normal bot flow ──
+    // Normal bot flow
     extractLeadData(session, rawMsg);
-
-    console.log(`📊 Lead: name=${session.leadData.name} | from=${session.leadData.currentCountry} | to=${session.leadData.targetCountry} | service=${session.leadData.serviceNeeded} | askedExtra=${session.askedAdditionalInfo} | collected=${session.leadCollected}`);
-
     const reply = await getClaudeReply(session, rawMsg);
     await sendWhatsAppMessage(phone, reply);
 
-    if (!session.askedAdditionalInfo && !session.leadCollected && isLeadCoreComplete(session.leadData)) {
+    // Ask for additional info when core is complete
+    if (!session.askedAdditionalInfo && isLeadCoreComplete(session.leadData)) {
       session.askedAdditionalInfo = true;
-      const additionalQ = "One last thing before I connect you with our expert — is there anything specific you'd like them to know? Any additional details, questions, or requirements? 📋\n\n(Reply 'no' if nothing else)";
-      console.log(`💬 Asking additional info for ${phone}`);
-      await sendWhatsAppMessage(phone, additionalQ);
-      session.history.push({ role: 'assistant', content: additionalQ });
+      await sendWhatsAppMessage(phone, "Any other details you'd like to share? (reply 'no' if not)");
+      session.history.push({ role: 'assistant', content: 'Asked for additional info' });
       await saveSession(session);
       return;
     }
 
-    if (session.askedAdditionalInfo && !session.leadCollected) {
-      if (!session.leadData.additionalInfo) {
-        const noInfoPhrases = ['no','nope','nothing','thats all','no thanks','not really','none','nah','nothing else','no more'];
-        const isNo = noInfoPhrases.some(p => rawMsg.toLowerCase().trim() === p || rawMsg.toLowerCase().trim().startsWith(p + ' '));
-        session.leadData.additionalInfo = isNo ? 'None' : rawMsg.trim();
-        console.log(`📝 Additional info captured: ${session.leadData.additionalInfo}`);
-      }
+    // Finalize lead when complete
+    if (session.askedAdditionalInfo && !session.leadCollected && session.leadData.additionalInfo) {
+      console.log(`✅ Lead complete!`);
       await finalizeLead(session);
+      const closeMsg = `Thank you, ${session.leadData.name}! 🎉 Our team will reach out shortly.\n\nContact: sales@complyglobally.com\n📞 +1 (302) 214-1717 | +91 99999 81613`;
+      await sendWhatsAppMessage(phone, closeMsg);
+      session.history.push({ role: 'assistant', content: closeMsg });
     }
 
     await saveSession(session);
@@ -3164,37 +2858,26 @@ For example: preferred meeting time, number of team members joining, specific qu
 });
 
 // ─────────────────────────────────────────────
-// HUMAN CONTROL ENDPOINTS
+// CONTROL ENDPOINTS
 // ─────────────────────────────────────────────
-app.post('/resume-bot/:phone', async (req, res) => {
-  const phone = req.params.phone.replace(/\D/g, '');
-  const session = await getSession(phone);
-  session.humanMode = false;
-  session.humanModeAt = null;
-  await saveSession(session);
-  await sendWhatsAppMessage(phone, "Hi again! 👋 I'm Comply, back to assist you. How can I help?");
-  res.json({ success: true, message: `Bot resumed for ${phone}` });
-});
-
 app.get('/resume-bot/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   const session = await getSession(phone);
   session.humanMode = false;
   session.humanModeAt = null;
   await saveSession(session);
-  await sendWhatsAppMessage(phone, "Hi again! 👋 I'm Compliance Advisor, back to assist you. How can I help?");
-  res.send(`
-    <html><body style="font-family:sans-serif;text-align:center;padding:60px">
-      <h2 style="color:#166534">✅ Bot resumed for +${phone}</h2>
-      <p>Comply will now respond to this customer's next message.</p>
-    </body></html>
-  `);
+  await sendWhatsAppMessage(phone, "👋 I'm back! How can I help?");
+  res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px"><h2 style="color:#166534">✅ Bot resumed for +${phone}</h2></body></html>`);
 });
 
-app.get('/status/:phone', async (req, res) => {
+app.post('/resume-bot/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   const session = await getSession(phone);
-  res.json({ phone, humanMode: session.humanMode, leadData: session.leadData });
+  session.humanMode = false;
+  session.humanModeAt = null;
+  await saveSession(session);
+  await sendWhatsAppMessage(phone, "👋 I'm back! How can I help?");
+  res.json({ success: true });
 });
 
 app.get('/leads', async (req, res) => {
@@ -3203,198 +2886,37 @@ app.get('/leads', async (req, res) => {
   res.json(leads);
 });
 
-// ─────────────────────────────────────────────
-// LOCAL TEST
-// ─────────────────────────────────────────────
-const testSession = freshSession('test_user');
-
-app.post('/chat', async (req, res) => {
-  try {
-    const msg = req.body.message || '';
-    if (!msg) return res.json({ reply: 'Please send a message.' });
-
-    if (wantsHuman(msg)) {
-      testSession.humanMode = true;
-      return res.json({ reply: "Of course! 🙏 Connecting you to an expert shortly.", humanMode: true });
-    }
-
-    extractLeadData(testSession, msg);
-    const reply = await getClaudeReply(testSession, msg);
-    res.json({ reply, leadData: testSession.leadData, humanMode: testSession.humanMode });
-  } catch (e) {
-    console.error('❌ Chat error:', e.message);
-    res.json({ reply: 'Error occurred.' });
-  }
-});
-
 app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
-
-// ─────────────────────────────────────────────
-// DEBUG ENDPOINTS
-// ─────────────────────────────────────────────
-app.get('/debug-sheets', async (req, res) => {
-  const results = { env: {}, parseOk: false, authOk: false, writeOk: false, error: null };
-  results.env.GOOGLE_SHEET_ID = GOOGLE_SHEET_ID ? '✅ set' : '❌ missing';
-  results.env.GOOGLE_CREDENTIALS_length = GOOGLE_CREDENTIALS ? GOOGLE_CREDENTIALS.length : 0;
-  results.env.GOOGLE_CREDENTIALS_starts = GOOGLE_CREDENTIALS.substring(0, 20);
-  results.env.GOOGLE_CREDENTIALS_ends = GOOGLE_CREDENTIALS.substring(GOOGLE_CREDENTIALS.length - 20);
-
-  try {
-    const creds = JSON.parse(GOOGLE_CREDENTIALS);
-    results.parseOk = true;
-    results.client_email = creds.client_email;
-    results.has_private_key = !!creds.private_key;
-    results.private_key_start = creds.private_key ? creds.private_key.substring(0, 40) : 'MISSING';
-
-    const auth = new google.auth.GoogleAuth({
-      credentials: creds,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
-    const sheets = google.sheets({ version: 'v4', auth });
-    results.authOk = true;
-
-    await sheets.spreadsheets.values.get({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'Sheet1!A1:A1',
-    });
-    results.sheetReadOk = true;
-
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'Sheet1!A1',
-      valueInputOption: 'RAW',
-      requestBody: { values: [['DEBUG TEST', 'Test Name', '9999999999', 'India', 'UAE', 'Company Formation', 'Startup', 'ASAP', 'Debug test row', 'This is a test']] },
-    });
-    results.writeOk = true;
-
-  } catch (err) {
-    results.error = err.message;
-    results.stack = err.stack;
-  }
-
-  res.json(results);
-});
-
-app.get('/debug-email', async (req, res) => {
-  const result = {
-    timestamp: new Date().toISOString(),
-    config: {
-      hasResendKey: !!RESEND_API_KEY,
-      resendKeyPrefix: RESEND_API_KEY ? RESEND_API_KEY.substring(0, 8) + '...' : 'missing',
-      notifyEmail: NOTIFY_EMAIL,
-      fromEmail: FROM_EMAIL,
-    },
-    sendResult: null,
-    error: null
-  };
-
-  try {
-    const sendResult = await sendEmail({
-      subject: '✅ Comply Bot - Email Test',
-      html: `
-        <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
-          <h2 style="color:#166534">Email Working! 🎉</h2>
-          <p>This test email was sent at: ${new Date().toLocaleString()}</p>
-          <p>Your Comply Globally bot emails should now work.</p>
-          <hr>
-          <p style="color:#666;font-size:12px">If you see this, Resend is configured correctly.</p>
-        </div>
-      `
-    });
-    result.sendResult = sendResult;
-    res.json(result);
-  } catch (err) {
-    result.error = err.message;
-    res.status(500).json(result);
-  }
-});
-
-app.get('/force-sheet/:phone', async (req, res) => {
-  const phone = req.params.phone.replace(/\D/g, '');
-  const session = await getSession(phone);
-  if (!session) return res.json({ error: 'Session not found' });
-  try {
-    const summary = await generateSummary(session.history);
-    await appendToSheet(session.leadData, summary);
-    await saveLead({ ...session.leadData, source: 'whatsapp', summary, completedAt: new Date() });
-    res.json({ success: true, leadData: session.leadData, summary });
-  } catch (err) {
-    res.json({ error: err.message });
-  }
-});
-
-app.get('/clear-session/:phone', async (req, res) => {
-  const phone = req.params.phone.replace(/\D/g, '');
-  try {
-    if (sessionsCol) {
-      await sessionsCol.deleteOne({ phone });
-      // Removed hardcoded +91 logic - phone is now stored consistently
-    }
-    res.json({ success: true, message: `Session cleared for ${phone}. Fresh start on next message.` });
-  } catch (err) {
-    res.json({ error: err.message });
-  }
-});
-
-app.get('/reset-all-sessions', async (req, res) => {
-  try {
-    if (sessionsCol) {
-      const result = await sessionsCol.deleteMany({});
-      res.json({ success: true, deleted: result.deletedCount, message: 'All sessions cleared.' });
-    } else {
-      res.json({ error: 'No DB connection' });
-    }
-  } catch (err) {
-    res.json({ error: err.message });
-  }
-});
-
-app.delete('/reset-leads', async (req, res) => {
-  try {
-    if (!leadsCol) return res.status(503).json({ error: 'No DB connection' });
-    const result = await leadsCol.deleteMany({});
-    console.log(`🗑️  CRM reset — ${result.deletedCount} leads deleted`);
-    res.json({ success: true, deleted: result.deletedCount, message: 'All leads cleared. CRM will now show only new leads going forward.' });
-  } catch (err) {
-    console.error('❌ Reset leads error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 // ─────────────────────────────────────────────
 // KEEP-ALIVE
 // ─────────────────────────────────────────────
-const KEEP_ALIVE_URL      = process.env.KEEP_ALIVE_URL || `${BASE_URL}/health`;
-const KEEP_ALIVE_INTERVAL = 14 * 60 * 1000;
+const KEEP_ALIVE_URL = process.env.KEEP_ALIVE_URL || `${BASE_URL}/health`;
 
 function startKeepAlive() {
-  console.log(`💓 Keep-alive enabled → pinging ${KEEP_ALIVE_URL} every 14 min`);
+  console.log(`💓 Keep-alive enabled (every 14 min)`);
   setInterval(async () => {
     try {
-      const res = await fetch(KEEP_ALIVE_URL);
-      console.log(`💓 Keep-alive ping OK [${res.status}] — ${new Date().toISOString()}`);
+      await fetch(KEEP_ALIVE_URL);
+      console.log(`💓 Keep-alive OK`);
     } catch (err) {
-      console.error(`💔 Keep-alive ping FAILED: ${err.message}`);
+      console.error(`💔 Keep-alive failed:`, err.message);
     }
-  }, KEEP_ALIVE_INTERVAL);
+  }, 14 * 60 * 1000);
 }
 
 // ─────────────────────────────────────────────
-// START
+// START SERVER
 // ─────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
     console.log(`\n🔥 Server running on port ${PORT}`);
-    console.log(`📡 Webhook:     POST /webhook`);
-    console.log(`💬 Test chat:   POST /chat`);
-    console.log(`▶️  Resume bot:  POST /resume-bot/:phone`);
-    console.log(`📊 Leads:       GET  /leads`);
-    console.log(`❤️  Health:      GET  /health`);
-    console.log(`📧 Test email:  GET  /debug-email\n`);
+    console.log(`📡 POST /webhook — receives WhatsApp messages`);
+    console.log(`💬 POST /chat — test endpoint`);
+    console.log(`📊 GET  /leads — view all leads\n`);
     startKeepAlive();
   });
 });
