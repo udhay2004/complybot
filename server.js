@@ -2,68 +2,24 @@
 
 /**
  * ============================================================
- *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend (v2)
- *  Production-Grade | Deep Conversational Intelligence | Persistent Memory
- *  
- *  FIXES IMPLEMENTED:
- *  ✅ Menu memory failure → MenuStateTracker with reference resolution
- *  ✅ Context loss → SessionManager + MemoryManager with structured storage
- *  ✅ Name validation broken → NameValidator with NLP checks + blacklist
- *  ✅ Onboarding conflicts → OnboardingStateManager with completion tracking
- *  ✅ Rate limits → TokenOptimizer + semantic context pruning
- *  ✅ Weak fallback → IntentClassifier + intelligent recovery
- *  ✅ Robotic behavior → Adaptive context-aware response generation
- * ============================================================
+ *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend (v3)
  *
- *  KNOWLEDGE BASE INSERTION INSTRUCTIONS:
- *
- *  1. Search for the constant: const KNOWLEDGE_BASE = `
- *     (around line 400-450 in this file)
- *
- *  2. Replace the PLACEHOLDER_KNOWLEDGE_BASE string with your complete KB.
- *     The KB should contain:
- *       - Country guides (USA, UK, Singapore, UAE, Canada, etc.)
- *       - FEMA/ODI compliance (India-specific)
- *       - Tax information by jurisdiction
- *       - Banking and setup timelines
- *       - Document requirements
- *       - Pricing information
- *     
- *  3. Format your KB as ONE continuous string (no line breaks in the template literal).
- *     Example:
- *       const KNOWLEDGE_BASE = `
- *       ════ USA GUIDE ════
- *       Delaware LLC costs...
- *       Wyoming benefits...
- *       [continue with full content]
- *       ════ UK GUIDE ════
- *       ...
- *       `;
- *
- *  4. The system will automatically:
- *       - Split and index the KB into semantic chunks
- *       - Retrieve relevant sections based on user queries
- *       - Inject only relevant context into Claude prompts (token optimization)
- *       - Cache frequently accessed sections
- *
- *  5. Size guidelines:
- *       - Small KB (<50KB): inject whole KB per request
- *       - Medium KB (50-200KB): semantic chunking + TF-IDF retrieval
- *       - Large KB (>200KB): upgrade to vector DB (Pinecone/Weaviate)
+ *  CHANGES FROM v2:
+ *  ⚡ SPEED: max_tokens cut to 350, parallel DB writes, KB retrieval limit=1
+ *  🎛️  QUICK REPLIES: every Claude response ends with 1️⃣2️⃣3️⃣4️⃣ topic buttons
+ *  ✅ MENU FIX: invalid selections ("5", "6") → clear error; valid → full answer
+ *  🧠 MENU CONTENT: stores option TEXT + TOPIC so Claude knows what to answer
  *
  *  ENVIRONMENT VARIABLES REQUIRED:
  *    INTERAKT_API_KEY     — Interakt WhatsApp API key
  *    ANTHROPIC_API_KEY    — Claude API key
  *    MONGODB_URI          — MongoDB connection string
- *    GOOGLE_SHEET_ID      — Google Sheet ID for lead logging
- *    GOOGLE_CREDENTIALS   — Stringified Google service-account JSON
  *    RESEND_API_KEY       — Resend email API key
  *    NOTIFY_EMAIL         — Email address to send notifications to
  *    FROM_EMAIL           — Sender email (Resend verified domain)
  *    BASE_URL             — Your deployed server URL
  *    HUMAN_TIMEOUT_MS     — ms before bot auto-resumes after human handoff (default 7200000)
  *    PORT                 — Server port (default 5000)
- *    KEEP_ALIVE_URL       — URL to ping every 14 min (optional)
  * ============================================================
  */
 
@@ -74,7 +30,6 @@ const express         = require('express');
 const path            = require('path');
 const fetch           = require('node-fetch');
 const { MongoClient } = require('mongodb');
-const { google }      = require('googleapis');
 require('dotenv').config();
 
 const app = express();
@@ -92,22 +47,19 @@ app.use((req, res, next) => {
 // ─────────────────────────────────────────────
 // ENVIRONMENT CONFIG
 // ─────────────────────────────────────────────
-const INTERAKT_API_KEY   = (process.env.INTERAKT_API_KEY   || '').replace(/['"` \n\r]/g, '');
-const ANTHROPIC_API_KEY  = (process.env.ANTHROPIC_API_KEY  || '').replace(/['"` \n\r]/g, '');
-const MONGODB_URI        = process.env.MONGODB_URI         || '';
-const GOOGLE_SHEET_ID    = process.env.GOOGLE_SHEET_ID     || '';
-const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS  || '';
-const RESEND_API_KEY     = (process.env.RESEND_API_KEY     || '').replace(/['"` \n\r]/g, '');
-const NOTIFY_EMAIL       = process.env.NOTIFY_EMAIL        || 'udhaymarwah96@gmail.com';
-const FROM_EMAIL         = process.env.FROM_EMAIL          || 'onboarding@resend.dev';
-const BASE_URL           = process.env.BASE_URL            || 'https://complybot.onrender.com';
-const HUMAN_TIMEOUT_MS   = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000', 10);
+const INTERAKT_API_KEY  = (process.env.INTERAKT_API_KEY  || '').replace(/['"` \n\r]/g, '');
+const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || '').replace(/['"` \n\r]/g, '');
+const MONGODB_URI       = process.env.MONGODB_URI        || '';
+const RESEND_API_KEY    = (process.env.RESEND_API_KEY    || '').replace(/['"` \n\r]/g, '');
+const NOTIFY_EMAIL      = process.env.NOTIFY_EMAIL       || 'udhaymarwah96@gmail.com';
+const FROM_EMAIL        = process.env.FROM_EMAIL         || 'onboarding@resend.dev';
+const BASE_URL          = process.env.BASE_URL           || 'https://complybot.onrender.com';
+const HUMAN_TIMEOUT_MS  = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000', 10);
 
 [
   ['INTERAKT_API_KEY',  INTERAKT_API_KEY],
   ['ANTHROPIC_API_KEY', ANTHROPIC_API_KEY],
   ['MONGODB_URI',       MONGODB_URI],
-  ['GOOGLE_SHEET_ID',   GOOGLE_SHEET_ID],
   ['RESEND_API_KEY',    RESEND_API_KEY],
 ].forEach(([k, v]) => {
   if (!v) console.error(`❌  ENV MISSING: ${k}`);
@@ -118,27 +70,16 @@ const HUMAN_TIMEOUT_MS   = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000', 1
 // ════════ KNOWLEDGE BASE — PASTE YOUR COMPLETE KB HERE ════════════════════
 // ════════════════════════════════════════════════════════════════════════════
 //
-// CRITICAL: The KNOWLEDGE_BASE below is injected into Claude's system prompt.
-// To add your content:
+//  HOW TO INSERT YOUR KB:
+//  1. Find the line:  const KNOWLEDGE_BASE = `
+//  2. Paste your entire KB content between the backticks below
+//  3. Keep the closing backtick on its own line
 //
-// 1. Copy your complete knowledge base (all country guides, tax info, etc.)
-// 2. Replace the PLACEHOLDER text below with your full KB content
-// 3. Keep the template literal backticks intact:  const KNOWLEDGE_BASE = `...`;
-// 4. Do NOT include the outer triple backticks — those are for this file only
-//
-// Your KB should be ONE continuous string. Example structure:
-//   ════ USA GUIDE ════
-//   Delaware...
-//   Wyoming...
-//   ════ UK GUIDE ════
-//   ...
-//   ════ FEMA ODI ════
-//   ...
-//
-// The system will:
-//   - Automatically index and retrieve relevant sections per user query
-//   - Optimize tokens by only injecting relevant context
-//   - Cache frequently accessed sections for performance
+//  The system will automatically:
+//   - Chunk the KB by ━━━ section headers
+//   - Score chunks against user keywords (TF-IDF)
+//   - Inject only the TOP 1 most relevant chunk per request (speed!)
+//   - Fallback to first 1500 chars if no match
 //
 const KNOWLEDGE_BASE = `
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2137,21 +2078,142 @@ CONTACT & PRICING
 - Pricing: "Our team will send a custom quote based on your jurisdiction and requirements"
 - Specific legal opinions or complex tax structuring: "Our experts will guide you on the specifics"
 `;
-
 // ════════════════════════════════════════════════════════════════════════════
 // ════════ END KNOWLEDGE BASE INSERTION POINT ════════════════════════════════
 // ════════════════════════════════════════════════════════════════════════════
 
 // ─────────────────────────────────────────────
+// QUICK-REPLY TOPIC BANKS
+// These are the numbered options appended to every Claude response.
+// Keys match country/topic slugs. Claude picks the right bank based on context.
+// ─────────────────────────────────────────────
+const QUICK_REPLY_BANKS = {
+  uae: [
+    'UAE Mainland LLC setup',
+    'Free Zone comparison',
+    'UAE banking requirements',
+    'Corporate tax implications',
+  ],
+  usa: [
+    'Best US state for my business',
+    'LLC vs C-Corp comparison',
+    'US banking without SSN',
+    'Form 5472 & compliance',
+  ],
+  uk: [
+    'UK company incorporation',
+    'UK banking options',
+    'UK tax & VAT overview',
+    'Skilled Worker visa',
+  ],
+  singapore: [
+    'Singapore Pte. Ltd. setup',
+    'Resident director requirement',
+    'Singapore tax benefits',
+    'Banking & account opening',
+  ],
+  canada: [
+    'Canada incorporation options',
+    'GST/HST registration',
+    'Resident director requirement',
+    'Banking & payroll setup',
+  ],
+  india_fema: [
+    'Form OI & UIN registration',
+    'Annual Performance Report (APR)',
+    'FLA Return filing',
+    'Compounding & late rectification',
+  ],
+  thailand: [
+    'BOI promotion benefits',
+    'Foreign Business Act limits',
+    'Thai banking timeline',
+    'Work permit requirements',
+  ],
+  estonia: [
+    'e-Residency application',
+    'Estonian OÜ incorporation',
+    'EU VAT & tax benefits',
+    'Banking for e-residents',
+  ],
+  indonesia: [
+    'PT PMA setup & capital',
+    'Positive Investment List check',
+    'Indonesia banking timeline',
+    'Work permit (ITAS) process',
+  ],
+  philippines: [
+    'Philippines subsidiary setup',
+    'PEZA incentives overview',
+    'BIR & SEC registration',
+    'Employment & payroll rules',
+  ],
+  vietnam: [
+    'Vietnam LLC incorporation',
+    'Foreign ownership rules',
+    'Vietnam banking process',
+    'Work permit requirements',
+  ],
+  italy: [
+    'Italian S.r.l. incorporation',
+    'IRES & IRAP tax rates',
+    'Golden Power & restrictions',
+    'Employment & CCNL rules',
+  ],
+  general: [
+    'Compare jurisdictions for my business',
+    'FEMA/ODI compliance (Indian founders)',
+    'Banking setup in target country',
+    'Speak to an advisor',
+  ],
+};
+
+// Emoji number map for display
+const EMOJI_NUMS = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣'];
+
+/**
+ * Detect which quick-reply bank to use based on conversation context.
+ * Checks the last few messages for country/topic keywords.
+ */
+function detectTopicBank(session, userMessage) {
+  const recent = [
+    userMessage,
+    ...(session.history || []).slice(-4).map(m => m.content),
+  ].join(' ').toLowerCase();
+
+  if (/\buae\b|dubai|abu dhabi|emirates|free zone|mainland/.test(recent)) return 'uae';
+  if (/\busa\b|\bus\b|america|delaware|wyoming|llc|c-corp/.test(recent))   return 'usa';
+  if (/\buk\b|britain|england|companies house|hmrc/.test(recent))           return 'uk';
+  if (/singapore|pte\.?\s*ltd|acra|iras/.test(recent))                      return 'singapore';
+  if (/canada|toronto|cra|gst.*hst/.test(recent))                           return 'canada';
+  if (/fema|odi|rbi|apr|fla return|form oi/.test(recent))                   return 'india_fema';
+  if (/thailand|bangkok|boi|fba|thai/.test(recent))                         return 'thailand';
+  if (/estonia|e-residency|estonian|o[uü]/.test(recent))                    return 'estonia';
+  if (/indonesia|pt pma|jakarta|kbli/.test(recent))                         return 'indonesia';
+  if (/philippines|manila|peza|bir|sec/.test(recent))                       return 'philippines';
+  if (/vietnam|ho chi minh|hanoi|vnd/.test(recent))                         return 'vietnam';
+  if (/italy|milan|rome|s\.r\.l|ires|irap/.test(recent))                    return 'italy';
+  return 'general';
+}
+
+/**
+ * Build the quick-reply footer string appended to every bot response.
+ * Returns an object: { footer: string, options: string[] }
+ */
+function buildQuickReplyFooter(bank) {
+  const options = QUICK_REPLY_BANKS[bank] || QUICK_REPLY_BANKS.general;
+  const lines   = options.map((opt, i) => `${EMOJI_NUMS[i]} ${opt}`);
+  const footer  = `\n\n*Quick topics:*\n${lines.join('\n')}`;
+  return { footer, options };
+}
+
+// ─────────────────────────────────────────────
 // MONGODB — CONNECTION & COLLECTIONS
 // ─────────────────────────────────────────────
-let db, sessionsCol, leadsCol, activeStateCol, analyticsCol, memoryCol, menuStateCol;
+let db, sessionsCol, leadsCol, activeStateCol, analyticsCol, menuStateCol;
 
 async function connectMongo() {
-  if (!MONGODB_URI) {
-    console.warn('⚠️  MONGODB_URI not set — running in memory-only mode');
-    return;
-  }
+  if (!MONGODB_URI) { console.warn('⚠️  MONGODB_URI not set — memory-only mode'); return; }
   try {
     const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 10000 });
     await client.connect();
@@ -2160,18 +2222,14 @@ async function connectMongo() {
     leadsCol       = db.collection('leads');
     activeStateCol = db.collection('activeStates');
     analyticsCol   = db.collection('analytics');
-    memoryCol      = db.collection('memory');
     menuStateCol   = db.collection('menuState');
 
-    // Indexes for performance
     await Promise.all([
       sessionsCol.createIndex({ phone: 1 }, { unique: true }),
       activeStateCol.createIndex({ phone: 1 }, { unique: true }),
       menuStateCol.createIndex({ phone: 1 }, { unique: true }),
-      memoryCol.createIndex({ phone: 1 }),
       analyticsCol.createIndex({ phone: 1, ts: -1 }),
     ]);
-
     console.log('✅  MongoDB connected — complybot database');
   } catch (err) {
     console.error('❌  MongoDB connection failed:', err.message);
@@ -2181,238 +2239,84 @@ async function connectMongo() {
 // ─────────────────────────────────────────────
 // IN-MEMORY CACHE (TTL: 30 min)
 // ─────────────────────────────────────────────
-const SESSION_TTL     = 30 * 60 * 1000;
-const sessionCache    = new Map();
+const SESSION_TTL      = 30 * 60 * 1000;
+const sessionCache     = new Map();
 const activeStateCache = new Map();
-const menuStateCache  = new Map();
-const kbChunkCache    = new Map();
+const menuStateCache   = new Map();
+const kbChunkCache     = new Map();
 
-function cacheSet(map, key, value) {
-  map.set(key, { value, ts: Date.now() });
-}
-
+function cacheSet(map, key, value) { map.set(key, { value, ts: Date.now() }); }
 function cacheGet(map, key) {
-  const entry = map.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.ts > SESSION_TTL) { map.delete(key); return null; }
-  return entry.value;
-}
-
-function cacheDelete(map, key) {
-  map.delete(key);
+  const e = map.get(key);
+  if (!e) return null;
+  if (Date.now() - e.ts > SESSION_TTL) { map.delete(key); return null; }
+  return e.value;
 }
 
 // ─────────────────────────────────────────────
 // KNOWLEDGE BASE CHUNKER & RETRIEVER
-// Splits KB into semantic chunks for efficient retrieval
+// ⚡ SPEED: limit=1 — only the single best chunk injected per request
 // ─────────────────────────────────────────────
+function extractKeywords(text) {
+  const words = text.toLowerCase().match(/\b\w{4,}\b/g) || [];
+  const freq  = {};
+  words.forEach(w => freq[w] = (freq[w] || 0) + 1);
+  return Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([w]) => w);
+}
+
 function chunkKnowledgeBase(kb) {
-  if (!kb || kb.includes('PLACEHOLDER')) return [];
-
+  if (!kb || kb.includes('PASTE_YOUR_KNOWLEDGE_BASE_HERE')) return [];
   const chunks = [];
-  // Split by section headers (════ SECTION ════)
-  const sections = kb.split(/════[\s\S]*?════/);
-
+  const sections = kb.split(/━{3,}/);
   sections.forEach((section, idx) => {
-    if (section.trim().length < 50) return; // Skip tiny sections
-
-    // Further sub-chunk by topic (e.g., "TAXATION:", "BANKING:")
+    if (section.trim().length < 50) return;
     const subsections = section.split(/(?=^[A-Z][A-Z0-9\s]+:|\n[A-Z][A-Z0-9\s]+:)/gm);
-
-    subsections.forEach(subsec => {
-      if (subsec.trim().length > 50) {
-        chunks.push({
-          id:       `chunk-${idx}-${chunks.length}`,
-          content:  subsec.trim(),
-          keywords: extractKeywords(subsec),
-        });
+    subsections.forEach(sub => {
+      if (sub.trim().length > 50) {
+        chunks.push({ id: `${idx}-${chunks.length}`, content: sub.trim(), keywords: extractKeywords(sub) });
       }
     });
   });
-
   return chunks;
 }
 
-function extractKeywords(text) {
-  const words = text.toLowerCase().match(/\b\w{4,}\b/g) || [];
-  // Return top 10 most frequent words as keywords
-  const freq = {};
-  words.forEach(w => freq[w] = (freq[w] || 0) + 1);
-  return Object.entries(freq)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10)
-    .map(([w]) => w);
-}
-
-function retrieveRelevantKB(userMessage, limit = 3) {
-  if (KNOWLEDGE_BASE.includes('PLACEHOLDER')) return '';
-
-  // Simple TF-IDF retrieval: match user keywords against KB chunks
+function retrieveRelevantKB(userMessage, limit = 1) {
+  if (KNOWLEDGE_BASE.includes('PASTE_YOUR_KNOWLEDGE_BASE_HERE')) return '';
   const cached = cacheGet(kbChunkCache, 'chunks');
   const chunks = cached || chunkKnowledgeBase(KNOWLEDGE_BASE);
-
   if (!cached) cacheSet(kbChunkCache, 'chunks', chunks);
 
   const msgKeywords = extractKeywords(userMessage);
-  const scored = chunks.map(chunk => {
-    const matches = msgKeywords.filter(kw => chunk.keywords.includes(kw)).length;
-    return { ...chunk, score: matches };
-  });
-
-  const relevant = scored
+  const scored = chunks
+    .map(chunk => ({ ...chunk, score: msgKeywords.filter(kw => chunk.keywords.includes(kw)).length }))
     .filter(c => c.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit)
     .map(c => c.content)
     .join('\n\n');
 
-  // Fallback: if no semantic match, return first 2000 chars of KB
-  if (!relevant) {
-    return KNOWLEDGE_BASE.substring(0, 2000) + '\n[...see full knowledge base...]';
-  }
-
-  return relevant;
+  return scored || KNOWLEDGE_BASE.substring(0, 1500) + '\n[...full KB available...]';
 }
 
 // ─────────────────────────────────────────────
-// NAME VALIDATOR
-// Strict validation to prevent random words from being saved as names
-// ─────────────────────────────────────────────
-const INVALID_NAME_PATTERNS = [
-  // Common words, adverbs, adjectives that shouldn't be names
-  /^(yes|no|sure|okay|ok|hello|hi|hey|thanks|thank you|please|more|less|good|bad|other|same|different)$/i,
-  // Countries
-  /^(usa|uk|india|canada|australia|singapore|uae|dubai|london|new\s+york|california|florida)$/i,
-  // Generic nouns
-  /^(company|business|service|product|office|team|person|people|money|cost|fee|time|date|number)$/i,
-  // Single letters or short gibberish
-  /^[a-z]{1,2}$/i,
-  // Numbers or mostly numbers
-  /^\d+$/,
-  // Menu replies or responses
-  /^(1|2|3|4|5|option|menu|reply|answer)$/i,
-];
-
-const COMMON_FIRST_NAMES = new Set([
-  'john', 'james', 'robert', 'michael', 'william', 'david', 'richard', 'joseph',
-  'thomas', 'charles', 'christopher', 'daniel', 'matthew', 'anthony', 'mark',
-  'donald', 'steven', 'paul', 'andrew', 'joshua', 'kenneth', 'kevin', 'brian',
-  'edward', 'ronald', 'timothy', 'jason', 'jeffrey', 'ryan', 'jacob', 'gary',
-  'nicholas', 'eric', 'jonathan', 'stephen', 'larry', 'justin', 'scott', 'brandon',
-  'benjamin', 'samuel', 'frank', 'gregory', 'raymond', 'alexander', 'patrick',
-  'jack', 'dennis', 'jerry', 'tyler', 'aaron', 'jose', 'adam', 'henry', 'douglas',
-  'zachary', 'peter', 'kyle', 'walter', 'harold', 'carl', 'jeremy', 'keith',
-  'roger', 'arthur', 'terry', 'sean', 'austin', 'gerald', 'carl', 'roger',
-  // Female names
-  'mary', 'patricia', 'jennifer', 'linda', 'barbara', 'elizabeth', 'susan', 'jessica',
-  'sarah', 'karen', 'nancy', 'betty', 'margaret', 'sandra', 'ashley', 'kimberly',
-  'emily', 'donna', 'michelle', 'dorothy', 'carol', 'amanda', 'melissa', 'deborah',
-  'stephanie', 'rebecca', 'sharon', 'laura', 'cynthia', 'kathleen', 'amy', 'angela',
-  'shirley', 'anna', 'brenda', 'pamela', 'emma', 'nicole', 'helen', 'samantha',
-  'katherine', 'christine', 'debra', 'rachel', 'catherine', 'carolyn', 'janet',
-  'maria', 'heather', 'diane', 'virginia', 'julie', 'joyce', 'victoria', 'olivia',
-  'kelly', 'christina', 'lauren', 'joan', 'evelyn', 'judith', 'megan', 'andrea',
-  'cheryl', 'hannah', 'jacqueline', 'martha', 'madison', 'teresa', 'gloria',
-  // Indian names (sample)
-  'arun', 'amit', 'anita', 'arjun', 'akshay', 'abhinav', 'ashish', 'anand',
-  'raj', 'rahul', 'rohan', 'ravi', 'ritesh', 'rajesh', 'ramesh', 'rakesh',
-  'sandeep', 'sanjay', 'sameer', 'saurabh', 'suresh', 'sunil', 'sanjiv', 'sidhant',
-  'priya', 'pooja', 'priyanka', 'prakash', 'prasad', 'pawan', 'parag', 'pranav',
-  'neha', 'nikhil', 'nishant', 'neeraj', 'naresh', 'naveen', 'nilesh',
-  'mahesh', 'mohit', 'manoj', 'murali', 'mohan', 'mukesh', 'madhav',
-  'harish', 'harsh', 'hari', 'hemant', 'hari', 'hrishikesh',
-  'vivek', 'vikas', 'varun', 'vikram', 'vimal', 'vinod', 'vinay', 'viral',
-  'yogesh', 'yash', 'yashmit',
-  'zara', 'zoey', 'zainab',
-]);
-
-function isValidName(candidate) {
-  if (!candidate || candidate.length < 2 || candidate.length > 50) return false;
-
-  const trimmed = candidate.trim();
-  const lower = trimmed.toLowerCase();
-
-  // Check blacklist patterns
-  if (INVALID_NAME_PATTERNS.some(pat => pat.test(lower))) return false;
-
-  // Check if it contains at least one common name or looks like a name
-  const words = trimmed.split(/[\s\-']+/);
-  const hasCommonName = words.some(w => COMMON_FIRST_NAMES.has(w.toLowerCase()));
-  const hasCapital = /[A-Z]/.test(trimmed);
-  const noNumbers = !/\d/.test(trimmed);
-
-  // Valid if: (has common name OR proper capitalization) AND no numbers AND no special chars
-  const isValidFormat = (hasCommonName || hasCapital) && noNumbers && !/[@#$%^&*()_+=\[\]{};:'"<>,.?\/\\|`~]/.test(trimmed);
-
-  return isValidFormat;
-}
-
-// ─────────────────────────────────────────────
-// SESSION MANAGEMENT
-// ─────────────────────────────────────────────
-function freshSession(phone) {
-  return {
-    phone,
-    history:        [],
-    leadData:       { phone },
-    leadCollected:  false,
-    createdAt:      new Date(),
-    lastActive:     new Date(),
-  };
-}
-
-async function getSession(phone) {
-  const cached = cacheGet(sessionCache, phone);
-  if (cached) return cached;
-
-  let session = null;
-  if (sessionsCol) session = await sessionsCol.findOne({ phone });
-  if (!session) session = freshSession(phone);
-
-  session.history  = session.history  || [];
-  session.leadData = session.leadData || { phone };
-
-  cacheSet(sessionCache, phone, session);
-  return session;
-}
-
-async function saveSession(session) {
-  session.lastActive = new Date();
-  cacheSet(sessionCache, session.phone, session);
-  if (sessionsCol) {
-    const { _id, ...doc } = session;
-    await sessionsCol.replaceOne({ phone: session.phone }, doc, { upsert: true });
-  }
-}
-
-async function saveLead(leadData) {
-  if (leadsCol) await leadsCol.insertOne({ ...leadData, savedAt: new Date() });
-}
-
-// ─────────────────────────────────────────────
-// MENU STATE TRACKER
-// Critical for resolving menu references ("option 2", "the fourth one", etc.)
+// MENU STATE
+// Stores: validOptions (display labels) + optionTopics (what each option means)
 // ─────────────────────────────────────────────
 function freshMenuState(phone) {
   return {
     phone,
-    activeMenu:      null,         // Current menu being displayed
-    validOptions:    [],           // List of valid option texts
-    menuShownAt:     null,
-    menuContext:     null,         // What question the menu answers
-    lastReferencedAt: null,
-    updatedAt:       new Date(),
+    validOptions:  [],   // e.g. ["UAE Mainland LLC setup", "Free Zone comparison", ...]
+    optionTopics:  [],   // same array — stored for Claude context
+    menuShownAt:   null,
+    updatedAt:     new Date(),
   };
 }
 
 async function getMenuState(phone) {
   const cached = cacheGet(menuStateCache, phone);
   if (cached) return cached;
-
-  let state = null;
-  if (menuStateCol) state = await menuStateCol.findOne({ phone });
+  let state = menuStateCol ? await menuStateCol.findOne({ phone }) : null;
   if (!state) state = freshMenuState(phone);
-
   cacheSet(menuStateCache, phone, state);
   return state;
 }
@@ -2426,314 +2330,70 @@ async function saveMenuState(state) {
   }
 }
 
-function storeMenuState(menuState, menuOptions, context) {
-  menuState.activeMenu   = menuOptions;
-  menuState.validOptions = menuOptions;
-  menuState.menuShownAt  = new Date();
-  menuState.menuContext  = context;
-}
-
-function resolveMenuReference(menuState, refType, refIndex) {
-  // refType: 'ordinal' (first, second, last), 'numeric' (1, 2, 3), 'by_text' (contains text)
-  // Returns: { index, text } or null
-
-  if (!menuState.validOptions || menuState.validOptions.length === 0) return null;
-
-  let targetIdx = null;
-
-  if (refType === 'numeric') {
-    targetIdx = refIndex - 1; // Convert 1-based to 0-based
-  } else if (refType === 'ordinal') {
-    targetIdx = refIndex === -1 ? menuState.validOptions.length - 1 : refIndex - 1;
-  }
-
-  if (targetIdx !== null && targetIdx >= 0 && targetIdx < menuState.validOptions.length) {
-    menuState.lastReferencedAt = new Date();
-    return {
-      index: targetIdx + 1,  // Return 1-based index
-      text:  menuState.validOptions[targetIdx].trim(),
-    };
-  }
-
-  return null;
-}
-
 // ─────────────────────────────────────────────
-// ONBOARDING STATE MANAGER
-// Tracks what profile data we've already collected
+// NAME VALIDATOR
 // ─────────────────────────────────────────────
-function freshOnboardingState(phone) {
-  return {
-    phone,
-    completionStage: 'START', // START | ASKED_NAME | ASKED_TARGET | ASKED_SERVICE | COMPLETE
-    collected: {
-      name:            false,
-      currentCountry:  false,
-      targetCountry:   false,
-      serviceNeeded:   false,
-      email:           false,
-      companyName:     false,
-    },
-    attemptedQuestions: [],
-    skippedQuestions:   [],
-    updatedAt:          new Date(),
-  };
-}
+const INVALID_NAME_PATTERNS = [
+  /^(yes|no|sure|okay|ok|hello|hi|hey|thanks|thank you|please|more|less|good|bad|other|same|different)$/i,
+  /^(usa|uk|india|canada|australia|singapore|uae|dubai|london|new\s+york|california|florida)$/i,
+  /^(company|business|service|product|office|team|person|people|money|cost|fee|time|date|number)$/i,
+  /^[a-z]{1,2}$/i,
+  /^\d+$/,
+  /^(1|2|3|4|5|option|menu|reply|answer)$/i,
+];
 
-function onboardingProgress(state) {
-  const total = Object.keys(state.collected).length;
-  const filled = Object.values(state.collected).filter(v => v).length;
-  return Math.round((filled / total) * 100);
-}
+const COMMON_FIRST_NAMES = new Set([
+  'john','james','robert','michael','william','david','richard','joseph','thomas','charles',
+  'christopher','daniel','matthew','anthony','mark','donald','steven','paul','andrew','joshua',
+  'kenneth','kevin','brian','edward','ronald','timothy','jason','jeffrey','ryan','jacob',
+  'mary','patricia','jennifer','linda','barbara','elizabeth','susan','jessica','sarah','karen',
+  'nancy','betty','margaret','sandra','ashley','kimberly','emily','donna','michelle','dorothy',
+  'carol','amanda','melissa','deborah','stephanie','rebecca','sharon','laura','cynthia','anna',
+  'arun','amit','anita','arjun','akshay','ashish','anand','raj','rahul','rohan','ravi',
+  'ritesh','rajesh','ramesh','rakesh','sandeep','sanjay','sameer','saurabh','suresh','sunil',
+  'priya','pooja','priyanka','prakash','neha','nikhil','nishant','neeraj','naresh','naveen',
+  'mahesh','mohit','manoj','murali','mohan','mukesh','harish','harsh','vivek','vikas','varun',
+  'vikram','vinod','vinay','yogesh','yash','udhay','uddhav','umesh','aryan','aarav','kabir',
+  'zara','zoey','zainab','ishaan','ishita','kavya','kavita','meera','naina','pallavi','riya',
+]);
 
-function nextOnboardingQuestion(state) {
-  const priorities = ['name', 'currentCountry', 'targetCountry', 'serviceNeeded', 'email', 'companyName'];
-  for (const field of priorities) {
-    if (!state.collected[field] && !state.skippedQuestions.includes(field)) {
-      return field;
-    }
-  }
-  return null; // All collected or skipped
+function isValidName(candidate) {
+  if (!candidate || candidate.length < 2 || candidate.length > 50) return false;
+  const trimmed = candidate.trim();
+  const lower   = trimmed.toLowerCase();
+  if (INVALID_NAME_PATTERNS.some(p => p.test(lower))) return false;
+  const words       = trimmed.split(/[\s\-']+/);
+  const hasCommon   = words.some(w => COMMON_FIRST_NAMES.has(w.toLowerCase()));
+  const hasCapital  = /[A-Z]/.test(trimmed);
+  const noNumbers   = !/\d/.test(trimmed);
+  return (hasCommon || hasCapital) && noNumbers && !/[@#$%^&*()_+=[\]{};:'"<>,.?/\\|`~]/.test(trimmed);
 }
 
 // ─────────────────────────────────────────────
-// ENTITY EXTRACTOR & VALIDATOR
+// SESSION MANAGEMENT
 // ─────────────────────────────────────────────
-const EMAIL_RE = /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/;
-
-const COUNTRIES_DICT = {
-  // Americas
-  usa: 'USA', 'united states': 'USA', america: 'USA', us: 'USA',
-  canada: 'Canada', mexican: 'Mexico', mexico: 'Mexico', brazil: 'Brazil',
-
-  // Europe
-  uk: 'UK', britain: 'UK', england: 'UK', scotland: 'UK', wales: 'UK', london: 'UK',
-  germany: 'Germany', france: 'France', italy: 'Italy', spain: 'Spain',
-  netherlands: 'Netherlands', nl: 'Netherlands', ireland: 'Ireland',
-  luxembourg: 'Luxembourg', malta: 'Malta', estonia: 'Estonia',
-
-  // Middle East
-  uae: 'UAE', 'united arab emirates': 'UAE', dubai: 'UAE', abu: 'Abu Dhabi',
-  saudi: 'Saudi Arabia', qatar: 'Qatar', oman: 'Oman', bahrain: 'Bahrain',
-
-  // Asia
-  india: 'India', indian: 'India', delhi: 'India', mumbai: 'India', bangalore: 'India',
-  singapore: 'Singapore', sg: 'Singapore', 'hong kong': 'Hong Kong', hongkong: 'Hong Kong',
-  thailand: 'Thailand', bangkok: 'Thailand', vietnam: 'Vietnam', philippines: 'Philippines',
-  indonesia: 'Indonesia', malaysia: 'Malaysia', cambodia: 'Cambodia', 'sri lanka': 'Sri Lanka',
-  pakistan: 'Pakistan', bangladesh: 'Bangladesh', nepal: 'Nepal', myanmar: 'Myanmar', burma: 'Myanmar',
-  japan: 'Japan', 'south korea': 'South Korea', korea: 'South Korea', china: 'China', taiwan: 'Taiwan',
-
-  // Oceania
-  australia: 'Australia', nz: 'New Zealand', 'new zealand': 'New Zealand',
-
-  // Africa
-  'south africa': 'South Africa', SA: 'South Africa', egypt: 'Egypt', kenya: 'Kenya', nigeria: 'Nigeria',
-
-  // Tax havens / Special zones
-  cayman: 'Cayman Islands', bvi: 'BVI', seychelles: 'Seychelles', mauritius: 'Mauritius',
-  vanuatu: 'Vanuatu', panama: 'Panama', belize: 'Belize',
-};
-
-const SERVICES_DICT = {
-  incorporat: 'Company Incorporation',
-  register:   'Company Incorporation',
-  setup:      'Company Incorporation',
-  'set up':   'Company Incorporation',
-
-  banking:    'Banking Setup',
-  bank:       'Banking Setup',
-  account:    'Banking Setup',
-
-  tax:        'Tax Compliance',
-  'tax filing': 'Tax Compliance',
-  gst:        'Tax Compliance',
-  vat:        'Tax Compliance',
-  compliance: 'Tax Compliance',
-
-  fema:       'FEMA/ODI Advisory',
-  odi:        'FEMA/ODI Advisory',
-  remittance: 'FEMA/ODI Advisory',
-  'capital outflow': 'FEMA/ODI Advisory',
-
-  residency:  'Residency Solutions',
-  visa:       'Residency Solutions',
-  immigration: 'Residency Solutions',
-  'work permit': 'Residency Solutions',
-};
-
-function extractEntities(msg) {
-  const entities = {
-    email:   null,
-    name:    null,
-    country: null,
-    service: null,
-  };
-
-  // Email
-  const emailMatch = msg.match(EMAIL_RE);
-  if (emailMatch) entities.email = emailMatch[0];
-
-  // Country
-  const lower = msg.toLowerCase();
-  for (const [keyword, country] of Object.entries(COUNTRIES_DICT)) {
-    if (msg.toLowerCase().includes(keyword)) {
-      entities.country = country;
-      break;
-    }
-  }
-
-  // Service
-  for (const [keyword, service] of Object.entries(SERVICES_DICT)) {
-    if (lower.includes(keyword)) {
-      entities.service = service;
-      break;
-    }
-  }
-
-  return entities;
+function freshSession(phone) {
+  return { phone, history: [], leadData: { phone }, leadCollected: false, createdAt: new Date(), lastActive: new Date() };
 }
 
-// ─────────────────────────────────────────────
-// INTENT INTERPRETER
-// Converts raw user input into structured intents
-// ─────────────────────────────────────────────
-function interpretUserInput(msg, menuState) {
-  const result = {
-    type:        'UNKNOWN', // MENU_SELECT | YES_NO | CORRECTION | NEGATION | TEXT | REFERENCE | QUESTION
-    menuNumber:  null,
-    yesNo:       null,
-    isCorrection: false,
-    isClarification: false,
-    confidence:  0.5,
-    enrichment:  null,
-  };
-
-  const trimmed = msg.trim();
-  const lower = trimmed.toLowerCase();
-
-  // ── Numeric selection ──────────────────────────────────────────────
-  const numMatch = trimmed.match(/^(\d+)\.?$/);
-  if (numMatch) {
-    result.type = 'MENU_SELECT';
-    result.menuNumber = parseInt(numMatch[1], 10);
-    result.confidence = 0.95;
-    return result;
-  }
-
-  // ── "option N", "choice N", "#N" ──────────────────────────────────
-  const optMatch = lower.match(/(?:option|choice|number|#)\s*(\d+)/);
-  if (optMatch) {
-    result.type = 'MENU_SELECT';
-    result.menuNumber = parseInt(optMatch[1], 10);
-    result.confidence = 0.9;
-    return result;
-  }
-
-  // ── Ordinal references ("first", "second", "last") ────────────────
-  const ORDINALS = { first: 1, second: 2, third: 3, fourth: 4, fifth: 5, sixth: 6, last: -1 };
-  for (const [word, idx] of Object.entries(ORDINALS)) {
-    if (lower.includes(word)) {
-      result.type = 'REFERENCE';
-      const actual = idx === -1 ? (menuState?.validOptions?.length || 1) : idx;
-      result.menuNumber = actual;
-      result.confidence = 0.85;
-      if (menuState?.validOptions && menuState.validOptions[actual - 1]) {
-        result.enrichment = `User referenced "${menuState.validOptions[actual - 1].trim()}" (option ${actual})`;
-      }
-      return result;
-    }
-  }
-
-  // ── Corrections ("actually", "wait", "I meant") ───────────────────
-  const CORRECTION_WORDS = ['actually', 'wait', 'no wait', 'forget that', 'sorry', 'i meant', 'i mean', 'scratch that', 'never mind', 'nevermind', 'i changed my mind', 'go back', 'not that', 'not this'];
-  if (CORRECTION_WORDS.some(w => lower.includes(w))) {
-    result.type = 'CORRECTION';
-    result.isCorrection = true;
-    result.confidence = 0.8;
-    result.enrichment = `User is CORRECTING their previous response.`;
-    return result;
-  }
-
-  // ── Explicit yes/no ───────────────────────────────────────────────
-  if (/^(yes|yeah|yep|yup|sure|ok|okay|correct|right|true|absolutely|definitely|of course)$/i.test(lower)) {
-    result.type = 'YES_NO';
-    result.yesNo = 'yes';
-    result.confidence = 0.98;
-    return result;
-  }
-
-  if (/^(no|nope|nah|not|false|never|none|nothing|nay)$/i.test(lower)) {
-    result.type = 'YES_NO';
-    result.yesNo = 'no';
-    result.confidence = 0.98;
-    return result;
-  }
-
-  // ── Clarification ("tell me more", "what about", "how") ──────────
-  if (/^(tell me more|what about|explain|how|why|when|where|what)/.test(lower)) {
-    result.type = 'QUESTION';
-    result.isClarification = true;
-    result.confidence = 0.8;
-    return result;
-  }
-
-  // ── Default: treat as free text ──────────────────────────────────
-  result.type = 'TEXT';
-  result.confidence = 0.6;
-  return result;
+async function getSession(phone) {
+  const cached = cacheGet(sessionCache, phone);
+  if (cached) return cached;
+  let session = sessionsCol ? await sessionsCol.findOne({ phone }) : null;
+  if (!session) session = freshSession(phone);
+  session.history  = session.history  || [];
+  session.leadData = session.leadData || { phone };
+  cacheSet(sessionCache, phone, session);
+  return session;
 }
 
-// ─────────────────────────────────────────────
-// CONTEXT RETRIEVER
-// Pulls relevant historical context from short-term and long-term memory
-// ─────────────────────────────────────────────
-function getRecentContext(session, limit = 5) {
-  const recent = session.history.slice(-limit * 2);
-  return recent
-    .map(m => `[${m.role === 'user' ? 'Customer' : 'Advisor'}]: ${m.content.substring(0, 200)}`)
-    .join('\n');
-}
-
-// ─────────────────────────────────────────────
-// TOKEN OPTIMIZER
-// Keeps prompt under token limits by pruning non-critical context
-// ─────────────────────────────────────────────
-function optimizeContextForClaude(session, activeState, userData, kbRelevant) {
-  // Strategy: include only essential context
-  // - Last 3-5 turns of history
-  // - Current user profile
-  // - Current active question/menu
-  // - Relevant KB (already chunked)
-  // - Skip: full history, all resolved intents, etc.
-
-  let tokens = 0;
-  const LIMIT = 4000; // Conservative limit before Claude's system prompt
-
-  // Start with KB (most important)
-  tokens += kbRelevant.length / 4; // rough estimate
-
-  // Add lean history (last 3-5 turns)
-  const leanHistory = session.history.slice(-6);
-  tokens += leanHistory.map(h => h.content.length / 4).reduce((a, b) => a + b, 0);
-
-  // Add user profile
-  const profileStr = JSON.stringify(userData);
-  tokens += profileStr.length / 4;
-
-  // Add active state (minimal)
-  const stateStr = JSON.stringify({
-    currentFlow: activeState?.currentFlow,
-    currentQuestion: activeState?.currentQuestion,
-    expectedInputType: activeState?.expectedInputType,
-  });
-  tokens += stateStr.length / 4;
-
-  return {
-    canFitHistory: tokens < LIMIT,
-    estimatedTokens: Math.round(tokens),
-    recommendation: tokens < LIMIT ? 'INCLUDE_FULL_CONTEXT' : 'PRUNE_HISTORY',
-  };
+async function saveSession(session) {
+  session.lastActive = new Date();
+  cacheSet(sessionCache, session.phone, session);
+  if (sessionsCol) {
+    const { _id, ...doc } = session;
+    await sessionsCol.replaceOne({ phone: session.phone }, doc, { upsert: true });
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -2742,29 +2402,22 @@ function optimizeContextForClaude(session, activeState, userData, kbRelevant) {
 function freshActiveState(phone) {
   return {
     phone,
-    currentFlow:        'ONBOARDING',      // ONBOARDING | NORMAL | HANDOFF | HUMAN_MODE
-    conversationStage:  'GREETING',        // GREETING | NAME | TARGET | SERVICE | QA | WRAPPING
-    retryCount:         0,
-    lastErrorAt:        null,
-    isRecoveringError:  false,
-    humanModeActive:    false,
-    humanModeSince:     null,
-    handoffPending:     false,
-    lastUserMessage:    null,
-    lastBotMessage:     null,
-    lastInteractionAt:  new Date(),
-    messageCount:       0,
+    currentFlow:       'ONBOARDING',
+    conversationStage: 'GREETING',
+    retryCount:        0,
+    humanModeActive:   false,
+    humanModeSince:    null,
+    handoffPending:    false,
+    lastInteractionAt: new Date(),
+    messageCount:      0,
   };
 }
 
 async function getActiveState(phone) {
   const cached = cacheGet(activeStateCache, phone);
   if (cached) return cached;
-
-  let state = null;
-  if (activeStateCol) state = await activeStateCol.findOne({ phone });
+  let state = activeStateCol ? await activeStateCol.findOne({ phone }) : null;
   if (!state) state = freshActiveState(phone);
-
   cacheSet(activeStateCache, phone, state);
   return state;
 }
@@ -2779,8 +2432,96 @@ async function saveActiveState(state) {
 }
 
 // ─────────────────────────────────────────────
+// ENTITY EXTRACTOR
+// ─────────────────────────────────────────────
+const EMAIL_RE = /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/;
+
+const COUNTRIES_DICT = {
+  usa:'USA','united states':'USA',america:'USA','us':'USA',
+  canada:'Canada',mexico:'Mexico',brazil:'Brazil',
+  uk:'UK',britain:'UK',england:'UK',scotland:'UK',wales:'UK',london:'UK',
+  germany:'Germany',france:'France',italy:'Italy',spain:'Spain',
+  netherlands:'Netherlands',ireland:'Ireland',luxembourg:'Luxembourg',malta:'Malta',estonia:'Estonia',
+  uae:'UAE','united arab emirates':'UAE',dubai:'UAE','abu dhabi':'Abu Dhabi',
+  saudi:'Saudi Arabia',qatar:'Qatar',oman:'Oman',bahrain:'Bahrain',
+  india:'India',indian:'India',delhi:'India',mumbai:'India',bangalore:'India',
+  singapore:'Singapore',sg:'Singapore','hong kong':'Hong Kong',
+  thailand:'Thailand',vietnam:'Vietnam',philippines:'Philippines',
+  indonesia:'Indonesia',malaysia:'Malaysia','sri lanka':'Sri Lanka',
+  japan:'Japan','south korea':'South Korea',china:'China',taiwan:'Taiwan',
+  australia:'Australia','new zealand':'New Zealand',
+  'south africa':'South Africa',egypt:'Egypt',kenya:'Kenya',nigeria:'Nigeria',
+};
+
+const SERVICES_DICT = {
+  incorporat:'Company Incorporation',register:'Company Incorporation',
+  setup:'Company Incorporation','set up':'Company Incorporation',
+  banking:'Banking Setup',bank:'Banking Setup',account:'Banking Setup',
+  tax:'Tax Compliance',gst:'Tax Compliance',vat:'Tax Compliance',compliance:'Tax Compliance',
+  fema:'FEMA/ODI Advisory',odi:'FEMA/ODI Advisory',remittance:'FEMA/ODI Advisory',
+  residency:'Residency Solutions',visa:'Residency Solutions',immigration:'Residency Solutions',
+};
+
+function extractEntities(msg) {
+  const entities = { email: null, country: null, service: null };
+  const emailMatch = msg.match(EMAIL_RE);
+  if (emailMatch) entities.email = emailMatch[0];
+  const lower = msg.toLowerCase();
+  for (const [kw, country] of Object.entries(COUNTRIES_DICT)) {
+    if (lower.includes(kw)) { entities.country = country; break; }
+  }
+  for (const [kw, service] of Object.entries(SERVICES_DICT)) {
+    if (lower.includes(kw)) { entities.service = service; break; }
+  }
+  return entities;
+}
+
+// ─────────────────────────────────────────────
+// INTENT INTERPRETER
+// ─────────────────────────────────────────────
+function interpretUserInput(msg, menuState) {
+  const trimmed = msg.trim();
+  const lower   = trimmed.toLowerCase();
+
+  // Pure number → menu select
+  const numMatch = trimmed.match(/^(\d+)\.?$/);
+  if (numMatch) {
+    return { type: 'MENU_SELECT', menuNumber: parseInt(numMatch[1], 10) };
+  }
+
+  // "option N" / "choice N"
+  const optMatch = lower.match(/(?:option|choice|number|#)\s*(\d+)/);
+  if (optMatch) {
+    return { type: 'MENU_SELECT', menuNumber: parseInt(optMatch[1], 10) };
+  }
+
+  // Ordinals
+  const ORDINALS = { first: 1, second: 2, third: 3, fourth: 4, fifth: 5, sixth: 6, last: -1 };
+  for (const [word, idx] of Object.entries(ORDINALS)) {
+    if (lower.includes(word)) {
+      const maxOpts = menuState?.validOptions?.length || 4;
+      const actual  = idx === -1 ? maxOpts : idx;
+      return { type: 'MENU_SELECT', menuNumber: actual };
+    }
+  }
+
+  // Corrections
+  const CORRECTIONS = ['actually','wait','no wait','forget that','sorry','i meant','i mean','scratch that','never mind','go back'];
+  if (CORRECTIONS.some(w => lower.includes(w))) {
+    return { type: 'CORRECTION' };
+  }
+
+  // Yes / No
+  if (/^(yes|yeah|yep|yup|sure|ok|okay|correct|right|absolutely|definitely)$/i.test(lower))
+    return { type: 'YES_NO', yesNo: 'yes' };
+  if (/^(no|nope|nah|not|false|never|none)$/i.test(lower))
+    return { type: 'YES_NO', yesNo: 'no' };
+
+  return { type: 'TEXT' };
+}
+
+// ─────────────────────────────────────────────
 // SYSTEM PROMPT BUILDER
-// Assembles rich context for Claude with all memory layers
 // ─────────────────────────────────────────────
 const BASE_SYSTEM_PROMPT = `You are a world-class conversational AI advisor for Comply Globally.
 
@@ -2789,113 +2530,78 @@ PERSONALITY:
 - Expert in global business expansion (47+ jurisdictions)
 - Deep knowledge of company incorporation, banking, tax, FEMA/ODI, residency
 - Never robotic; always contextual and adaptive
-- Conversational, natural tone suitable for WhatsApp
+- Conversational, natural tone for WhatsApp
 
-CONVERSATIONAL EXCELLENCE:
-- Remember everything shared in the conversation
-- Resolve vague references ("that option", "the one you mentioned") naturally
-- Acknowledge corrections gracefully ("Got it, so you meant...")
-- Maintain context across topic switches
-- Provide relevant follow-up suggestions
-- Be concise but complete — never truncate critical information
+RESPONSE RULES:
+- Keep answers under 250 words (brevity = speed)
+- Use *bold* for key terms, line breaks for readability
+- Always end with a clear next step or question
+- Use "we"/"our team" where appropriate
+- Do NOT append numbered options yourself — the system adds them automatically
 
 LEAD COLLECTION (natural, non-invasive):
-Collect these fields naturally over the conversation:
-- Full name (validate: reject random words, require real name)
-- Email address (validate: proper email format)
-- Current country (where they're based now)
-- Target jurisdiction (where they want to expand)
-- Service needed (incorporation / banking / tax / FEMA / residency / other)
-- Business stage (idea / startup / established / large corp)
-- Timeline (urgent / 1-3 months / 3-6 months / flexible)
-- Additional context (freely provided)
-
-VALIDATION:
-- NEVER save obviously invalid names (country names, adverbs, single letters, etc.)
-- ONLY confirm extracted data when confident
-- If uncertain, ask clarifying questions naturally
+Collect: full name, email, current country, target jurisdiction, service needed, business stage, timeline.
+NEVER ask for info already known from the profile below.
+NEVER save obviously invalid names (countries, random words, single letters).
 
 MENU HANDLING:
-- When presenting options, use clear numbered format: 1. Option A  2. Option B
-- Accept selections as: bare numbers (1, 2), ordinals (first, second), text references
-- If user is confused, repeat options with context
+- When the user sends a number (1, 2, 3, 4), you WILL be told exactly which option they selected in the [MENU SELECTION] tag
+- Answer that topic thoroughly and naturally — do not ask "what did you mean by 2?"
+- The quick-reply options are appended automatically; do not recreate them in your response
 
 KNOWLEDGE BASE:
-- Inject relevant country guides, tax info, banking timelines as appropriate
-- Cite specific information (e.g., "Delaware's franchise tax", "Singapore's 0% CIT")
-- Offer to elaborate on specific topics
-- Direct to sales@complyglobally.com for custom quotes
-
-TONE RULES:
-- WhatsApp friendly: use *bold*, line breaks, emojis (sparingly)
-- Keep responses under 300 words unless depth is needed
-- End with clear next step or question
-- Use "we", "our team" when appropriate
-- Be encouraging for entrepreneurs, reassuring for cautious inquirers
-
-CRITICAL:
-- Always read full conversation history before responding
-- Resolve references against the LAST menu/list shown
-- Handle corrections by acknowledging the change naturally
-- If user asks for human, guide smoothly to handoff
+- Cite specific facts from the injected KB section
+- For custom quotes or complex legal opinions: direct to sales@complyglobally.com or +91 99999 81613
 `;
 
-function buildSystemPrompt(session, activeState, menuState, onboardingState) {
+function buildSystemPrompt(session, activeState, menuState) {
   const lead = session.leadData || {};
   const leadSummary = [
-    lead.name ? `Name: ${lead.name}` : null,
-    lead.email ? `Email: ${lead.email}` : null,
-    lead.companyName ? `Company: ${lead.companyName}` : null,
-    lead.currentCountry ? `Based in: ${lead.currentCountry}` : null,
-    lead.targetCountry ? `Target: ${lead.targetCountry}` : null,
-    lead.serviceNeeded ? `Service: ${lead.serviceNeeded}` : null,
-    lead.businessStage ? `Stage: ${lead.businessStage}` : null,
-    lead.timeline ? `Timeline: ${lead.timeline}` : null,
+    lead.name          ? `Name: ${lead.name}`                : null,
+    lead.email         ? `Email: ${lead.email}`              : null,
+    lead.companyName   ? `Company: ${lead.companyName}`      : null,
+    lead.currentCountry? `Based in: ${lead.currentCountry}`  : null,
+    lead.targetCountry ? `Target: ${lead.targetCountry}`     : null,
+    lead.serviceNeeded ? `Service: ${lead.serviceNeeded}`    : null,
+    lead.businessStage ? `Stage: ${lead.businessStage}`      : null,
+    lead.timeline      ? `Timeline: ${lead.timeline}`        : null,
   ].filter(Boolean).join(' | ');
 
-  const recentHistory = getRecentContext(session, 3);
-
-  let systemPrompt = BASE_SYSTEM_PROMPT;
+  let prompt = BASE_SYSTEM_PROMPT;
 
   if (leadSummary) {
-    systemPrompt += `\n\n[CUSTOMER PROFILE — ALREADY KNOWN (do NOT ask again):\n${leadSummary}]`;
-  }
-
-  if (recentHistory) {
-    systemPrompt += `\n\n[RECENT CONVERSATION:\n${recentHistory}]`;
-  }
-
-  if (activeState?.currentFlow) {
-    systemPrompt += `\n\n[FLOW STATE: ${activeState.currentFlow} | Stage: ${activeState.conversationStage}]`;
+    prompt += `\n\n[CUSTOMER PROFILE — ALREADY KNOWN (do NOT ask again):\n${leadSummary}]`;
   }
 
   if (menuState?.validOptions?.length > 0) {
-    const optionsList = menuState.validOptions.map((o, i) => `${i + 1}. ${o.trim()}`).join('\n');
-    systemPrompt += `\n\n[ACTIVE MENU (user can reference by number or ordinal):\n${optionsList}]`;
+    const optList = menuState.validOptions.map((o, i) => `${i + 1}. ${o}`).join('\n');
+    prompt += `\n\n[LAST QUICK-REPLY MENU SHOWN TO USER:\n${optList}\nIf user sends a number 1-${menuState.validOptions.length}, treat it as selecting the matching option above.]`;
   }
 
-  if (onboardingState && onboardingState.collected) {
-    const progress = onboardingProgress(onboardingState);
-    systemPrompt += `\n\n[ONBOARDING: ${progress}% complete. Collected: ${Object.entries(onboardingState.collected).filter(([, v]) => v).map(([k]) => k).join(', ')}]`;
+  if (activeState?.currentFlow) {
+    prompt += `\n\n[FLOW: ${activeState.currentFlow} | Stage: ${activeState.conversationStage}]`;
   }
 
-  return systemPrompt;
+  return prompt;
 }
 
 // ─────────────────────────────────────────────
 // CLAUDE API CALLER
+// ⚡ SPEED: max_tokens=350, last 10 turns only, single KB chunk
 // ─────────────────────────────────────────────
 async function getClaudeReply(systemPrompt, messages, userMessage) {
-  const trimmedHistory = messages.slice(-15);  // Last 15 turns
-  const relevantKB = retrieveRelevantKB(userMessage, 2);
+  // ⚡ Only last 10 turns to reduce payload size
+  const trimmedHistory = messages.slice(-10);
 
-  if (relevantKB && !relevantKB.includes('PLACEHOLDER')) {
+  // ⚡ Only inject 1 KB chunk (most relevant)
+  const relevantKB = retrieveRelevantKB(userMessage, 1);
+  if (relevantKB && !relevantKB.includes('PASTE_YOUR_KNOWLEDGE_BASE_HERE')) {
     systemPrompt += `\n\n[RELEVANT KNOWLEDGE BASE:\n${relevantKB}]`;
   }
 
   const payload = {
     model:      'claude-sonnet-4-20250514',
-    max_tokens: 600,
+    max_tokens: 350,   // ⚡ Reduced from 600 — faster responses
     system:     systemPrompt,
     messages:   trimmedHistory,
   };
@@ -2917,13 +2623,9 @@ async function getClaudeReply(systemPrompt, messages, userMessage) {
       return 'I apologize for the technical difficulty. Please try again or contact sales@complyglobally.com.';
     }
 
-    const reply = (data.content || [])
-      .filter(b => b.type === 'text')
-      .map(b => b.text)
-      .join('\n')
-      .trim();
+    return (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim()
+      || 'I was unable to generate a response. Please try again.';
 
-    return reply || 'I was unable to generate a response. Please try again.';
   } catch (err) {
     console.error('❌  Claude request failed:', err.message);
     return 'I am experiencing connectivity issues. Please try again shortly.';
@@ -2934,39 +2636,25 @@ async function getClaudeReply(systemPrompt, messages, userMessage) {
 // WHATSAPP SENDER
 // ─────────────────────────────────────────────
 function parsePhone(raw) {
-  const digits = String(raw).replace(/\D/g, '');
-  if (/^91[6-9]\d{9}$/.test(digits))  return { countryCode: '+91',  phoneNumber: digits.slice(2) };
-  if (/^1[2-9]\d{9}$/.test(digits))   return { countryCode: '+1',   phoneNumber: digits.slice(1) };
-  if (/^971\d{9}$/.test(digits))       return { countryCode: '+971', phoneNumber: digits.slice(3) };
-  if (/^44[1-9]\d{8,9}$/.test(digits)) return { countryCode: '+44',  phoneNumber: digits.slice(2) };
-  if (/^[6-9]\d{9}$/.test(digits))    return { countryCode: '+91',  phoneNumber: digits };
-  console.warn(`⚠️  Unknown format: ${raw}`);
-  return { countryCode: '+91', phoneNumber: digits };
+  const d = String(raw).replace(/\D/g, '');
+  if (/^91[6-9]\d{9}$/.test(d))   return { countryCode: '+91',  phoneNumber: d.slice(2) };
+  if (/^1[2-9]\d{9}$/.test(d))    return { countryCode: '+1',   phoneNumber: d.slice(1) };
+  if (/^971\d{9}$/.test(d))        return { countryCode: '+971', phoneNumber: d.slice(3) };
+  if (/^44[1-9]\d{8,9}$/.test(d)) return { countryCode: '+44',  phoneNumber: d.slice(2) };
+  if (/^[6-9]\d{9}$/.test(d))     return { countryCode: '+91',  phoneNumber: d };
+  console.warn(`⚠️  Unknown phone format: ${raw}`);
+  return { countryCode: '+91', phoneNumber: d };
 }
 
 async function sendWhatsApp(phone, text) {
-  console.log(`📤  Sending to ${phone}: ${text.substring(0, 100)}…`);
-
-  if (!INTERAKT_API_KEY) {
-    console.warn('⚠️  INTERAKT_API_KEY missing');
-    return;
-  }
-
+  console.log(`📤  [${phone}] ${text.substring(0, 80)}…`);
+  if (!INTERAKT_API_KEY) { console.warn('⚠️  INTERAKT_API_KEY missing'); return; }
   const { countryCode, phoneNumber } = parsePhone(phone);
-
   try {
     await fetch('https://api.interakt.ai/v1/public/message/', {
       method: 'POST',
-      headers: {
-        Authorization:  `Basic ${INTERAKT_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        countryCode,
-        phoneNumber,
-        type: 'Text',
-        data: { message: text },
-      }),
+      headers: { Authorization: `Basic ${INTERAKT_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ countryCode, phoneNumber, type: 'Text', data: { message: text } }),
     });
     console.log('✅  Sent');
   } catch (err) {
@@ -2978,26 +2666,17 @@ async function sendWhatsApp(phone, text) {
 // HUMAN HANDOFF
 // ─────────────────────────────────────────────
 function wantsHuman(msg) {
-  const humanTriggers = ['human', 'agent', 'person', 'representative', 'support', 'speak to', 'talk to', 'connect', 'call'];
-  return humanTriggers.some(t => msg.toLowerCase().includes(t));
+  return ['human','agent','person','representative','speak to','talk to','connect me','call'].some(t => msg.toLowerCase().includes(t));
 }
 
 async function sendHandoffEmail(phone, leadData, history) {
   if (!RESEND_API_KEY || !NOTIFY_EMAIL) return;
-
-  const chatSummary = history.slice(-6)
-    .map(m => `${m.role === 'user' ? '👤' : '🤖'}: ${m.content}`)
-    .join('\n\n');
-
+  const chatSummary = history.slice(-6).map(m => `${m.role === 'user' ? '👤' : '🤖'}: ${m.content}`).join('\n\n');
   await fetch('https://api.resend.com/emails', {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${RESEND_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
+    headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      from: FROM_EMAIL,
-      to: [NOTIFY_EMAIL],
+      from: FROM_EMAIL, to: [NOTIFY_EMAIL],
       subject: `🚨 Handoff Needed — ${leadData.name || phone}`,
       html: `<h2>Customer Handoff Request</h2><pre>${chatSummary}</pre>`,
     }),
@@ -3014,20 +2693,14 @@ function isLeadComplete(lead) {
 async function finalizeLead(session) {
   session.leadCollected = true;
   console.log(`🎯  Lead finalized: ${session.leadData.name}`);
-
-  if (leadsCol) {
-    await leadsCol.insertOne({
-      ...session.leadData,
-      completedAt: new Date(),
-    });
-  }
+  if (leadsCol) await leadsCol.insertOne({ ...session.leadData, completedAt: new Date() });
 }
 
 // ─────────────────────────────────────────────
 // WEBHOOK — MAIN BOT LOGIC
 // ─────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200);
+  res.sendStatus(200); // ⚡ Respond immediately before any async work
 
   try {
     const body = req.body;
@@ -3035,111 +2708,107 @@ app.post('/webhook', async (req, res) => {
 
     const phone  = (body.data?.customer?.phone_number || '').replace(/\D/g, '');
     const rawMsg = (body.data?.message?.message || '').trim();
-
     if (!phone || !rawMsg) return;
 
     console.log(`\n📩  [${phone}] "${rawMsg}"`);
 
-    // Load all state
+    // ⚡ Load all state in parallel
     const [session, activeState, menuState] = await Promise.all([
       getSession(phone),
       getActiveState(phone),
       getMenuState(phone),
     ]);
 
-    const isNew = session.history.length === 0;
-
-    // ── NEW USER GREETING ──────────────────────────────────────────
-    if (isNew) {
-      const greeting = `Welcome to *Comply Globally* — your trusted partner for global business expansion.\n\n` +
-        `We help you with company incorporation, banking setup, tax compliance, FEMA/ODI advisory, and residency solutions across 47+ jurisdictions.\n\n` +
-        `To get started, may I know your *full name* and which *country you're looking to expand into*?`;
+    // ── NEW USER GREETING ─────────────────────────────────────────
+    if (session.history.length === 0) {
+      const { footer, options } = buildQuickReplyFooter('general');
+      const greeting = `Welcome to *Comply Globally* — your trusted partner for global business expansion. 🌍\n\n` +
+        `We help Indian businesses set up companies, open bank accounts, handle tax compliance, FEMA/ODI advisory, and residency solutions across 47+ jurisdictions.\n\n` +
+        `To get started, may I know your *full name* and which *country you're looking to expand into*?` +
+        footer;
 
       await sendWhatsApp(phone, greeting);
       session.history.push({ role: 'user', content: 'GREETING_RECEIVED' });
       session.history.push({ role: 'assistant', content: greeting });
-      activeState.currentFlow = 'ONBOARDING';
-      activeState.conversationStage = 'NAME';
-      activeState.lastBotMessage = greeting;
+      activeState.currentFlow        = 'ONBOARDING';
+      activeState.conversationStage  = 'NAME';
+      menuState.validOptions  = options;
+      menuState.optionTopics  = options;
 
-      await Promise.all([saveSession(session), saveActiveState(activeState)]);
+      // ⚡ Parallel saves
+      await Promise.all([saveSession(session), saveActiveState(activeState), saveMenuState(menuState)]);
       return;
     }
 
-    // ── AUTO-RESUME from human mode if timeout ──────────────────
+    // ── AUTO-RESUME FROM HUMAN MODE ───────────────────────────────
     if (activeState.humanModeActive) {
       const elapsed = Date.now() - new Date(activeState.humanModeSince || 0).getTime();
       if (elapsed >= HUMAN_TIMEOUT_MS) {
-        console.log(`⏰  Auto-resuming: ${phone}`);
         activeState.humanModeActive = false;
-        activeState.humanModeSince = null;
+        activeState.humanModeSince  = null;
+        console.log(`⏰  Auto-resuming: ${phone}`);
       } else {
-        console.log(`🧑  Human mode active — message suppressed`);
+        console.log(`🧑  Human mode active — suppressed`);
         return;
       }
     }
 
-    // ── INTERPRET USER INPUT ────────────────────────────────────────
+    // ── INTERPRET INTENT ──────────────────────────────────────────
     const intent = interpretUserInput(rawMsg, menuState);
-    console.log(`🧠  Intent: ${intent.type} (confidence: ${intent.confidence})`);
+    console.log(`🧠  Intent: ${intent.type}`);
 
-    // ── EXTRACT ENTITIES ────────────────────────────────────────────
-    const entities = extractEntities(rawMsg);
+    // ── HANDLE MENU SELECTION ─────────────────────────────────────
+    if (intent.type === 'MENU_SELECT') {
+      const num     = intent.menuNumber;
+      const maxOpts = menuState.validOptions.length;
 
-    // ── UPDATE LEAD DATA ────────────────────────────────────────────
-    if (entities.email) session.leadData.email = entities.email;
-    if (entities.country) {
-      // Heuristic: if message has action verbs (expand, setup, move), it's target; else current
-      if (/expand|move|setup|incorporate|register/.test(rawMsg.toLowerCase())) {
-        session.leadData.targetCountry = entities.country;
-      } else {
-        session.leadData.currentCountry = entities.country;
-      }
-    }
-    if (entities.service) session.leadData.serviceNeeded = entities.service;
-
-    // ── HANDLE NAME EXTRACTION ──────────────────────────────────────
-    if (activeState.conversationStage === 'NAME' && !session.leadData.name) {
-      // Try to extract a name from the message
-      const nameMatch = rawMsg.match(/^([A-Za-z][A-Za-z\s'-]{1,40})(?:\s|,|$)/);
-      if (nameMatch) {
-        const candidate = nameMatch[1].trim();
-        if (isValidName(candidate)) {
-          session.leadData.name = candidate;
-          console.log(`✅  Name extracted: ${candidate}`);
-        } else {
-          console.log(`❌  Invalid name candidate: ${candidate}`);
-        }
-      }
-    }
-
-    // ── HANDLE MENU REFERENCE ───────────────────────────────────────
-    if (intent.type === 'MENU_SELECT' && menuState.validOptions.length > 0) {
-      const ref = resolveMenuReference(menuState, 'numeric', intent.menuNumber);
-      if (ref) {
-        intent.enrichment = `User selected: "${ref.text}"`;
-        console.log(`✅  Menu resolved: option ${ref.index} = "${ref.text}"`);
-      } else {
-        console.log(`❌  Invalid menu selection: ${intent.menuNumber} (max: ${menuState.validOptions.length})`);
-        const reprompt = `Please choose from 1 to ${menuState.validOptions.length}. Try again.`;
-        await sendWhatsApp(phone, reprompt);
-        activeState.retryCount++;
-        await saveActiveState(activeState);
+      // Invalid selection (e.g. user sends 5 when only 4 options exist)
+      if (!maxOpts || num < 1 || num > maxOpts) {
+        const invalidMsg = maxOpts > 0
+          ? `That's not a valid option. Please choose *1 to ${maxOpts}* from the menu above. 👆`
+          : `I don't have an active menu right now. What would you like to know about?`;
+        await sendWhatsApp(phone, invalidMsg);
         return;
       }
+
+      // Valid selection — inject the chosen topic into the user message for Claude
+      const chosenTopic = menuState.validOptions[num - 1];
+      console.log(`✅  Menu selection: ${num} → "${chosenTopic}"`);
+
+      // Build a clear enriched message so Claude knows exactly what was chosen
+      const enrichedMsg = `[MENU SELECTION: User chose option ${num} — "${chosenTopic}". Answer this topic thoroughly.]`;
+
+      session.history.push({ role: 'user', content: enrichedMsg });
+      const sysPrompt = buildSystemPrompt(session, activeState, menuState);
+      const rawReply  = await getClaudeReply(sysPrompt, session.history, chosenTopic);
+
+      // Detect topic bank from the chosen topic + session context
+      const bank        = detectTopicBank(session, chosenTopic);
+      const { footer, options } = buildQuickReplyFooter(bank);
+      const finalReply  = rawReply + footer;
+
+      await sendWhatsApp(phone, finalReply);
+      session.history.push({ role: 'assistant', content: finalReply });
+
+      // Update menu state with new options
+      menuState.validOptions = options;
+      menuState.optionTopics = options;
+      menuState.menuShownAt  = new Date();
+
+      // ⚡ Parallel saves
+      await Promise.all([saveSession(session), saveActiveState(activeState), saveMenuState(menuState)]);
+      return;
     }
 
-    // ── HUMAN HANDOFF ───────────────────────────────────────────────
+    // ── HUMAN HANDOFF ─────────────────────────────────────────────
     if (wantsHuman(rawMsg) && !activeState.handoffPending) {
       console.log(`🙋  Human requested`);
-      activeState.handoffPending = true;
+      activeState.handoffPending  = true;
       activeState.humanModeActive = true;
-      activeState.humanModeSince = new Date();
+      activeState.humanModeSince  = new Date();
 
-      const handoffMsg = `Thank you for reaching out. I'm connecting you with our senior advisory team right now.\n\n` +
-        `In the meantime, you can also reach us at:\n` +
-        `📧 sales@complyglobally.com\n` +
-        `📞 +1 (302) 214-1717 | +91 99999 81613`;
+      const handoffMsg = `Thank you for reaching out. I'm connecting you with our senior advisory team right now. ✅\n\n` +
+        `In the meantime:\n📧 sales@complyglobally.com\n📞 +1 (302) 214-1717 | +91 99999 81613`;
 
       await Promise.all([
         sendWhatsApp(phone, handoffMsg),
@@ -3148,47 +2817,68 @@ app.post('/webhook', async (req, res) => {
 
       session.history.push({ role: 'user', content: rawMsg });
       session.history.push({ role: 'assistant', content: handoffMsg });
-
       if (!session.leadCollected) await finalizeLead(session);
 
       await Promise.all([saveSession(session), saveActiveState(activeState)]);
       return;
     }
 
-    // ── BUILD CONTEXT & GET CLAUDE REPLY ─────────────────────────
-    const sysPrompt = buildSystemPrompt(session, activeState, menuState, null);
-    const messagePayload = intent.enrichment || rawMsg;
+    // ── EXTRACT ENTITIES & UPDATE LEAD ────────────────────────────
+    const entities = extractEntities(rawMsg);
+    if (entities.email)   session.leadData.email = entities.email;
+    if (entities.country) {
+      if (/expand|move|setup|incorporate|register/.test(rawMsg.toLowerCase())) {
+        session.leadData.targetCountry = entities.country;
+      } else {
+        session.leadData.currentCountry = entities.country;
+      }
+    }
+    if (entities.service) session.leadData.serviceNeeded = entities.service;
 
-    session.history.push({ role: 'user', content: messagePayload });
-    const reply = await getClaudeReply(sysPrompt, session.history, rawMsg);
-
-    await sendWhatsApp(phone, reply);
-    session.history.push({ role: 'assistant', content: reply });
-
-    // ── DETECT MENU IN REPLY & UPDATE MENU STATE ───────────────────
-    const numberedLines = reply.split('\n').filter(l => /^\s*\d+[\.\)]\s+\S/.test(l));
-    if (numberedLines.length >= 2 && numberedLines.length <= 8) {
-      storeMenuState(menuState, numberedLines, reply.substring(0, 100));
-      await saveMenuState(menuState);
+    // Name extraction (only during onboarding stage)
+    if (activeState.conversationStage === 'NAME' && !session.leadData.name) {
+      const nameMatch = rawMsg.match(/^([A-Za-z][A-Za-z\s'-]{1,40})(?:\s|,|$)/);
+      if (nameMatch) {
+        const candidate = nameMatch[1].trim();
+        if (isValidName(candidate)) {
+          session.leadData.name = candidate;
+          console.log(`✅  Name: ${candidate}`);
+        }
+      }
     }
 
-    // ── CHECK FOR LEAD COMPLETION ──────────────────────────────────
+    // ── NORMAL CLAUDE REPLY ───────────────────────────────────────
+    session.history.push({ role: 'user', content: rawMsg });
+    const sysPrompt = buildSystemPrompt(session, activeState, menuState);
+    const rawReply  = await getClaudeReply(sysPrompt, session.history, rawMsg);
+
+    // Detect topic and append quick-reply options
+    const bank        = detectTopicBank(session, rawMsg);
+    const { footer, options } = buildQuickReplyFooter(bank);
+    const finalReply  = rawReply + footer;
+
+    await sendWhatsApp(phone, finalReply);
+    session.history.push({ role: 'assistant', content: finalReply });
+
+    // Update menu state
+    menuState.validOptions = options;
+    menuState.optionTopics = options;
+    menuState.menuShownAt  = new Date();
+
+    // Lead completion check
     if (!session.leadCollected && isLeadComplete(session.leadData)) {
       await finalizeLead(session);
-      console.log(`✅  Lead complete!`);
     }
 
-    // ── UPDATE SESSION & STATE ─────────────────────────────────────
-    activeState.lastUserMessage = rawMsg;
-    activeState.lastBotMessage = reply;
     activeState.lastInteractionAt = new Date();
     activeState.messageCount++;
 
-    await Promise.all([saveSession(session), saveActiveState(activeState)]);
-    await logInteraction(phone, 'QA', { intent: intent.type, entities });
+    // ⚡ Parallel saves
+    await Promise.all([saveSession(session), saveActiveState(activeState), saveMenuState(menuState)]);
+    await logInteraction(phone, 'QA', { intent: intent.type });
 
   } catch (err) {
-    console.error('❌  Webhook error:', err.message);
+    console.error('❌  Webhook error:', err.message, err.stack);
   }
 });
 
@@ -3197,12 +2887,7 @@ app.post('/webhook', async (req, res) => {
 // ─────────────────────────────────────────────
 async function logInteraction(phone, type, data = {}) {
   if (!analyticsCol) return;
-  analyticsCol.insertOne({
-    phone,
-    type,
-    data,
-    ts: new Date(),
-  }).catch(() => {});
+  analyticsCol.insertOne({ phone, type, data, ts: new Date() }).catch(() => {});
 }
 
 // ─────────────────────────────────────────────
@@ -3217,10 +2902,8 @@ app.get('/admin/leads', async (req, res) => {
 app.get('/admin/sessions', async (req, res) => {
   if (!sessionsCol) return res.json([]);
   const sessions = await sessionsCol
-    .find({}, { projection: { phone: 1, 'leadData': 1, leadCollected: 1, lastActive: 1 } })
-    .sort({ lastActive: -1 })
-    .limit(50)
-    .toArray();
+    .find({}, { projection: { phone: 1, leadData: 1, leadCollected: 1, lastActive: 1 } })
+    .sort({ lastActive: -1 }).limit(50).toArray();
   res.json(sessions);
 });
 
@@ -3229,29 +2912,28 @@ app.get('/health', (req, res) => {
     status: 'ok',
     uptime: process.uptime(),
     caches: {
-      sessions: sessionCache.size,
+      sessions:     sessionCache.size,
       activeStates: activeStateCache.size,
-      menus: menuStateCache.size,
-      kbChunks: kbChunkCache.size,
+      menus:        menuStateCache.size,
+      kbChunks:     kbChunkCache.size,
     },
   });
 });
 
 app.get('/', (req, res) => {
-  res.send('<h1>Comply Globally — WhatsApp Bot</h1><p>Webhook ready.</p>');
+  res.send('<h1>Comply Globally — WhatsApp Bot v3</h1><p>Webhook ready.</p>');
 });
 
 // ─────────────────────────────────────────────
 // START SERVER
 // ─────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
-
 connectMongo().then(() => {
   app.listen(PORT, () => {
     console.log(`\n🚀  Server running on port ${PORT}`);
-    console.log(`📡  POST /webhook — WhatsApp receiver`);
-    console.log(`📊  GET  /admin/leads — view leads`);
-    console.log(`📊  GET  /admin/sessions — view sessions`);
-    console.log(`❤️   GET  /health — health check\n`);
+    console.log(`📡  POST /webhook`);
+    console.log(`📊  GET  /admin/leads`);
+    console.log(`📊  GET  /admin/sessions`);
+    console.log(`❤️   GET  /health\n`);
   });
 });
