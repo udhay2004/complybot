@@ -1,9 +1,7 @@
 'use strict';
 
 /**
- * ============================================================
- *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  Production-Grade | Context-Aware | Persistent State
+
  * ============================================================
  *
  *  KNOWLEDGE BASE INSERTION POINT:
