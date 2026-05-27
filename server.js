@@ -2324,7 +2324,7 @@ const COMMON_FIRST_NAMES = new Set([
   'vivek', 'vikas', 'varun', 'vikram', 'vimal', 'vinod', 'vinay', 'viral',
   'yogesh', 'yash', 'yashmit',
   'zara', 'zoey', 'zainab',
-];
+]);
 
 function isValidName(candidate) {
   if (!candidate || candidate.length < 2 || candidate.length > 50) return false;
