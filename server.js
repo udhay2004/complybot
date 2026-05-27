@@ -2078,14 +2078,7 @@ CONTACT & PRICING
 - Pricing: "Our team will send a custom quote based on your jurisdiction and requirements"
 - Specific legal opinions or complex tax structuring: "Our experts will guide you on the specifics"
 `;
-// ════════════════════════════════════════════════════════════════════════════
-// ════════ END KNOWLEDGE BASE INSERTION POINT ════════════════════════════════
-// ════════════════════════════════════════════════════════════════════════════
 
-// ─────────────────────────────────────────────
-// QUICK-REPLY TOPIC BANKS
-// These are the numbered options appended to every Claude response.
-// Keys match country/topic slugs. Claude picks the right bank based on context.
 // ─────────────────────────────────────────────
 const QUICK_REPLY_BANKS = {
   uae: [
@@ -2296,6 +2289,20 @@ function retrieveRelevantKB(userMessage, limit = 1) {
     .join('\n\n');
 
   return scored || KNOWLEDGE_BASE.substring(0, 1500) + '\n[...full KB available...]';
+}
+
+// ─────────────────────────────────────────────
+// FOOTER DEDUPLICATION
+// Claude sometimes generates its own "Quick topics:" block despite instructions.
+// Strip it before we append the system-controlled footer.
+// ─────────────────────────────────────────────
+function stripClaudeGeneratedFooter(text) {
+  return text
+    // Remove any "*Quick topics:*" / "Quick topics:" block and everything after it
+    .replace(/\n*[\*_]*Quick\s+(?:topics|reply|options)[\*_]*:?[\s\S]*/i, '')
+    // Remove if Claude starts a standalone emoji-number list
+    .replace(/\n+(?:1️⃣|2️⃣|3️⃣|4️⃣|5️⃣|6️⃣)[\s\S]*/m, '')
+    .trimEnd();
 }
 
 // ─────────────────────────────────────────────
@@ -2537,7 +2544,9 @@ RESPONSE RULES:
 - Use *bold* for key terms, line breaks for readability
 - Always end with a clear next step or question
 - Use "we"/"our team" where appropriate
-- Do NOT append numbered options yourself — the system adds them automatically
+- ⛔ ABSOLUTELY FORBIDDEN: do NOT write "Quick topics:", "Quick reply:", or any numbered option/menu list
+- ⛔ ABSOLUTELY FORBIDDEN: do NOT end your message with 1️⃣ 2️⃣ 3️⃣ 4️⃣ or any emoji-numbered list
+- The system appends quick-reply options automatically AFTER your response — if you add them too, the user sees them TWICE which is broken
 
 LEAD COLLECTION (natural, non-invasive):
 Collect: full name, email, current country, target jurisdiction, service needed, business stage, timeline.
@@ -2547,7 +2556,6 @@ NEVER save obviously invalid names (countries, random words, single letters).
 MENU HANDLING:
 - When the user sends a number (1, 2, 3, 4), you WILL be told exactly which option they selected in the [MENU SELECTION] tag
 - Answer that topic thoroughly and naturally — do not ask "what did you mean by 2?"
-- The quick-reply options are appended automatically; do not recreate them in your response
 
 KNOWLEDGE BASE:
 - Cite specific facts from the injected KB section
@@ -2720,20 +2728,21 @@ app.post('/webhook', async (req, res) => {
     ]);
 
     // ── NEW USER GREETING ─────────────────────────────────────────
+    // No quick-reply boxes on the opening message — just a clean welcome.
+    // Options appear only after the user shares their name/country.
     if (session.history.length === 0) {
-      const { footer, options } = buildQuickReplyFooter('general');
       const greeting = `Welcome to *Comply Globally* — your trusted partner for global business expansion. 🌍\n\n` +
         `We help Indian businesses set up companies, open bank accounts, handle tax compliance, FEMA/ODI advisory, and residency solutions across 47+ jurisdictions.\n\n` +
-        `To get started, may I know your *full name* and which *country you're looking to expand into*?` +
-        footer;
+        `To get started, could you share your *full name* and which *country you're looking to expand into*?`;
 
       await sendWhatsApp(phone, greeting);
       session.history.push({ role: 'user', content: 'GREETING_RECEIVED' });
       session.history.push({ role: 'assistant', content: greeting });
-      activeState.currentFlow        = 'ONBOARDING';
-      activeState.conversationStage  = 'NAME';
-      menuState.validOptions  = options;
-      menuState.optionTopics  = options;
+      activeState.currentFlow       = 'ONBOARDING';
+      activeState.conversationStage = 'NAME';
+      // Do NOT set validOptions here — no menu on first message
+      menuState.validOptions = [];
+      menuState.optionTopics = [];
 
       // ⚡ Parallel saves
       await Promise.all([saveSession(session), saveActiveState(activeState), saveMenuState(menuState)]);
@@ -2782,10 +2791,10 @@ app.post('/webhook', async (req, res) => {
       const sysPrompt = buildSystemPrompt(session, activeState, menuState);
       const rawReply  = await getClaudeReply(sysPrompt, session.history, chosenTopic);
 
-      // Detect topic bank from the chosen topic + session context
+      // Strip any footer Claude generated, then append the system-controlled one
       const bank        = detectTopicBank(session, chosenTopic);
       const { footer, options } = buildQuickReplyFooter(bank);
-      const finalReply  = rawReply + footer;
+      const finalReply  = stripClaudeGeneratedFooter(rawReply) + footer;
 
       await sendWhatsApp(phone, finalReply);
       session.history.push({ role: 'assistant', content: finalReply });
@@ -2852,10 +2861,10 @@ app.post('/webhook', async (req, res) => {
     const sysPrompt = buildSystemPrompt(session, activeState, menuState);
     const rawReply  = await getClaudeReply(sysPrompt, session.history, rawMsg);
 
-    // Detect topic and append quick-reply options
+    // Strip any footer Claude generated, then append the system-controlled one
     const bank        = detectTopicBank(session, rawMsg);
     const { footer, options } = buildQuickReplyFooter(bank);
-    const finalReply  = rawReply + footer;
+    const finalReply  = stripClaudeGeneratedFooter(rawReply) + footer;
 
     await sendWhatsApp(phone, finalReply);
     session.history.push({ role: 'assistant', content: finalReply });
