@@ -1,6 +1,6 @@
-const express = require('express');
-const path = require('path');
-const fetch = require('node-fetch');
+const express    = require('express');
+const path       = require('path');
+const fetch      = require('node-fetch');
 const { MongoClient } = require('mongodb');
 const { google } = require('googleapis');
 require('dotenv').config();
@@ -9,6 +9,7 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// CORS — permissive for Interakt webhooks
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
@@ -18,7 +19,7 @@ app.use((req, res, next) => {
 });
 
 // ─────────────────────────────────────────────
-// ENV
+// ENVIRONMENT CONFIG
 // ─────────────────────────────────────────────
 const INTERAKT_API_KEY   = (process.env.INTERAKT_API_KEY   || '').replace(/['"` \n\r]/g, '');
 const ANTHROPIC_API_KEY  = (process.env.ANTHROPIC_API_KEY  || '').replace(/['"` \n\r]/g, '');
@@ -29,8 +30,9 @@ const RESEND_API_KEY     = (process.env.RESEND_API_KEY     || '').replace(/['"` 
 const NOTIFY_EMAIL       = process.env.NOTIFY_EMAIL        || 'udhaymarwah96@gmail.com';
 const FROM_EMAIL         = process.env.FROM_EMAIL          || 'onboarding@resend.dev';
 const BASE_URL           = process.env.BASE_URL            || 'https://complybot.onrender.com';
-const HUMAN_TIMEOUT_MS   = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000');
+const HUMAN_TIMEOUT_MS   = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000', 10);
 
+// Validate critical env vars at startup
 [
   ['INTERAKT_API_KEY',  INTERAKT_API_KEY],
   ['ANTHROPIC_API_KEY', ANTHROPIC_API_KEY],
@@ -38,37 +40,18 @@ const HUMAN_TIMEOUT_MS   = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000');
   ['GOOGLE_SHEET_ID',   GOOGLE_SHEET_ID],
   ['RESEND_API_KEY',    RESEND_API_KEY],
 ].forEach(([k, v]) => {
-  if (!v) console.error(`❌ ${k} missing!`);
-  else    console.log(`✅ ${k} loaded`);
+  if (!v) console.error(`❌  ENV MISSING: ${k}`);
+  else    console.log (`✅  ENV loaded:  ${k}`);
 });
 
-// ─────────────────────────────────────────────
-// MONGODB
-// ─────────────────────────────────────────────
-let db;
-let sessionsCol;
-let leadsCol;
-
-async function connectMongo() {
-  try {
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    db          = client.db('comply_globally');
-    sessionsCol = db.collection('sessions');
-    leadsCol    = db.collection('leads');
-    await sessionsCol.createIndex({ phone: 1 }, { unique: true });
-    await sessionsCol.createIndex({ lastActive: 1 }, { expireAfterSeconds: 86400 * 7 }); // 7-day TTL
-    console.log('✅ MongoDB connected');
-  } catch (err) {
-    console.error('❌ MongoDB connection failed:', err.message);
-  }
-}
-
-// ─────────────────────────────────────────────
-// KNOWLEDGE BASE
-// ─────────────────────────────────────────────
-// PASTE YOUR FULL KNOWLEDGE BASE STRING HERE between the backticks below.
-// Replace this comment block with the entire KB content.
+// ════════ KNOWLEDGE BASE — PASTE YOUR FULL KB STRING HERE ════════
+// Replace the empty string below with your complete knowledge base.
+// Keep the backtick delimiters. The string can be thousands of lines long.
+// Example:
+//   const KNOWLEDGE_BASE = `
+//   ━━━━━━ KNOWLEDGE BASE — USA INCORPORATION ━━━━━━
+//   ... all your KB content ...
+//   `;
 const KNOWLEDGE_BASE = `
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 KNOWLEDGE BASE — USA INCORPORATION (State Navigator)
@@ -2064,127 +2047,193 @@ CONTACT & PRICING
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 - Contact: sales@complyglobally.com | +1 (302) 214-1717 | +91 99999 81613
 - Pricing: "Our team will send a custom quote based on your jurisdiction and requirements"
-- Specific legal opinions or complex tax structuring: "Our experts will guide you on the specifics"`;
+- Specific legal opinions or complex tax structuring: "Our experts will guide you on the specifics"
+`;
+// ═══════════════════════════════════════════════════════════════════════
 
 // ─────────────────────────────────────────────
-// NAME VALIDATION
+// MONGODB
 // ─────────────────────────────────────────────
+let db;
+let sessionsCol;
+let leadsCol;
+
+async function connectMongo() {
+  try {
+    const client = new MongoClient(MONGODB_URI, {
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 10000,
+    });
+    await client.connect();
+    db          = client.db('comply_globally');
+    sessionsCol = db.collection('sessions');
+    leadsCol    = db.collection('leads');
+
+    // Indexes
+    await sessionsCol.createIndex({ phone: 1 }, { unique: true });
+    await sessionsCol.createIndex({ lastActive: 1 }, { expireAfterSeconds: 86400 * 7 }); // 7-day TTL
+    await leadsCol.createIndex({ phone: 1 }, { unique: true });
+
+    console.log('✅  MongoDB connected');
+  } catch (err) {
+    console.error('❌  MongoDB connection failed:', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// IN-MEMORY SESSION CACHE
+// Reduces DB round-trips for high-traffic numbers.
+// ─────────────────────────────────────────────
+const sessionCache = new Map(); // phone → { session, ts }
+const CACHE_TTL_MS = 30_000;   // 30 seconds
+
+function cacheGet(phone) {
+  const entry = sessionCache.get(phone);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CACHE_TTL_MS) { sessionCache.delete(phone); return null; }
+  return entry.session;
+}
+
+function cacheSet(phone, session) {
+  sessionCache.set(phone, { session, ts: Date.now() });
+}
+
+function cacheDelete(phone) {
+  sessionCache.delete(phone);
+}
+
+// ─────────────────────────────────────────────
+// NAME VALIDATION  — comprehensive, safe
+// ─────────────────────────────────────────────
+
 /**
- * WHY THE OLD CODE FAILED:
- * The old extractLeadData() scanned every incoming message for "any word that
- * looks like a noun" and stored the first non-stopword it found as the user's
- * name.  When a user typed "I am expanding to Pakistan", the function found
- * "Pakistan" (not in its small stopword set) and silently wrote it as the name.
- *
- * FIX:
- * We now extract a name ONLY when one of two conditions is met:
- *   1. The user message matches an explicit self-introduction pattern
- *      ("my name is X", "I'm X", "this is X", etc.)
- *   2. The bot's PREVIOUS message explicitly asked for the user's name AND the
- *      user's reply passes structural validation (no country / company noise).
- *
- * Structural validation rejects:
- *   - Known country / city names
- *   - Known company-type suffixes (LLC, Ltd, Pvt, Corp …)
- *   - Single characters, pure numbers, or strings > 40 chars
- *   - Common filler words ("yes", "no", "sure", "ok", …)
+ * Comprehensive geo-entity blacklist.
+ * These words must NEVER be stored as a user's name.
  */
-
-// Comprehensive list of geo entities that must NEVER be treated as names
 const GEO_ENTITIES = new Set([
+  // Countries
   'india','indian','pakistan','pakistani','usa','america','american',
   'canada','canadian','uk','britain','british','england','english',
-  'uae','dubai','abu dhabi','emirates','singapore','singaporean',
-  'thailand','thai','philippines','philippine','indonesia','indonesian',
+  'uae','dubai','abudhabi','emirates','emirati','singapore','singaporean',
+  'thailand','thai','philippines','philippine','filipino','indonesia','indonesian',
   'vietnam','vietnamese','estonia','estonian','italy','italian',
   'germany','german','france','french','australia','australian',
   'china','chinese','japan','japanese','korea','korean',
-  'bangladesh','bangladesh','sri lanka','nepal','myanmar',
-  'kenya','nigeria','ghana','south africa','malaysia','malaysian',
-  'new york','california','texas','florida','london','mumbai',
-  'delhi','bangalore','hyderabad','chennai','kolkata','pune',
+  'bangladesh','bangladeshi','srilanka','nepal','nepali','myanmar','burmese',
+  'kenya','kenyan','nigeria','nigerian','ghana','ghanaian','southafrica','malaysia','malaysian',
+  'newzealand','ireland','irish','scotland','scottish','wales','welsh',
+  'spain','spanish','portugal','portuguese','brazil','brazilian',
+  'mexico','mexican','argentina','argentine',
+  // Major cities
+  'newyork','california','texas','florida','london','mumbai',
+  'delhi','newdelhi','bangalore','hyderabad','chennai','kolkata','pune','ahmedabad',
   'karachi','lahore','islamabad','dhaka','colombo','kathmandu',
-  'jakarta','manila','bangkok','kuala lumpur','hong kong',
-  'middle east','gulf','europe','asia','southeast asia','south asia',
+  'jakarta','manila','bangkok','kualalumpur','hongkong','beijing','shanghai',
+  'tokyo','osaka','seoul','sydney','melbourne','toronto','vancouver',
+  'paris','berlin','amsterdam','rome','milan','madrid','barcelona',
+  'dubai','abudhabi','riyadh','doha','kuwait','muscat',
+  // Regions / concepts
+  'middleeast','gulf','europe','asia','southeastasia','southasia',
+  'caribbean','africa','oceania',
 ]);
 
-// Words that are clearly NOT personal names
+/**
+ * Generic words that are never personal names.
+ */
 const NAME_BLACKLIST = new Set([
-  'yes','no','nope','okay','ok','sure','thanks','thank','hello','hi','hey',
+  // Greetings / filler
+  'yes','no','nope','okay','ok','sure','thanks','thank','hello','hi','hey','yo',
   'good','fine','great','nice','cool','right','alright','absolutely','definitely',
-  'please','sorry','help','need','want','looking','expanding','business',
-  'company','startup','firm','service','product','export','import','trade',
+  'please','sorry','help','need','want','looking','expanding','business','company',
+  'startup','firm','service','product','export','import','trade',
   'incorporate','incorporation','register','setup','formation','compliance',
   'tax','legal','finance','banking','account','visa','residency','golden',
   'digital','online','software','technology','tech','saas','ecommerce','app',
+  // Entity types
   'llc','ltd','pvt','corp','inc','gmbh','pte','pty','bv','srl','ou','sas',
+  'limited','private','public','plc','pty',
+  // Common question words
   'not','just','also','even','only','very','much','more','most','some',
   'what','where','when','how','why','who','which','that','this','these','those',
   'have','has','had','will','would','could','should','may','might','must','can',
   'are','is','was','were','be','been','being','do','does','did','get','got',
+  // Negatives used in handoff flow
+  'nope','nah','none','nothing','nomore','notreally','thatsall','nothinelse',
 ]);
 
 /**
- * Returns true if `word` looks like a plausible personal first name.
- * Does NOT guarantee it IS a name — just that it passes sanity checks.
+ * Returns true if a token looks like a plausible person name component.
  */
-function looksLikePersonName(word) {
+function looksLikeNameToken(word) {
   if (!word || typeof word !== 'string') return false;
-  const clean = word.trim();
-  if (clean.length < 2 || clean.length > 40) return false;
-  if (!/^[A-Za-z]/.test(clean)) return false;          // must start with a letter
-  if (/\d/.test(clean)) return false;                   // no digits
-  if (GEO_ENTITIES.has(clean.toLowerCase())) return false;
-  if (NAME_BLACKLIST.has(clean.toLowerCase())) return false;
-  // Reject things that look like company-type suffixes
-  if (/\b(llc|ltd|pvt|corp|inc|gmbh|pte|pty|bv|srl|ou|sas)\b/i.test(clean)) return false;
+  const clean = word.trim().replace(/[^a-zA-Z\-']/g, '');
+  if (clean.length < 2 || clean.length > 35) return false;
+  if (!/^[A-Za-z]/.test(clean)) return false;
+  if (/\d/.test(clean)) return false;
+  // Normalise for blacklist lookup
+  const lower = clean.toLowerCase().replace(/[\s\-']/g, '');
+  if (GEO_ENTITIES.has(lower)) return false;
+  if (NAME_BLACKLIST.has(lower)) return false;
+  // Reject obvious company suffixes embedded
+  if (/\b(llc|ltd|pvt|corp|inc|gmbh|pte|pty|bv|srl|ou|sas|plc)\b/i.test(clean)) return false;
   return true;
 }
 
 /**
- * Attempt to extract a name from an EXPLICIT self-introduction.
- * Returns the name string or null.
+ * Attempt to extract a name from an explicit self-introduction phrase.
+ * Returns capitalised first name or null.
  */
 function extractNameFromIntroduction(message) {
   const patterns = [
-    /(?:my name is|i(?:'m| am)|this is|call me|it's|its)\s+([A-Za-z][A-Za-z\s]{1,30}?)(?:\s*[,\.!?]|$)/i,
-    /^([A-Za-z]{2,20})\s+here\b/i,   // "Rahul here"
-    /^([A-Za-z]{2,20})\s+this side\b/i, // "Rahul this side" (common in India)
+    // "my name is Rahul", "my name's Rahul Sharma"
+    /(?:my\s+name(?:\s+is|'s)?)\s+([A-Za-z][A-Za-z\s\-']{1,40}?)(?:\s*[,\.!?]|$)/i,
+    // "I am Rahul", "I'm Rahul"
+    /\b(?:i\s+am|i'm)\s+([A-Za-z][A-Za-z\s\-']{1,40}?)(?:\s+(?:from|based|calling|reaching|writing|here|and|with)\b|[,\.!?]|$)/i,
+    // "this is Rahul"
+    /\bthis\s+is\s+([A-Za-z][A-Za-z\s\-']{1,40}?)(?:\s*[,\.!?]|$)/i,
+    // "call me Rahul"
+    /\bcall\s+me\s+([A-Za-z][A-Za-z\s\-']{1,30}?)(?:\s*[,\.!?]|$)/i,
+    // "Rahul here" / "Rahul this side"
+    /^([A-Za-z]{2,25})\s+(?:here|this\s+side)\b/i,
+    // "it's Rahul"
+    /\bit(?:'s|\s+is)\s+([A-Za-z][A-Za-z\s\-']{1,30}?)(?:\s*[,\.!?]|$)/i,
   ];
 
   for (const pattern of patterns) {
     const match = message.match(pattern);
     if (match) {
-      // Take only the FIRST word to avoid "John Doe CEO India" being stored as full name string
-      const raw   = match[1].trim().split(/\s+/)[0];
-      const clean = raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase();
-      if (looksLikePersonName(clean)) return clean;
+      // Take only the first word to avoid "Rahul Sharma CEO India" misparse
+      const firstToken = match[1].trim().split(/\s+/)[0];
+      const clean = capitalise(firstToken);
+      if (looksLikeNameToken(clean)) return clean;
     }
   }
   return null;
 }
 
 /**
- * Attempt to extract a name when the bot's last message was asking for name.
- * This is more permissive but still validated.
+ * When the bot's last message explicitly asked for the user's name,
+ * try to parse the reply as a name.
  */
 function extractNameFromDirectAnswer(message) {
-  // If the reply is a single token that looks like a name, accept it
   const tokens = message.trim().split(/\s+/);
+  // Single token reply
   if (tokens.length === 1) {
-    const clean = tokens[0].charAt(0).toUpperCase() + tokens[0].slice(1).toLowerCase();
-    return looksLikePersonName(clean) ? clean : null;
+    const clean = capitalise(tokens[0]);
+    return looksLikeNameToken(clean) ? clean : null;
   }
-  // If 2–3 tokens, check if they ALL pass (full name like "Rahul Sharma")
+  // 2–3 token reply (e.g. "Rahul Sharma")
   if (tokens.length <= 3) {
-    const cleaned = tokens.map(t => t.charAt(0).toUpperCase() + t.slice(1).toLowerCase());
-    if (cleaned.every(looksLikePersonName)) return cleaned[0]; // store first name only
+    const cleaned = tokens.map(t => capitalise(t));
+    if (cleaned.every(t => looksLikeNameToken(t))) {
+      return cleaned[0]; // store first name only
+    }
   }
   return null;
 }
 
 /**
- * Check whether the bot's most recent assistant message was asking for the user's name.
+ * Check whether the bot's most-recent message explicitly asked for the user's name.
  */
 function botWasAskingForName(lastBotMessage) {
   if (!lastBotMessage) return false;
@@ -2195,259 +2244,295 @@ function botWasAskingForName(lastBotMessage) {
     lower.includes('may i know your name') ||
     lower.includes('could you share your name') ||
     lower.includes('who am i speaking with') ||
-    lower.includes('introduce yourself')
+    lower.includes('introduce yourself') ||
+    lower.includes('may i have your name') ||
+    lower.includes('what is your name')
   );
 }
 
+function capitalise(str) {
+  if (!str) return '';
+  return str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
+}
+
 // ─────────────────────────────────────────────
-// LEAD DATA EXTRACTION (FIXED)
+// LEAD DATA EXTRACTION  — safe, context-aware
 // ─────────────────────────────────────────────
+
+/**
+ * Extract and update lead fields from a user message.
+ * NEVER overwrites validated fields with noise.
+ */
 function extractLeadData(session, userMessage) {
   const lead = session.leadData;
 
-  // ── 1. NAME (safe extraction only) ──────────────────────────────────────
+  // ── 1. NAME ────────────────────────────────────────────────────────────
   if (!lead.name) {
-    // Strategy A: explicit introduction in the message
-    const nameFromIntro = extractNameFromIntroduction(userMessage);
-    if (nameFromIntro) {
-      lead.name = nameFromIntro;
-      console.log('✅ Name (intro):', lead.name);
+    // Strategy A: explicit introduction in the message itself
+    const nameA = extractNameFromIntroduction(userMessage);
+    if (nameA) {
+      lead.name = nameA;
+      console.log(`✅  Name (intro): ${lead.name}`);
     } else {
-      // Strategy B: bot explicitly asked for name → treat reply as potential name
-      const lastBotMsg = session.history
-        .filter(m => m.role === 'assistant')
-        .slice(-1)[0]?.content || '';
+      // Strategy B: bot's previous turn explicitly asked for the name
+      const lastBotMsg = lastAssistantMessage(session);
       if (botWasAskingForName(lastBotMsg)) {
-        const nameFromAnswer = extractNameFromDirectAnswer(userMessage);
-        if (nameFromAnswer) {
-          lead.name = nameFromAnswer;
-          console.log('✅ Name (direct answer):', lead.name);
+        const nameB = extractNameFromDirectAnswer(userMessage);
+        if (nameB) {
+          lead.name = nameB;
+          console.log(`✅  Name (direct answer): ${lead.name}`);
         }
       }
     }
   }
 
-  // ── 2. EMAIL ─────────────────────────────────────────────────────────────
+  // ── 2. EMAIL ───────────────────────────────────────────────────────────
   if (!lead.email) {
     const emailMatch = userMessage.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
     if (emailMatch) {
       lead.email = emailMatch[0].toLowerCase();
-      console.log('✅ Email:', lead.email);
+      console.log(`✅  Email: ${lead.email}`);
     }
   }
 
-  // ── 3. COMPANY NAME ──────────────────────────────────────────────────────
+  // ── 3. COMPANY NAME ────────────────────────────────────────────────────
   if (!lead.companyName) {
     const companyMatch = userMessage.match(
-      /(?:company(?:\s+name)?(?:\s+is)?|our\s+company|firm|organisation|organization)\s+(?:is\s+)?([A-Za-z][A-Za-z0-9\s&\-]{1,50}?)(?:\s*[,\.!?]|$)/i
+      /(?:company(?:\s+name)?(?:\s+is)?|our\s+company|firm|organisation|organization|business(?:\s+name)?(?:\s+is)?)\s+(?:is\s+)?([A-Za-z][A-Za-z0-9\s&\-\.]{1,60}?)(?:\s*[,\.!?]|$)/i
     );
     if (companyMatch) {
-      lead.companyName = companyMatch[1].trim();
-      console.log('✅ Company:', lead.companyName);
-    }
-  }
-
-  // ── 4. COUNTRIES (only based on clear expanding/from context) ────────────
-  const countryMap = [
-    { names: ['usa','u.s.','united states','america','new york','california','florida','texas','delaware','wyoming'], label: 'USA' },
-    { names: ['canada','toronto','vancouver','ontario','british columbia','quebec'], label: 'Canada' },
-    { names: ['uk','u.k.','united kingdom','britain','england','scotland','london','manchester'], label: 'UK' },
-    { names: ['uae','dubai','abu dhabi','emirates'], label: 'UAE' },
-    { names: ['singapore','sg'], label: 'Singapore' },
-    { names: ['india','delhi','mumbai','bangalore','hyderabad','pune','chennai','kolkata'], label: 'India' },
-    { names: ['pakistan','karachi','lahore','islamabad'], label: 'Pakistan' },
-    { names: ['thailand','bangkok','chiang mai'], label: 'Thailand' },
-    { names: ['philippines','manila','cebu'], label: 'Philippines' },
-    { names: ['indonesia','jakarta','surabaya'], label: 'Indonesia' },
-    { names: ['vietnam','hanoi','ho chi minh','saigon'], label: 'Vietnam' },
-    { names: ['estonia','tallinn'], label: 'Estonia' },
-    { names: ['italy','milan','rome'], label: 'Italy' },
-    { names: ['germany','berlin','frankfurt','munich'], label: 'Germany' },
-    { names: ['netherlands','amsterdam'], label: 'Netherlands' },
-    { names: ['australia','sydney','melbourne'], label: 'Australia' },
-  ];
-
-  const msg = userMessage.toLowerCase();
-
-  // Signals that the user is talking about WHERE THEY WANT TO GO (target)
-  const targetSignals = /\b(expand(?:ing)?(?:\s+(?:to|into|in))?|set(?:ting)?\s+up\s+(?:in|a)|incorporat(?:e|ing)\s+in|register(?:ing)?\s+in|open(?:ing)?\s+(?:a\s+(?:company|business|office)\s+)?in|launch(?:ing)?\s+in|enter(?:ing)?\s+(?:the\s+)?|move(?:\s+(?:to|into))?|headquarter(?:s)?\s+in|company\s+in|business\s+in)\b/i;
-
-  // Signals that the user is talking about WHERE THEY ARE NOW (current)
-  const currentSignals = /\b(based\s+in|currently\s+in|i(?:\s+am|'m)\s+(?:from|in)|we(?:\s+are|'re)\s+(?:from|in|based\s+in)|our\s+(?:office|company|business)\s+is\s+in|located\s+in|residing\s+in|operating\s+(?:from|in))\b/i;
-
-  const isTargetContext  = targetSignals.test(userMessage);
-  const isCurrentContext = currentSignals.test(userMessage);
-
-  for (const { names, label } of countryMap) {
-    const found = names.some(n => {
-      // Use word-boundary matching for short codes (uae, sg, uk) to avoid false positives
-      if (n.length <= 3) return new RegExp(`\\b${n}\\b`, 'i').test(msg);
-      return msg.includes(n);
-    });
-    if (!found) continue;
-
-    if (isTargetContext && !lead.targetCountry) {
-      lead.targetCountry = label;
-      console.log('🎯 Target country:', label);
-    } else if (isCurrentContext && !lead.currentCountry) {
-      lead.currentCountry = label;
-      console.log('📍 Current country:', label);
-    } else if (!isTargetContext && !isCurrentContext) {
-      // Ambiguous: first country → current (where they are), second → target
-      if (!lead.currentCountry) {
-        lead.currentCountry = label;
-        console.log('📍 Current country (ambiguous):', label);
-      } else if (!lead.targetCountry && label !== lead.currentCountry) {
-        lead.targetCountry = label;
-        console.log('🎯 Target country (ambiguous):', label);
+      const candidate = companyMatch[1].trim();
+      // Don't save if it's just a geo entity
+      const lower = candidate.toLowerCase().replace(/[\s\-']/g, '');
+      if (!GEO_ENTITIES.has(lower)) {
+        lead.companyName = candidate;
+        console.log(`✅  Company: ${lead.companyName}`);
       }
     }
   }
 
-  // ── 5. SERVICE NEEDED ────────────────────────────────────────────────────
+  // ── 4. COUNTRIES ────────────────────────────────────────────────────────
+  //
+  // Only extract country when there's clear contextual signal.
+  // "target" signal = user is going somewhere.
+  // "current" signal = user says where they are now.
+  //
+  const COUNTRY_MAP = [
+    { names: ['usa','u.s.','united states','america','new york','california','florida','texas','delaware','wyoming','nevada','new mexico','south dakota'], label: 'USA' },
+    { names: ['canada','toronto','vancouver','ontario','british columbia','quebec','calgary','ottawa'], label: 'Canada' },
+    { names: ['uk','u.k.','united kingdom','britain','england','scotland','london','manchester','birmingham'], label: 'UK' },
+    { names: ['uae','u.a.e.','dubai','abu dhabi','emirates','sharjah','rak','ajman'], label: 'UAE' },
+    { names: ['singapore'], label: 'Singapore' },
+    { names: ['india','delhi','mumbai','bangalore','bengaluru','hyderabad','pune','chennai','kolkata','ahmedabad'], label: 'India' },
+    { names: ['pakistan','karachi','lahore','islamabad'], label: 'Pakistan' },
+    { names: ['thailand','bangkok','chiang mai'], label: 'Thailand' },
+    { names: ['philippines','manila','cebu','peza'], label: 'Philippines' },
+    { names: ['indonesia','jakarta','surabaya','bali','batam'], label: 'Indonesia' },
+    { names: ['vietnam','hanoi','ho chi minh','saigon'], label: 'Vietnam' },
+    { names: ['estonia','tallinn','e-residency','eresidency'], label: 'Estonia' },
+    { names: ['italy','milan','rome','turin'], label: 'Italy' },
+    { names: ['germany','berlin','frankfurt','munich'], label: 'Germany' },
+    { names: ['netherlands','amsterdam','rotterdam'], label: 'Netherlands' },
+    { names: ['australia','sydney','melbourne','brisbane'], label: 'Australia' },
+    { names: ['new zealand'], label: 'New Zealand' },
+    { names: ['ireland','dublin'], label: 'Ireland' },
+    { names: ['hong kong'], label: 'Hong Kong' },
+    { names: ['japan','tokyo','osaka'], label: 'Japan' },
+    { names: ['south africa','johannesburg','cape town'], label: 'South Africa' },
+    { names: ['kenya','nairobi'], label: 'Kenya' },
+    { names: ['nigeria','lagos'], label: 'Nigeria' },
+    { names: ['malaysia','kuala lumpur'], label: 'Malaysia' },
+  ];
+
+  const msgLower = userMessage.toLowerCase();
+
+  const TARGET_SIGNAL  = /\b(expand(?:ing)?(?:\s+(?:to|into|in))?|set(?:ting)?\s+up\s+(?:in|a\s+(?:company|business))|incorporat(?:e|ing)(?:\s+in)?|register(?:ing)?(?:\s+in)?|open(?:ing)?(?:\s+(?:a\s+)?(?:company|business|office))?\s+in|launch(?:ing)?(?:\s+in)?|enter(?:ing)?(?:\s+(?:the\s+)?)?market|move(?:\s+(?:to|into))?|headquarter(?:s)?\s+in|company\s+in|business\s+in|start(?:ing)?\s+(?:a\s+business\s+)?in|want.*(?:in|to))\b/i;
+  const CURRENT_SIGNAL = /\b(based\s+in|currently\s+(?:in|based)|i(?:\s+am|'m)\s+(?:from|in|based)|we(?:\s+are|'re)\s+(?:from|in|based)|our\s+(?:office|company|business)\s+is\s+in|located\s+in|residing\s+in|operating\s+(?:from|in)|from\s+india|india(?:-| )based)\b/i;
+
+  const isTarget  = TARGET_SIGNAL.test(userMessage);
+  const isCurrent = CURRENT_SIGNAL.test(userMessage);
+
+  for (const { names, label } of COUNTRY_MAP) {
+    const found = names.some(n => {
+      if (n.length <= 4) return new RegExp(`\\b${escapeRegex(n)}\\b`, 'i').test(msgLower);
+      return msgLower.includes(n);
+    });
+    if (!found) continue;
+
+    if (isTarget && !lead.targetCountry) {
+      lead.targetCountry = label;
+      console.log(`🎯  Target country: ${label}`);
+    } else if (isCurrent && !lead.currentCountry) {
+      lead.currentCountry = label;
+      console.log(`📍  Current country: ${label}`);
+    } else if (!isTarget && !isCurrent) {
+      // Ambiguous: first mention → current, second → target
+      if (!lead.currentCountry) {
+        lead.currentCountry = label;
+        console.log(`📍  Current country (ambiguous): ${label}`);
+      } else if (!lead.targetCountry && label !== lead.currentCountry) {
+        lead.targetCountry = label;
+        console.log(`🎯  Target country (ambiguous): ${label}`);
+      }
+    }
+  }
+
+  // ── 5. SERVICE NEEDED ──────────────────────────────────────────────────
   if (!lead.serviceNeeded) {
-    if (/\b(incorporat|formation|register|company\s+setup|entity\s+setup|llc|corp|pvt\s+ltd|establish(?:ment)?)\b/i.test(userMessage))
+    if (/\b(incorporat|formation|register(?:ation)?|company\s+setup|entity\s+setup|llc|c-corp|pvt\s+ltd|establish(?:ment)?|set\s+up\s+a\s+company)\b/i.test(userMessage))
       lead.serviceNeeded = 'Company Formation';
-    else if (/\b(bank(?:ing)?|account|finance|payment|remit|wire\s+transfer)\b/i.test(userMessage))
+    else if (/\b(bank(?:ing)?|account|finance|payment|remit(?:tance)?|wire\s+transfer|mercury|relay|brex|wise)\b/i.test(userMessage))
       lead.serviceNeeded = 'Banking Setup';
-    else if (/\b(tax|vat|gst|irs|filing|compliance|return|audit)\b/i.test(userMessage))
+    else if (/\b(tax(?:ation)?|vat|gst|irs|filing|compliance|return|audit|cit|ires|irap)\b/i.test(userMessage))
       lead.serviceNeeded = 'Tax Compliance';
-    else if (/\b(fema|rbi|overseas\s+invest|odi|form\s+oi|apr|fla\s+return)\b/i.test(userMessage))
+    else if (/\b(fema|rbi|overseas\s+invest|odi|form\s+oi|apr|fla\s+return|ad\s+bank|uin|lrs|compounding)\b/i.test(userMessage))
       lead.serviceNeeded = 'FEMA / ODI Compliance';
-    else if (/\b(visa|residency|golden\s+visa|work\s+permit|immigration|pr\b|permanent\s+residen)\b/i.test(userMessage))
+    else if (/\b(visa|residency|golden\s+visa|work\s+permit|immigration|pr\b|permanent\s+residen|e-residency|smart\s+visa|ltr\s+visa)\b/i.test(userMessage))
       lead.serviceNeeded = 'Residency / Visa';
-    else if (/\b(exim|export|import|trade\s+finance|customs)\b/i.test(userMessage))
+    else if (/\b(exim|export|import|trade\s+finance|customs|logistics|shipping|port)\b/i.test(userMessage))
       lead.serviceNeeded = 'EXIM / Trade';
-    if (lead.serviceNeeded) console.log('📋 Service:', lead.serviceNeeded);
+    else if (/\b(vc|fundrais|investor|raise\s+(?:money|capital|funding)|series\s+[a-c]|seed\s+round|qsbs)\b/i.test(userMessage))
+      lead.serviceNeeded = 'VC / Fundraising';
+    if (lead.serviceNeeded) console.log(`📋  Service: ${lead.serviceNeeded}`);
   }
 
-  // ── 6. BUSINESS STAGE ────────────────────────────────────────────────────
+  // ── 6. BUSINESS STAGE ──────────────────────────────────────────────────
   if (!lead.businessStage) {
-    if (/\b(startup|just\s+start(?:ed)?|new\s+(?:business|venture)|early\s+stage|pre-revenue)\b/i.test(userMessage))
+    if (/\b(startup|just\s+start(?:ed)?|new\s+(?:business|venture|company)|early\s+stage|pre-revenue|idea\s+stage)\b/i.test(userMessage))
       lead.businessStage = 'Startup / Early Stage';
-    else if (/\b(freelanc|consultant|solo|self[-\s]employ|individual|sole\s+proprietor)\b/i.test(userMessage))
+    else if (/\b(freelanc|consultant|solo|self[-\s]employ|individual|sole\s+proprietor|one-?person)\b/i.test(userMessage))
       lead.businessStage = 'Freelancer / Consultant';
-    else if (/\b(small|medium|sme|growing|scale[-\s]up)\b/i.test(userMessage))
+    else if (/\b(small|medium|sme|growing|scale[-\s]up|scaleup)\b/i.test(userMessage))
       lead.businessStage = 'SME';
-    else if (/\b(large|enterprise|multinational|established|years\s+(?:in\s+)?(?:business|operation))\b/i.test(userMessage))
+    else if (/\b(large|enterprise|multinational|established|conglomerate|\d{2,}\s+years?\s+(?:in\s+)?(?:business|operation))\b/i.test(userMessage))
       lead.businessStage = 'Established Company';
-    if (lead.businessStage) console.log('📊 Stage:', lead.businessStage);
+    if (lead.businessStage) console.log(`📊  Stage: ${lead.businessStage}`);
   }
 
-  // ── 7. TIMELINE ──────────────────────────────────────────────────────────
+  // ── 7. TIMELINE ────────────────────────────────────────────────────────
   if (!lead.timeline) {
-    if (/\b(now|today|asap|urgent|immediately|right\s+away|this\s+week)\b/i.test(userMessage))
+    if (/\b(now|today|asap|urgent|immediately|right\s+away|this\s+week|instant)\b/i.test(userMessage))
       lead.timeline = 'Immediate / ASAP';
     else if (/\b(next\s+(?:week|few\s+weeks)|soon|quickly|fast|within\s+(?:a\s+)?(?:week|month))\b/i.test(userMessage))
       lead.timeline = 'Within 1 month';
-    else if (/\b((?:few|couple\s+of)\s+months?|in\s+\d\s+months?|quarter)\b/i.test(userMessage))
+    else if (/\b((?:few|couple\s+of)\s+months?|in\s+\d\s+months?|quarter|q[1-4])\b/i.test(userMessage))
       lead.timeline = '1–3 months';
-    else if (/\b(next\s+(?:half|year|6\s+months)|long.?term|planning\s+ahead)\b/i.test(userMessage))
+    else if (/\b(next\s+(?:half|year|6\s+months)|long.?term|planning\s+ahead|later\s+this\s+year)\b/i.test(userMessage))
       lead.timeline = '6+ months';
-    if (lead.timeline) console.log('⏱️  Timeline:', lead.timeline);
+    if (lead.timeline) console.log(`⏱️   Timeline: ${lead.timeline}`);
   }
-
-  // ── 8. ADDITIONAL INFO (only after explicit ask) ─────────────────────────
-  // Handled separately in the main webhook flow — NOT here.
 }
 
 // ─────────────────────────────────────────────
-// KNOWLEDGE BASE ROUTER
+// KNOWLEDGE BASE ROUTER — returns only relevant sections
 // ─────────────────────────────────────────────
+
+const KB_SECTION_MARKERS = {
+  USA:         'KNOWLEDGE BASE — USA',
+  FEMA:        'KNOWLEDGE BASE — FEMA ODI',
+  CANADA:      'KNOWLEDGE BASE — CANADA',
+  UK:          'KNOWLEDGE BASE — UNITED KINGDOM',
+  SINGAPORE:   'KNOWLEDGE BASE — SINGAPORE',
+  UAE:         'KNOWLEDGE BASE — UAE',
+  PHILIPPINES: 'KNOWLEDGE BASE — PHILIPPINES',
+  THAILAND:    'KNOWLEDGE BASE — THAILAND',
+  ESTONIA:     'KNOWLEDGE BASE — ESTONIA',
+  ITALY:       'KNOWLEDGE BASE — ITALY',
+  VIETNAM:     'KNOWLEDGE BASE — VIETNAM',
+  INDONESIA:   'KNOWLEDGE BASE — INDONESIA',
+};
+
+// Cache parsed KB sections for performance (built once on first request)
+const _kbCache = new Map();
+
+function extractKBSection(sectionKey) {
+  if (_kbCache.has(sectionKey)) return _kbCache.get(sectionKey);
+
+  const keys        = Object.keys(KB_SECTION_MARKERS);
+  const startMarker = KB_SECTION_MARKERS[sectionKey];
+  if (!startMarker) { _kbCache.set(sectionKey, ''); return ''; }
+
+  const start = KNOWLEDGE_BASE.indexOf(startMarker);
+  if (start === -1) { _kbCache.set(sectionKey, ''); return ''; }
+
+  const idx = keys.indexOf(sectionKey);
+  let end = KNOWLEDGE_BASE.length;
+  for (let i = idx + 1; i < keys.length; i++) {
+    const nextStart = KNOWLEDGE_BASE.indexOf(KB_SECTION_MARKERS[keys[i]], start + startMarker.length);
+    if (nextStart !== -1) { end = nextStart; break; }
+  }
+
+  const result = KNOWLEDGE_BASE.slice(start, end).trim();
+  _kbCache.set(sectionKey, result);
+  return result;
+}
+
 function getRelevantKnowledge(session, userMessage) {
-  const msg = (userMessage + ' ' + (session.leadData.targetCountry || '')).toLowerCase();
+  const combined = (userMessage + ' ' + (session.leadData.targetCountry || '') + ' ' + (session.leadData.currentCountry || '')).toLowerCase();
 
-  const sections = [];
-  if (msg.match(/usa|america|united states?|wyoming|delaware|florida|nevada|llc|c-corp|ein|form 5472/))
-    sections.push('USA');
-  if (msg.match(/fema|odi|rbi|apr|fla return|form oi|uin|lrs|compounding|ad bank/))
-    sections.push('FEMA');
-  if (msg.match(/canada|ontario|british columbia|cra|gst.*canada|sr&ed/))
-    sections.push('CANADA');
-  if (msg.match(/uk|united kingdom|britain|england|companies house|hmrc|vat.*uk/))
-    sections.push('UK');
-  if (msg.match(/singapore|acra|pte.*ltd|iras|cpf|mas/))
-    sections.push('SINGAPORE');
-  if (msg.match(/uae|dubai|abu dhabi|free zone|mainland.*uae|dmcc|difc|emara/))
-    sections.push('UAE');
-  if (msg.match(/philippines|peza|bir|sec.*phil|boi.*phil/))
-    sections.push('PHILIPPINES');
-  if (msg.match(/thailand|boi.*thai|fba|dbd|thai baht/))
-    sections.push('THAILAND');
-  if (msg.match(/estonia|e-residency|o[uü]|e-resident/))
-    sections.push('ESTONIA');
-  if (msg.match(/italy|srl|ires|irap|registro/))
-    sections.push('ITALY');
-  if (msg.match(/vietnam|vnd|hanoi|ho chi minh/))
-    sections.push('VIETNAM');
-  if (msg.match(/indonesia|pt pma|kbli|bkpm|oss/))
-    sections.push('INDONESIA');
+  const sections = new Set();
 
-  if (sections.length === 0) {
+  if (/usa|america|united states?|wyoming|delaware|florida|nevada|new mexico|south dakota|llc|c-corp|ein|form 5472|irs|boi|fincen/.test(combined))
+    sections.add('USA');
+  if (/fema|odi|rbi|apr\b|fla return|form oi|uin\b|lrs\b|compounding|ad bank|overseas invest/.test(combined))
+    sections.add('FEMA');
+  if (/canada|ontario|british columbia|cra\b|sr&ed|toronto|vancouver|gst.*canada/.test(combined))
+    sections.add('CANADA');
+  if (/\buk\b|united kingdom|britain|england|companies house|hmrc|vat.*uk|london/.test(combined))
+    sections.add('UK');
+  if (/singapore|acra|pte.*ltd|iras|cpf\b|mas\b/.test(combined))
+    sections.add('SINGAPORE');
+  if (/\buae\b|dubai|abu dhabi|free zone|mainland.*uae|dmcc|difc|emara|jafza/.test(combined))
+    sections.add('UAE');
+  if (/philippines|peza|bir\b|sec.*phil|boi.*phil|manila|cebu/.test(combined))
+    sections.add('PHILIPPINES');
+  if (/thailand|boi.*thai|fba\b|dbd\b|thai baht|bangkok/.test(combined))
+    sections.add('THAILAND');
+  if (/estonia|e-residency|e-resident|\bou\b/.test(combined))
+    sections.add('ESTONIA');
+  if (/\bitaly\b|italian|srl\b|ires\b|irap\b|registro|milan/.test(combined))
+    sections.add('ITALY');
+  if (/vietnam|vnd\b|hanoi|ho chi minh|saigon/.test(combined))
+    sections.add('VIETNAM');
+  if (/indonesia|pt pma|kbli|bkpm|oss-rba|jakarta|batam/.test(combined))
+    sections.add('INDONESIA');
+
+  if (sections.size === 0) {
     return `
-COMPLY GLOBALLY — QUICK REFERENCE:
-- 47+ jurisdictions: USA, Canada, UK, Singapore, UAE, Philippines, Thailand, Estonia, Italy, Vietnam, Indonesia, and more
-- Services: Company formation, Banking, Tax compliance, FEMA/ODI, EXIM, Investment Advisory, Residency/Golden Visas
-- For Indian founders: FEMA ODI compliance is mandatory before any overseas investment
-- USA top picks: Wyoming LLC ($62/yr) for most; Delaware C-Corp only for VC fundraising
-- UK: incorporate in 24 hrs, £50, no resident director needed, no withholding tax on dividends
+COMPLY GLOBALLY — QUICK REFERENCE (47+ jurisdictions):
+- USA: Wyoming LLC ($62/yr) for most founders; Delaware C-Corp only for VC fundraising
+- UK: incorporate in 24 hrs, £50, no resident director needed, 0% WHT on dividends
 - Singapore: 17% CIT, no capital gains tax, needs 1 local resident director
 - UAE: 0% personal tax, mainland vs free zone is the key decision, 9% CIT above AED 375K
 - Canada: 15% federal CIT, 25% of directors must be Canadian residents
+- Estonia: 0% CIT on retained profits (pay only on distribution), 100% online via e-Residency
+- Philippines, Thailand, Indonesia, Vietnam: strong manufacturing & BPO incentives
+- India: FEMA ODI compliance is mandatory before any overseas investment
+- Services: Company formation, Banking, Tax compliance, FEMA/ODI, EXIM, Residency/Golden Visas
 - Contact: sales@complyglobally.com | +1 (302) 214-1717 | +91 99999 81613
 `;
   }
 
-  const relevantParts = [];
-  for (const s of sections) {
-    const part = extractKBSection(s);
-    if (part) relevantParts.push(part);
-  }
-  return relevantParts.join('\n\n');
-}
-
-function extractKBSection(sectionKey) {
-  // Map section keys to their start markers inside KNOWLEDGE_BASE
-  const startMarkers = {
-    USA:         'KNOWLEDGE BASE — USA',
-    FEMA:        'KNOWLEDGE BASE — FEMA ODI',
-    CANADA:      'KNOWLEDGE BASE — CANADA',
-    UK:          'KNOWLEDGE BASE — UNITED KINGDOM',
-    SINGAPORE:   'KNOWLEDGE BASE — SINGAPORE',
-    UAE:         'KNOWLEDGE BASE — UAE',
-    PHILIPPINES: 'KNOWLEDGE BASE — PHILIPPINES',
-    THAILAND:    'KNOWLEDGE BASE — THAILAND',
-    ESTONIA:     'KNOWLEDGE BASE — ESTONIA',
-    ITALY:       'KNOWLEDGE BASE — ITALY',
-    VIETNAM:     'KNOWLEDGE BASE — VIETNAM',
-    INDONESIA:   'KNOWLEDGE BASE — INDONESIA',
-  };
-
-  const sectionKeys = Object.keys(startMarkers);
-  const startMarker = startMarkers[sectionKey];
-  if (!startMarker) return '';
-
-  const start = KNOWLEDGE_BASE.indexOf(startMarker);
-  if (start === -1) return '';
-
-  // Find end: the next section's start marker
-  const idx = sectionKeys.indexOf(sectionKey);
-  let end = KNOWLEDGE_BASE.length;
-  for (let i = idx + 1; i < sectionKeys.length; i++) {
-    const nextStart = KNOWLEDGE_BASE.indexOf(startMarkers[sectionKeys[i]], start + startMarker.length);
-    if (nextStart !== -1) { end = nextStart; break; }
-  }
-
-  return KNOWLEDGE_BASE.slice(start, end).trim();
+  return Array.from(sections).map(s => extractKBSection(s)).filter(Boolean).join('\n\n');
 }
 
 // ─────────────────────────────────────────────
 // SESSION MANAGEMENT
 // ─────────────────────────────────────────────
+
+/**
+ * CONVERSATION STATE FLAGS:
+ *
+ *   NORMAL          humanMode=false, pendingHumanHandoff=false
+ *   HANDOFF_EXTRA   pendingHumanHandoff=true, awaitingHandoffExtraInfo=true
+ *                   Bot asked "anything to add?" — waiting for user reply.
+ *   HUMAN_MODE      humanMode=true
+ *                   Bot is silent; human handles conversation in Interakt.
+ */
 function freshSession(phone) {
   return {
     phone,
-    history: [],           // Full conversation history (trimmed to last 20 turns in memory)
+    history:                    [],
     leadData: {
       name:           null,
       email:          null,
@@ -2460,32 +2545,34 @@ function freshSession(phone) {
       timeline:       null,
       additionalInfo: null,
     },
-    leadCollected:             false,
-    humanMode:                 false,
-    humanModeAt:               null,
-    // Handoff flow flags
-    pendingHumanHandoff:       false,
-    awaitingHandoffExtraInfo:  false,
-    // "Additional info" ask (only after explicit handoff sequence — see architecture notes)
-    handoffExtraInfoAsked:     false,
-    createdAt:                 new Date(),
-    lastActive:                new Date(),
+    leadCollected:               false,
+    humanMode:                   false,
+    humanModeAt:                 null,
+    pendingHumanHandoff:         false,
+    awaitingHandoffExtraInfo:    false,
+    handoffEmailSent:            false,   // ← prevents duplicate escalation emails
+    createdAt:                   new Date(),
+    lastActive:                  new Date(),
   };
 }
 
 async function getSession(phone) {
+  // 1. Check in-memory cache first
+  const cached = cacheGet(phone);
+  if (cached) return cached;
+
   if (!sessionsCol) return freshSession(phone);
 
   let session = await sessionsCol.findOne({ phone });
   if (!session) {
     session = freshSession(phone);
     await sessionsCol.insertOne(session);
-    console.log(`🆕 New session: ${phone}`);
+    console.log(`🆕  New session: ${phone}`);
+    cacheSet(phone, session);
     return session;
   }
 
-  // ── Migration: add any fields missing from older session documents ──
-  let dirty = false;
+  // Migration: ensure all new fields exist on older documents
   const defaults = {
     email:                    null,
     companyName:              null,
@@ -2493,125 +2580,125 @@ async function getSession(phone) {
     humanModeAt:              null,
     pendingHumanHandoff:      false,
     awaitingHandoffExtraInfo: false,
-    handoffExtraInfoAsked:    false,
+    handoffEmailSent:         false,
   };
+  let dirty = false;
   for (const [key, val] of Object.entries(defaults)) {
     if (session[key] === undefined) { session[key] = val; dirty = true; }
-    // Migrate old leadData fields
-    if (session.leadData && session.leadData[key] === undefined && ['email','companyName'].includes(key)) {
-      session.leadData[key] = val; dirty = true;
-    }
   }
-  // Remove the old field name if present (migration from askedAdditionalInfo)
-  if (session.askedAdditionalInfo !== undefined) {
-    delete session.askedAdditionalInfo;
-    dirty = true;
+  if (session.leadData) {
+    ['email','companyName'].forEach(k => {
+      if (session.leadData[k] === undefined) { session.leadData[k] = null; dirty = true; }
+    });
   }
+  // Remove legacy field names
+  ['askedAdditionalInfo','handoffExtraInfoAsked'].forEach(old => {
+    if (session[old] !== undefined) { delete session[old]; dirty = true; }
+  });
+
   if (dirty) {
     await sessionsCol.replaceOne({ phone }, session, { upsert: true });
-    console.log(`🔧 Session migrated: ${phone}`);
+    console.log(`🔧  Session migrated: ${phone}`);
   }
 
   console.log(
-    `📂 Loaded session: ${phone} | name=${session.leadData?.name} | ` +
+    `📂  Session loaded: ${phone} | name=${session.leadData?.name} | ` +
     `current=${session.leadData?.currentCountry} | target=${session.leadData?.targetCountry} | ` +
     `humanMode=${session.humanMode} | pendingHandoff=${session.pendingHumanHandoff}`
   );
+
+  cacheSet(phone, session);
   return session;
 }
 
 async function saveSession(session) {
-  if (!sessionsCol) return;
   session.lastActive = new Date();
-  await sessionsCol.replaceOne({ phone: session.phone }, session, { upsert: true });
+  cacheSet(session.phone, session);
+  if (!sessionsCol) return;
+  // Use fire-and-forget to avoid blocking the response path
+  sessionsCol.replaceOne({ phone: session.phone }, session, { upsert: true }).catch(err => {
+    console.error('❌  Session save error:', err.message);
+  });
 }
 
 async function saveLead(leadData) {
   if (!leadsCol) return;
-  leadData.source    = leadData.source    || 'whatsapp';
+  leadData.source    = 'whatsapp';
   leadData.updatedAt = new Date();
-  await leadsCol.replaceOne({ phone: leadData.phone }, leadData, { upsert: true });
+  leadsCol.replaceOne({ phone: leadData.phone }, leadData, { upsert: true }).catch(err => {
+    console.error('❌  Lead save error:', err.message);
+  });
 }
 
 // ─────────────────────────────────────────────
-// SYSTEM PROMPT  ← professional, no slang
+// SYSTEM PROMPT BUILDER
 // ─────────────────────────────────────────────
 const BASE_SYSTEM_PROMPT = `You are Compliance Advisor, a senior Global Expansion Advisor at Comply Globally.
 
 CORE IDENTITY:
-You are a knowledgeable, professional, and precise business advisor — not a casual chatbot.
-Comply Globally helps Indian and international businesses incorporate, manage compliance, banking,
-tax obligations, FEMA/ODI requirements, and residency/visa matters across 47+ countries.
+You help Indian and international businesses incorporate, manage compliance, banking, tax obligations,
+FEMA/ODI requirements, and residency/visa matters across 47+ countries.
+You are knowledgeable, professional, precise — not a casual chatbot.
 
 TONE & COMMUNICATION:
-- Always professional, polished, and consultative
-- Warm but formal — like a trusted senior advisor, not a friend
-- Never use slang, casual phrases, excessive emoji, or informal greetings such as "Hey!" or "Sure thing!"
-- Acceptable openers: "Certainly," "Of course," "Thank you for reaching out," "I'd be happy to assist."
-- Use bullet points or numbered lists ONLY when presenting options or structured information
-- Keep responses concise: 3–5 sentences for factual replies; structured lists when comparing options
+- Professional, polished, consultative. Warm but formal — like a trusted senior advisor.
+- Never use slang, emoji, or informal openers like "Hey!" or "Sure thing!"
+- Acceptable openers: "Certainly," "Of course," "Thank you for reaching out," "I would be happy to assist."
+- Use bullet points ONLY when presenting multiple options or structured comparisons.
+- Keep responses concise: 3–5 sentences for factual replies; structured lists only when comparing.
 
 ACCURACY & HONESTY:
 - ONLY answer from the knowledge base provided. Do NOT invent or extrapolate facts.
-- If you are uncertain or the knowledge base does not cover the specific question, say:
+- If uncertain or the KB does not cover the specific question, say:
   "I would like to connect you with one of our senior advisors who can provide accurate guidance on this."
 - Do not guess fees, timelines, or legal requirements.
 
-HUMAN ESCALATION RULE:
-If the user asks for a human, agent, expert, senior advisor, or if you cannot answer accurately:
-  1. Acknowledge their request professionally
-  2. Say you will connect them with a senior advisor
-  3. The system will then ask for any additional context they wish to share
-DO NOT say "Any other details you'd like to share?" on your own — the system handles that step.
+HUMAN ESCALATION:
+If the user asks for a human, agent, expert, senior advisor, or you cannot answer accurately:
+- The system handles escalation automatically. Do NOT generate handoff messages yourself.
 
 LEAD CAPTURE (natural, not interrogative):
-Weave these questions naturally into the conversation when not already known:
-  - Name (ask once, politely, at the start or early in conversation)
-  - Country they are based in
-  - Country / jurisdiction they want to expand to
-  - Type of service they need
-  - Stage of their business
-  - Timeline
-Never repeat questions for information already provided.
+- Weave these questions naturally: name, country based in, country expanding to, service needed, business stage, timeline.
+- NEVER ask for information already provided in [CUSTOMER PROFILE].
+- Ask at most ONE clarifying question per reply.
 
 RESPONSE FORMAT:
-- End most substantive replies with SUGGEST_TOPICS:[...] listing up to 4 follow-up topics
-- Do NOT include SUGGEST_TOPICS when asking for personal information
-- Do NOT include SUGGEST_TOPICS during handoff sequences
+- End substantive replies with SUGGEST_TOPICS:[...] listing up to 4 follow-up topics as a JSON array.
+  Example: SUGGEST_TOPICS:["Banking setup for my LLC","FEMA ODI reporting","Wyoming vs Delaware","Cost comparison"]
+- Do NOT include SUGGEST_TOPICS when asking for personal info or during handoff sequences.
 
 KNOWLEDGE BASE:
 `;
 
 function buildSystemPrompt(session, userMessage) {
   const relevantKB = getRelevantKnowledge(session, userMessage);
+  const lead       = session.leadData;
 
-  const lead = session.leadData;
-  const known = [];
-  if (lead.name)           known.push(`Name: ${lead.name}`);
-  if (lead.email)          known.push(`Email: ${lead.email}`);
-  if (lead.companyName)    known.push(`Company: ${lead.companyName}`);
-  if (lead.currentCountry) known.push(`Based in: ${lead.currentCountry}`);
-  if (lead.targetCountry)  known.push(`Target jurisdiction: ${lead.targetCountry}`);
-  if (lead.serviceNeeded)  known.push(`Service requested: ${lead.serviceNeeded}`);
-  if (lead.businessStage)  known.push(`Business stage: ${lead.businessStage}`);
-  if (lead.timeline)       known.push(`Timeline: ${lead.timeline}`);
-  if (lead.additionalInfo) known.push(`Additional context: ${lead.additionalInfo}`);
+  const knownFields = [];
+  if (lead.name)           knownFields.push(`Name: ${lead.name}`);
+  if (lead.email)          knownFields.push(`Email: ${lead.email}`);
+  if (lead.companyName)    knownFields.push(`Company: ${lead.companyName}`);
+  if (lead.currentCountry) knownFields.push(`Based in: ${lead.currentCountry}`);
+  if (lead.targetCountry)  knownFields.push(`Target jurisdiction: ${lead.targetCountry}`);
+  if (lead.serviceNeeded)  knownFields.push(`Service requested: ${lead.serviceNeeded}`);
+  if (lead.businessStage)  knownFields.push(`Business stage: ${lead.businessStage}`);
+  if (lead.timeline)       knownFields.push(`Timeline: ${lead.timeline}`);
+  if (lead.additionalInfo) knownFields.push(`Additional context: ${lead.additionalInfo}`);
 
-  let contextBlock = BASE_SYSTEM_PROMPT + relevantKB;
+  let systemPrompt = BASE_SYSTEM_PROMPT + relevantKB;
 
-  if (known.length > 0) {
-    const isReturning = session.history.length > 2;
-    contextBlock += `\n\n[CUSTOMER PROFILE — already known, do NOT ask again:\n${known.join('\n')}]`;
-    if (isReturning && lead.name) {
-      contextBlock += `\n[RETURNING CUSTOMER: address ${lead.name} by name where natural.]`;
+  if (knownFields.length > 0) {
+    systemPrompt += `\n\n[CUSTOMER PROFILE — already known, do NOT ask again:\n${knownFields.join('\n')}]`;
+    if (session.history.length > 2 && lead.name) {
+      systemPrompt += `\n[RETURNING CUSTOMER: address ${lead.name} by name where natural.]`;
     }
   }
 
   if (session.leadCollected) {
-    contextBlock += '\n[LEAD SUBMITTED: Our team will contact this customer. Reassure them and offer to answer any further questions.]';
+    systemPrompt += '\n[LEAD SUBMITTED: Our team will contact this customer. Reassure them and offer to answer further questions.]';
   }
 
-  return contextBlock;
+  return systemPrompt;
 }
 
 // ─────────────────────────────────────────────
@@ -2622,6 +2709,10 @@ const HUMAN_TRIGGERS = [
   'call me','speak with','talk with','connect me','senior','manager',
   'expert','representative','live person','actual person','not a bot',
   'talk to a person','speak to a person','need a person','need human',
+  'customer support','support team','your team','contact team',
+  'connect call','connect an agent','connect agent','connect advisor',
+  'talk to advisor','speak advisor','speak to advisor',
+  'connect to a human','want a human','prefer human',
 ];
 
 function wantsHuman(msg) {
@@ -2630,7 +2721,7 @@ function wantsHuman(msg) {
 }
 
 // ─────────────────────────────────────────────
-// SUGGEST TOPICS FORMATTING
+// SUGGEST TOPICS HELPERS
 // ─────────────────────────────────────────────
 function stripSuggestTopics(text) {
   return text.replace(/SUGGEST_TOPICS:\[.*?\]/gs, '').trim();
@@ -2642,22 +2733,22 @@ function formatForWhatsApp(text) {
   if (!match) return cleanText;
 
   try {
-    const topics  = JSON.parse('[' + match[1] + ']');
+    const topics   = JSON.parse('[' + match[1] + ']');
     const numbered = topics.map((t, i) => `${i + 1}️⃣ ${t}`).join('\n');
-    return `${cleanText}\n\n*Quick replies:*\n${numbered}`;
+    return `${cleanText}\n\n*Quick topics:*\n${numbered}`;
   } catch {
     return cleanText;
   }
 }
 
 // ─────────────────────────────────────────────
-// CLAUDE API CALL
+// CLAUDE API
 // ─────────────────────────────────────────────
 async function getClaudeReply(session, userMessage) {
-  // Append user message to history
+  // Append user turn to history
   session.history.push({ role: 'user', content: userMessage });
 
-  // Keep only last 20 turns in the API call to control token usage
+  // Keep last 20 turns for context window efficiency
   const trimmedHistory = session.history.slice(-20);
 
   const systemPrompt = buildSystemPrompt(session, userMessage);
@@ -2666,8 +2757,8 @@ async function getClaudeReply(session, userMessage) {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
+        'Content-Type':      'application/json',
+        'x-api-key':         ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
@@ -2680,8 +2771,8 @@ async function getClaudeReply(session, userMessage) {
 
     const data = await response.json();
     if (!response.ok) {
-      console.error('❌ Claude API error:', data);
-      return "I apologise for the inconvenience. Please try again in a moment, or contact us at sales@complyglobally.com.";
+      console.error('❌  Claude API error:', data);
+      return 'I apologise for the inconvenience. Please try again in a moment, or contact us at sales@complyglobally.com.';
     }
 
     const reply = (data.content || [])
@@ -2690,12 +2781,12 @@ async function getClaudeReply(session, userMessage) {
       .join('\n')
       .trim();
 
-    if (!reply) return "I was unable to retrieve a response. Please try again or contact our team directly.";
+    if (!reply) return 'I was unable to retrieve a response. Please try again or contact our team directly.';
 
-    // Append assistant reply to history
-    session.history.push({ role: 'assistant', content: reply });
+    // Append assistant turn (strip SUGGEST_TOPICS from stored version to keep DB clean)
+    session.history.push({ role: 'assistant', content: stripSuggestTopics(reply) });
 
-    // Trim stored history to last 30 turns to prevent document bloat in MongoDB
+    // Trim stored history to last 30 turns to keep MongoDB document small
     if (session.history.length > 30) {
       session.history = session.history.slice(-30);
     }
@@ -2703,8 +2794,8 @@ async function getClaudeReply(session, userMessage) {
     return reply;
 
   } catch (err) {
-    console.error('❌ Claude request failed:', err.message);
-    return "I am experiencing a connectivity issue. Please try again shortly, or reach us at sales@complyglobally.com.";
+    console.error('❌  Claude request failed:', err.message);
+    return 'I am experiencing a connectivity issue. Please try again shortly, or reach us at sales@complyglobally.com.';
   }
 }
 
@@ -2713,8 +2804,8 @@ async function generateSummary(history) {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
+        'Content-Type':      'application/json',
+        'x-api-key':         ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
@@ -2722,7 +2813,7 @@ async function generateSummary(history) {
         max_tokens: 200,
         messages: [{
           role:    'user',
-          content: `Summarise this WhatsApp conversation in 2–3 professional sentences, focusing on what the customer needs:\n\n${
+          content: `Summarise this WhatsApp conversation in 2–3 professional sentences, focusing on what the customer needs and their situation:\n\n${
             history.slice(-10).map(m => `${m.role === 'user' ? 'Customer' : 'Advisor'}: ${m.content}`).join('\n')
           }`,
         }],
@@ -2736,42 +2827,29 @@ async function generateSummary(history) {
 }
 
 // ─────────────────────────────────────────────
-// LEAD COMPLETION
-// ─────────────────────────────────────────────
-function isLeadCoreComplete(lead) {
-  return !!(lead.name && lead.currentCountry && lead.targetCountry && lead.serviceNeeded);
-}
-
-async function finalizeLead(session) {
-  session.leadCollected = true;
-  console.log(`🎯 Lead finalised for ${session.phone}`);
-  const summary = await generateSummary(session.history);
-  try {
-    await appendToSheet(session.leadData, summary);
-    await saveLead({ ...session.leadData, source: 'whatsapp', summary, completedAt: new Date() });
-    await sendLeadCapturedEmail(session.leadData);
-  } catch (err) {
-    console.error('❌ Lead finalisation error:', err.message);
-  }
-}
-
-// ─────────────────────────────────────────────
 // WHATSAPP SENDER
 // ─────────────────────────────────────────────
 function parsePhone(rawPhone) {
-  if (/^91[6-9]\d{9}$/.test(rawPhone))  return { countryCode: '+91',  phoneNumber: rawPhone.slice(2) };
-  if (/^1[2-9]\d{9}$/.test(rawPhone))   return { countryCode: '+1',   phoneNumber: rawPhone.slice(1) };
-  if (/^971[0-9]{9}$/.test(rawPhone))   return { countryCode: '+971', phoneNumber: rawPhone.slice(3) };
-  if (/^[6-9]\d{9}$/.test(rawPhone))    return { countryCode: '+91',  phoneNumber: rawPhone };
-  if (/^[2-9]\d{9}$/.test(rawPhone))    return { countryCode: '+1',   phoneNumber: rawPhone };
-  console.warn(`⚠️ Unknown phone format: ${rawPhone}`);
-  return { countryCode: '+91', phoneNumber: rawPhone };
+  const digits = String(rawPhone).replace(/\D/g, '');
+  if (/^91[6-9]\d{9}$/.test(digits))  return { countryCode: '+91',  phoneNumber: digits.slice(2) };
+  if (/^1[2-9]\d{9}$/.test(digits))   return { countryCode: '+1',   phoneNumber: digits.slice(1) };
+  if (/^971\d{9}$/.test(digits))       return { countryCode: '+971', phoneNumber: digits.slice(3) };
+  if (/^44[1-9]\d{8,9}$/.test(digits)) return { countryCode: '+44',  phoneNumber: digits.slice(2) };
+  if (/^65\d{8}$/.test(digits))        return { countryCode: '+65',  phoneNumber: digits.slice(2) };
+  if (/^[6-9]\d{9}$/.test(digits))    return { countryCode: '+91',  phoneNumber: digits };
+  if (/^[2-9]\d{9}$/.test(digits))    return { countryCode: '+1',   phoneNumber: digits };
+  console.warn(`⚠️  Unknown phone format: ${rawPhone}`);
+  return { countryCode: '+91', phoneNumber: digits };
 }
 
 async function sendWhatsAppMessage(phone, text) {
   const cleanText = formatForWhatsApp(text);
-  console.log('📤 Sending to', phone, ':', cleanText.substring(0, 100));
-  if (!INTERAKT_API_KEY) { console.warn('⚠️ INTERAKT_API_KEY not set — message not sent'); return; }
+  console.log(`📤  Sending to ${phone}: ${cleanText.substring(0, 120)}…`);
+
+  if (!INTERAKT_API_KEY) {
+    console.warn('⚠️  INTERAKT_API_KEY not set — message NOT sent');
+    return;
+  }
 
   const { countryCode, phoneNumber } = parsePhone(phone);
 
@@ -2786,18 +2864,40 @@ async function sendWhatsAppMessage(phone, text) {
         countryCode,
         phoneNumber,
         callbackData: 'bot_reply',
-        type: 'Text',
-        data: { message: cleanText },
+        type:          'Text',
+        data:          { message: cleanText },
       }),
     });
     if (!res.ok) {
       const errBody = await res.text();
-      console.error('❌ Interakt error:', res.status, errBody);
+      console.error(`❌  Interakt error: ${res.status}`, errBody);
     } else {
-      console.log('✅ Message sent');
+      console.log('✅  WhatsApp message sent');
     }
   } catch (err) {
-    console.error('❌ Interakt send error:', err.message);
+    console.error('❌  Interakt send error:', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// LEAD COMPLETION
+// ─────────────────────────────────────────────
+function isLeadCoreComplete(lead) {
+  return !!(lead.name && lead.currentCountry && lead.targetCountry && lead.serviceNeeded);
+}
+
+async function finalizeLead(session) {
+  session.leadCollected = true;
+  console.log(`🎯  Lead finalised for ${session.phone}`);
+  const summary = await generateSummary(session.history);
+  try {
+    await Promise.allSettled([
+      appendToSheet(session.leadData, summary),
+      saveLead({ ...session.leadData, summary, completedAt: new Date() }),
+      sendLeadCapturedEmail(session.leadData),
+    ]);
+  } catch (err) {
+    console.error('❌  Lead finalisation error:', err.message);
   }
 }
 
@@ -2806,7 +2906,7 @@ async function sendWhatsAppMessage(phone, text) {
 // ─────────────────────────────────────────────
 async function appendToSheet(leadData, conversationSummary) {
   if (!GOOGLE_SHEET_ID || !GOOGLE_CREDENTIALS) {
-    console.warn('⚠️ Skipping Sheets — missing credentials');
+    console.warn('⚠️  Skipping Sheets — missing credentials');
     return;
   }
   try {
@@ -2817,6 +2917,12 @@ async function appendToSheet(leadData, conversationSummary) {
     });
     const sheets = google.sheets({ version: 'v4', auth });
     const now    = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+
+    const HEADERS = [
+      'Timestamp','Name','Email','Company','Phone',
+      'Current Country','Target Country','Service Needed',
+      'Business Stage','Timeline','Additional Info','Conversation Summary',
+    ];
 
     const row = [
       now,
@@ -2833,35 +2939,29 @@ async function appendToSheet(leadData, conversationSummary) {
       conversationSummary     || '',
     ];
 
-    // Write header row only if sheet is empty
+    // Only add header if sheet is empty
     const existing = await sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
       range: 'Sheet1!A1:A1',
     });
     if (!existing.data.values) {
       await sheets.spreadsheets.values.append({
-        spreadsheetId: GOOGLE_SHEET_ID,
-        range: 'Sheet1!A1',
+        spreadsheetId:   GOOGLE_SHEET_ID,
+        range:           'Sheet1!A1',
         valueInputOption: 'RAW',
-        requestBody: {
-          values: [[
-            'Timestamp','Name','Email','Company','Phone',
-            'Current Country','Target Country','Service Needed',
-            'Business Stage','Timeline','Additional Info','Conversation Summary',
-          ]],
-        },
+        requestBody:     { values: [HEADERS] },
       });
     }
 
     await sheets.spreadsheets.values.append({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'Sheet1!A1',
+      spreadsheetId:   GOOGLE_SHEET_ID,
+      range:           'Sheet1!A1',
       valueInputOption: 'RAW',
-      requestBody: { values: [row] },
+      requestBody:     { values: [row] },
     });
-    console.log('✅ Lead appended to Google Sheet');
+    console.log('✅  Lead appended to Google Sheet');
   } catch (err) {
-    console.error('❌ Google Sheets error:', err.message);
+    console.error('❌  Google Sheets error:', err.message);
   }
 }
 
@@ -2870,7 +2970,7 @@ async function appendToSheet(leadData, conversationSummary) {
 // ─────────────────────────────────────────────
 async function sendEmail({ subject, html }) {
   if (!RESEND_API_KEY || !NOTIFY_EMAIL) {
-    console.warn('⚠️ Email skipped — missing RESEND_API_KEY or NOTIFY_EMAIL');
+    console.warn('⚠️  Email skipped — missing RESEND_API_KEY or NOTIFY_EMAIL');
     return { success: false };
   }
   try {
@@ -2887,29 +2987,27 @@ async function sendEmail({ subject, html }) {
         html,
       }),
     });
-    const responseJson = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      console.error('❌ Resend error:', res.status, responseJson);
-      return { success: false };
-    }
-    console.log('✅ Email sent:', responseJson.id || 'ok');
-    return { success: true, id: responseJson.id };
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) { console.error('❌  Resend error:', res.status, json); return { success: false }; }
+    console.log('✅  Email sent:', json.id || 'ok');
+    return { success: true, id: json.id };
   } catch (err) {
-    console.error('❌ Email error:', err.message);
+    console.error('❌  Email error:', err.message);
     return { success: false };
   }
 }
 
 async function sendHumanHandoffEmail(phone, leadData, history) {
+  // Guard: don't send duplicate emails
   const chatPreview = history.slice(-8)
     .map(m => `${m.role === 'user' ? '👤 Customer' : '🤖 Advisor'}: ${m.content}`)
     .join('\n\n');
 
-  const resumeUrl   = `${BASE_URL}/resume-bot/${phone}`;
-  const timeoutHrs  = Math.round(HUMAN_TIMEOUT_MS / 3600000);
+  const resumeUrl  = `${BASE_URL}/resume-bot/${phone}`;
+  const timeoutHrs = Math.round(HUMAN_TIMEOUT_MS / 3600000);
 
   await sendEmail({
-    subject: `🚨 Human Handoff Requested — ${leadData.name || phone}`,
+    subject: `🚨 Human Handoff — ${leadData.name || phone}`,
     html: `
       <div style="font-family:sans-serif;max-width:620px;margin:0 auto">
         <div style="background:#1a1a2e;color:white;padding:20px;border-radius:8px 8px 0 0">
@@ -2917,20 +3015,26 @@ async function sendHumanHandoffEmail(phone, leadData, history) {
         </div>
         <div style="background:#f9f9f9;padding:20px;border:1px solid #eee">
           <div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin-bottom:16px">
-            ⏱️ <b>Bot is paused.</b> It will auto-resume after <b>${timeoutHrs} hours</b> if no action is taken.
+            ⏱️ <b>Bot is paused.</b> Auto-resumes after <b>${timeoutHrs} hours</b> of inactivity.
           </div>
           <h3>Customer Profile</h3>
           <table style="width:100%;border-collapse:collapse">
-            <tr><td style="padding:6px;color:#666;width:160px">Name</td><td style="padding:6px"><b>${leadData.name || '—'}</b></td></tr>
-            <tr><td style="padding:6px;color:#666">Email</td><td style="padding:6px">${leadData.email || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Company</td><td style="padding:6px">${leadData.companyName || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Phone</td><td style="padding:6px"><b>+${phone}</b></td></tr>
-            <tr><td style="padding:6px;color:#666">Based In</td><td style="padding:6px">${leadData.currentCountry || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Target Jurisdiction</td><td style="padding:6px">${leadData.targetCountry || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Service Needed</td><td style="padding:6px">${leadData.serviceNeeded || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Business Stage</td><td style="padding:6px">${leadData.businessStage || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Timeline</td><td style="padding:6px">${leadData.timeline || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Additional Info</td><td style="padding:6px">${leadData.additionalInfo || '—'}</td></tr>
+            ${[
+              ['Name',               leadData.name           || '—'],
+              ['Email',              leadData.email          || '—'],
+              ['Company',            leadData.companyName    || '—'],
+              ['Phone',              `+${phone}`],
+              ['Based In',           leadData.currentCountry || '—'],
+              ['Target Jurisdiction',leadData.targetCountry  || '—'],
+              ['Service Needed',     leadData.serviceNeeded  || '—'],
+              ['Business Stage',     leadData.businessStage  || '—'],
+              ['Timeline',           leadData.timeline       || '—'],
+              ['Additional Info',    leadData.additionalInfo || '—'],
+            ].map(([label, val]) => `
+              <tr>
+                <td style="padding:6px;color:#666;width:170px">${label}</td>
+                <td style="padding:6px"><b>${val}</b></td>
+              </tr>`).join('')}
           </table>
           <h3>Recent Conversation</h3>
           <pre style="background:#fff;border:1px solid #ddd;padding:12px;border-radius:4px;white-space:pre-wrap;font-size:13px">${chatPreview}</pre>
@@ -2938,10 +3042,9 @@ async function sendHumanHandoffEmail(phone, leadData, history) {
             <a href="https://app.interakt.ai" style="display:inline-block;background:#1a1a2e;color:white;padding:10px 20px;border-radius:6px;text-decoration:none">Open Interakt →</a>
             <a href="${resumeUrl}" style="display:inline-block;background:#166534;color:white;padding:10px 20px;border-radius:6px;text-decoration:none">✅ Resume Bot for +${phone}</a>
           </div>
-          <p style="color:#aaa;font-size:11px;margin-top:16px">Bot auto-resumes after ${timeoutHrs}h regardless.</p>
+          <p style="color:#aaa;font-size:11px;margin-top:16px">Bot auto-resumes after ${timeoutHrs}h.</p>
         </div>
-      </div>
-    `,
+      </div>`,
   });
 }
 
@@ -2955,47 +3058,66 @@ async function sendLeadCapturedEmail(leadData) {
         </div>
         <div style="background:#f9f9f9;padding:20px;border:1px solid #eee">
           <table style="width:100%;border-collapse:collapse">
-            <tr><td style="padding:6px;color:#666;width:160px">Name</td><td style="padding:6px"><b>${leadData.name || '—'}</b></td></tr>
-            <tr><td style="padding:6px;color:#666">Email</td><td style="padding:6px">${leadData.email || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Company</td><td style="padding:6px">${leadData.companyName || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Phone</td><td style="padding:6px"><b>+${leadData.phone}</b></td></tr>
-            <tr><td style="padding:6px;color:#666">Based In</td><td style="padding:6px">${leadData.currentCountry || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Target Jurisdiction</td><td style="padding:6px">${leadData.targetCountry || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Service Needed</td><td style="padding:6px">${leadData.serviceNeeded || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Business Stage</td><td style="padding:6px">${leadData.businessStage || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Timeline</td><td style="padding:6px">${leadData.timeline || '—'}</td></tr>
-            <tr><td style="padding:6px;color:#666">Additional Info</td><td style="padding:6px">${leadData.additionalInfo || '—'}</td></tr>
+            ${[
+              ['Name',               leadData.name           || '—'],
+              ['Email',              leadData.email          || '—'],
+              ['Company',            leadData.companyName    || '—'],
+              ['Phone',              `+${leadData.phone}`],
+              ['Based In',           leadData.currentCountry || '—'],
+              ['Target Jurisdiction',leadData.targetCountry  || '—'],
+              ['Service Needed',     leadData.serviceNeeded  || '—'],
+              ['Business Stage',     leadData.businessStage  || '—'],
+              ['Timeline',           leadData.timeline       || '—'],
+              ['Additional Info',    leadData.additionalInfo || '—'],
+            ].map(([label, val]) => `
+              <tr>
+                <td style="padding:6px;color:#666;width:170px">${label}</td>
+                <td style="padding:6px"><b>${val}</b></td>
+              </tr>`).join('')}
           </table>
         </div>
-      </div>
-    `,
+      </div>`,
   });
+}
+
+// ─────────────────────────────────────────────
+// UTILITY HELPERS
+// ─────────────────────────────────────────────
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function lastAssistantMessage(session) {
+  for (let i = session.history.length - 1; i >= 0; i--) {
+    if (session.history[i].role === 'assistant') return session.history[i].content;
+  }
+  return '';
 }
 
 // ─────────────────────────────────────────────
 // WEBHOOK — MAIN BOT LOGIC
 // ─────────────────────────────────────────────
 /**
- * CONVERSATION STATE MACHINE
- * ─────────────────────────────────────────────
- * States (mutually exclusive via flags):
+ * FIXED HANDOFF FLOW (compared to original):
  *
- *  NORMAL          — humanMode=false, pendingHumanHandoff=false
- *                    Regular Q&A; lead data captured passively.
+ * OLD (BROKEN):
+ *   User says "connect agent"
+ *   → Bot says "I will connect you right away" (extra message)
+ *   → Bot asks "anything to add?"
+ *   → User replies "nope"
+ *   → Bot says "Thank you, Probably." (WRONG NAME)
  *
- *  HANDOFF_ASKED   — pendingHumanHandoff=true, awaitingHandoffExtraInfo=false
- *                    Bot has said it will connect to a human;
- *                    system now asks for any additional context.
+ * NEW (CORRECT):
+ *   User says "connect agent"
+ *   → Bot IMMEDIATELY asks "Before I connect you, anything to add? Reply No if not."
+ *   → User replies (any response)
+ *   → Bot says "Thank you [name]. An advisor will be in touch shortly."
+ *   → Email sent. Bot enters human mode. DONE.
  *
- *  HANDOFF_EXTRA   — pendingHumanHandoff=true, awaitingHandoffExtraInfo=true
- *                    Waiting for user's response to "anything to add?"
- *
- *  HUMAN_MODE      — humanMode=true
- *                    Bot is silent; human agent is in control via Interakt.
- *                    Auto-resets after HUMAN_TIMEOUT_MS.
+ * This removes the extra round-trip and eliminates the name-from-context bug.
  */
 app.post('/webhook', async (req, res) => {
-  // Acknowledge Interakt immediately to prevent retries
+  // Acknowledge Interakt immediately to prevent webhook retries
   res.sendStatus(200);
 
   try {
@@ -3003,22 +3125,23 @@ app.post('/webhook', async (req, res) => {
     if (body.type !== 'message_received') return;
 
     const phone  = (body.data?.customer?.phone_number || '').replace(/\D/g, '');
-    const rawMsg = (body.data?.message?.message || '').trim();
+    const rawMsg = (body.data?.message?.message       || '').trim();
     if (!phone || !rawMsg) return;
 
-    console.log(`📩 [${phone}] "${rawMsg}"`);
+    console.log(`\n📩  [${phone}] "${rawMsg}"`);
 
-    // ── Detect truly new user before getSession creates the record ──────────
+    // ── Detect truly new user before session creation ──────────────────────
     const isNewUser = sessionsCol ? !(await sessionsCol.findOne({ phone })) : false;
     const session   = await getSession(phone);
 
-    // ── NEW USER: send greeting, do NOT process message yet ─────────────────
+    // ══════════════════════════════════════════════════════
+    // NEW USER — send greeting, store nothing yet
+    // ══════════════════════════════════════════════════════
     if (isNewUser) {
-      const greeting = `Thank you for reaching out to *Comply Globally* — your trusted partner for global business expansion.
-
-We assist businesses across 47+ jurisdictions with company incorporation, banking, tax compliance, FEMA/ODI advisory, and residency solutions.
-
-To get started, may I know your name and which country you are looking to expand into?`;
+      const greeting =
+        `Thank you for reaching out to *Comply Globally* — your trusted partner for global business expansion.\n\n` +
+        `We assist businesses across 47+ jurisdictions with company incorporation, banking, tax compliance, FEMA/ODI advisory, and residency solutions.\n\n` +
+        `To get started, may I know your name and which country you are looking to expand into?`;
 
       await sendWhatsAppMessage(phone, greeting);
       session.history.push({ role: 'assistant', content: greeting });
@@ -3026,43 +3149,47 @@ To get started, may I know your name and which country you are looking to expand
       return;
     }
 
-    // ── AUTO-RESUME from human mode if timeout elapsed ───────────────────────
+    // ══════════════════════════════════════════════════════
+    // AUTO-RESUME from human mode if timeout elapsed
+    // ══════════════════════════════════════════════════════
     if (session.humanMode) {
       const elapsed = Date.now() - new Date(session.humanModeAt || 0).getTime();
       if (elapsed >= HUMAN_TIMEOUT_MS) {
-        console.log(`⏰ Auto-resuming bot for ${phone}`);
-        session.humanMode    = false;
-        session.humanModeAt  = null;
+        console.log(`⏰  Auto-resuming bot for ${phone}`);
+        session.humanMode            = false;
+        session.humanModeAt          = null;
+        session.handoffEmailSent     = false; // allow fresh handoff email next time
         await saveSession(session);
         // Fall through to normal processing
       } else {
-        console.log(`🧑 Human mode active for ${phone} — message ignored`);
+        console.log(`🧑  Human mode active for ${phone} — message suppressed`);
         return;
       }
     }
 
-    // ════════════════════════════════════════════════════════
-    // STATE: HANDOFF_EXTRA — waiting for additional context
-    // ════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════
+    // STATE: HANDOFF_EXTRA — waiting for user's "anything to add?" reply
+    // ══════════════════════════════════════════════════════
     if (session.pendingHumanHandoff && session.awaitingHandoffExtraInfo) {
-      console.log(`📝 Handoff extra info received from ${phone}`);
+      console.log(`📝  Handoff extra-info received from ${phone}: "${rawMsg}"`);
 
-      // Store whatever the user said as additionalInfo
-      const isNegative = /^(no|nope|nothing|nah|none|not really|that'?s?\s+all|nothing\s+else)$/i.test(rawMsg);
+      // Store additional info (but not if it's a negative reply)
+      const isNegative = /^(no|nope|nothing|nah|none|not really|that'?s?\s+all|nothing\s+else|nil|n\/a)$/i.test(rawMsg.trim());
       session.leadData.additionalInfo = isNegative ? 'None provided' : rawMsg;
 
-      // Also run extraction in case they mentioned country/service etc.
+      // Still run extraction in case user mentioned country/service etc.
       extractLeadData(session, rawMsg);
 
-      // Confirm to user
-      const confirmMsg = `Thank you${session.leadData.name ? ', ' + session.leadData.name : ''}. One of our senior advisors will be in touch with you shortly.
-
-In the meantime, you are welcome to reach us at:
-📧 sales@complyglobally.com
-📞 +1 (302) 214-1717 | +91 99999 81613`;
+      // Confirm handoff to user
+      const nameGreeting = session.leadData.name ? `, ${session.leadData.name}` : '';
+      const confirmMsg =
+        `Thank you${nameGreeting}. One of our senior advisors will be in touch with you shortly.\n\n` +
+        `In the meantime, you are welcome to reach us at:\n` +
+        `📧 sales@complyglobally.com\n` +
+        `📞 +1 (302) 214-1717 | +91 99999 81613`;
 
       await sendWhatsAppMessage(phone, confirmMsg);
-      session.history.push({ role: 'user', content: rawMsg });
+      session.history.push({ role: 'user',      content: rawMsg });
       session.history.push({ role: 'assistant', content: confirmMsg });
 
       // Transition to HUMAN_MODE
@@ -3071,156 +3198,166 @@ In the meantime, you are welcome to reach us at:
       session.pendingHumanHandoff      = false;
       session.awaitingHandoffExtraInfo = false;
 
-      // Finalise lead if not already done
+      // Finalise lead if not done yet
       if (!session.leadCollected) {
         await finalizeLead(session);
       }
 
-      // Send handoff email to team
-      await sendHumanHandoffEmail(phone, session.leadData, session.history);
+      // Send handoff email (guard against duplicates)
+      if (!session.handoffEmailSent) {
+        session.handoffEmailSent = true;
+        await sendHumanHandoffEmail(phone, session.leadData, session.history);
+      }
 
       await saveSession(session);
       return;
     }
 
-    // ════════════════════════════════════════════════════════
-    // STATE: HANDOFF_ASKED — bot mentioned handoff; ask for extra info
-    // ════════════════════════════════════════════════════════
-    if (session.pendingHumanHandoff && !session.awaitingHandoffExtraInfo) {
-      console.log(`📋 Asking for handoff extra info from ${phone}`);
-      const extraAsk = `Before I connect you with our team, is there any specific information or query you would like to pass on to the advisor? (You may reply "No" if not.)`;
+    // ══════════════════════════════════════════════════════
+    // HUMAN TRIGGER — FIXED FLOW:
+    // Immediately ask "anything to add?" without a prior confirmation message.
+    // ══════════════════════════════════════════════════════
+    if (!session.pendingHumanHandoff && wantsHuman(rawMsg)) {
+      console.log(`🙋  Human requested by ${phone}`);
+
+      // Log user's message to history
+      session.history.push({ role: 'user', content: rawMsg });
+
+      // STEP 1: Immediately ask for extra context (no intermediate confirmation message)
+      const extraAsk =
+        `Before I connect you with our senior advisory team, is there any specific information or query you would like to pass on to the advisor?\n\n` +
+        `(You may simply reply *"No"* if not.)`;
+
       await sendWhatsAppMessage(phone, extraAsk);
       session.history.push({ role: 'assistant', content: extraAsk });
-      session.awaitingHandoffExtraInfo = true;
-      await saveSession(session);
-      return;
-    }
 
-    // ════════════════════════════════════════════════════════
-    // STATE: NORMAL — check for human trigger first
-    // ════════════════════════════════════════════════════════
-    if (wantsHuman(rawMsg)) {
-      console.log(`🙋 Human requested by ${phone}`);
-
-      // Acknowledge the request professionally
-      const ackMsg = `Certainly. I will connect you with one of our senior advisors right away.`;
-      await sendWhatsAppMessage(phone, ackMsg);
-      session.history.push({ role: 'user',      content: rawMsg });
-      session.history.push({ role: 'assistant', content: ackMsg });
-
-      // Set state to HANDOFF_ASKED; next webhook turn will ask for extra info
+      // Set state: waiting for user's reply
       session.pendingHumanHandoff      = true;
-      session.awaitingHandoffExtraInfo = false;
+      session.awaitingHandoffExtraInfo = true;
 
       await saveSession(session);
       return;
     }
 
-    // ════════════════════════════════════════════════════════
-    // STATE: NORMAL — regular Q&A flow
-    // ════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════
+    // NORMAL Q&A FLOW
+    // ══════════════════════════════════════════════════════
 
-    // 1. Extract lead data from this message (safe extraction)
+    // 1. Extract lead data safely
     extractLeadData(session, rawMsg);
 
-    // 2. Get Claude's reply
+    // 2. Get Claude reply
     const reply = await getClaudeReply(session, rawMsg);
 
     // 3. Send reply
     await sendWhatsAppMessage(phone, reply);
 
-    // 4. Finalise lead once core fields are captured
+    // 4. Finalise lead silently once core fields are known
     if (!session.leadCollected && isLeadCoreComplete(session.leadData)) {
       await finalizeLead(session);
-      // Note: we do NOT send the "our team will reach out" message here in
-      // normal flow — the bot continues answering questions. Lead is
-      // silently recorded. Handoff only happens if user requests it or
-      // cannot be answered.
     }
 
     await saveSession(session);
 
   } catch (err) {
-    console.error('❌ Webhook error:', err.message, err.stack);
+    console.error('❌  Webhook error:', err.message, err.stack);
   }
 });
 
 // ─────────────────────────────────────────────
 // CONTROL ENDPOINTS
 // ─────────────────────────────────────────────
-app.get('/resume-bot/:phone', async (req, res) => {
-  const phone   = req.params.phone.replace(/\D/g, '');
+
+/** Resume bot for a phone number after human handoff — called from email button */
+async function resumeBot(phone, res) {
   const session = await getSession(phone);
-  session.humanMode              = false;
-  session.humanModeAt            = null;
-  session.pendingHumanHandoff    = false;
+  session.humanMode                = false;
+  session.humanModeAt              = null;
+  session.pendingHumanHandoff      = false;
   session.awaitingHandoffExtraInfo = false;
+  session.handoffEmailSent         = false;
   await saveSession(session);
-  await sendWhatsAppMessage(phone, "Welcome back. The Comply Globally advisor is here — how may I assist you?");
-  res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px"><h2 style="color:#166534">✅ Bot resumed for +${phone}</h2></body></html>`);
+  await sendWhatsAppMessage(phone, 'Welcome back. Your Comply Globally advisor is here — how may I assist you further?');
+  if (res) res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px"><h2 style="color:#166534">✅ Bot resumed for +${phone}</h2><p>The customer will receive a WhatsApp message.</p></body></html>`);
+}
+
+app.get('/resume-bot/:phone', async (req, res) => {
+  await resumeBot(req.params.phone.replace(/\D/g, ''), res);
 });
 
 app.post('/resume-bot/:phone', async (req, res) => {
-  const phone   = req.params.phone.replace(/\D/g, '');
-  const session = await getSession(phone);
-  session.humanMode              = false;
-  session.humanModeAt            = null;
-  session.pendingHumanHandoff    = false;
-  session.awaitingHandoffExtraInfo = false;
-  await saveSession(session);
-  await sendWhatsAppMessage(phone, "Welcome back. The Comply Globally advisor is here — how may I assist you?");
+  await resumeBot(req.params.phone.replace(/\D/g, ''), null);
   res.json({ success: true });
 });
 
-// Admin: view all leads
+/** Admin: view all leads (most recent first) */
 app.get('/leads', async (req, res) => {
   if (!leadsCol) return res.json([]);
   const leads = await leadsCol.find({}).sort({ completedAt: -1 }).limit(100).toArray();
   res.json(leads);
 });
 
-// Admin: view all sessions (summary only)
+/** Admin: view session summaries */
 app.get('/sessions', async (req, res) => {
   if (!sessionsCol) return res.json([]);
   const sessions = await sessionsCol
-    .find({}, { projection: { phone: 1, 'leadData.name': 1, 'leadData.targetCountry': 1, humanMode: 1, leadCollected: 1, lastActive: 1 } })
+    .find({}, {
+      projection: {
+        phone: 1,
+        'leadData.name': 1,
+        'leadData.targetCountry': 1,
+        'leadData.serviceNeeded': 1,
+        humanMode: 1,
+        leadCollected: 1,
+        lastActive: 1,
+      },
+    })
     .sort({ lastActive: -1 })
     .limit(100)
     .toArray();
   res.json(sessions);
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
-app.get('/',       (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+/** Health check */
+app.get('/health', (req, res) => res.json({
+  status:  'ok',
+  uptime:  process.uptime(),
+  memory:  process.memoryUsage(),
+  cacheSize: sessionCache.size,
+}));
+
+/** Serve frontend */
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 // ─────────────────────────────────────────────
 // KEEP-ALIVE (prevents Render free-tier sleep)
 // ─────────────────────────────────────────────
 function startKeepAlive() {
   const url = process.env.KEEP_ALIVE_URL || `${BASE_URL}/health`;
-  console.log(`💓 Keep-alive pinging ${url} every 14 min`);
+  console.log(`💓  Keep-alive pinging ${url} every 14 min`);
   setInterval(async () => {
     try {
-      await fetch(url);
-      console.log('💓 Keep-alive OK');
+      const res = await fetch(url);
+      console.log(`💓  Keep-alive: ${res.status}`);
     } catch (err) {
-      console.error('💔 Keep-alive failed:', err.message);
+      console.error('💔  Keep-alive failed:', err.message);
     }
   }, 14 * 60 * 1000);
 }
 
 // ─────────────────────────────────────────────
-// START
+// START SERVER
 // ─────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🔥 Server running on port ${PORT}`);
-    console.log(`📡 POST /webhook        — WhatsApp message receiver`);
-    console.log(`📊 GET  /leads          — view captured leads`);
-    console.log(`🔧 GET  /sessions       — view active sessions`);
-    console.log(`✅ GET  /resume-bot/:phone — resume bot after human handoff\n`);
+    console.log(`\n🚀  Server running on port ${PORT}`);
+    console.log(`📡  POST /webhook          — WhatsApp message receiver`);
+    console.log(`📊  GET  /leads            — view captured leads`);
+    console.log(`🔧  GET  /sessions         — view active sessions`);
+    console.log(`✅  GET  /resume-bot/:phone — resume bot after human handoff`);
+    console.log(`❤️   GET  /health           — health check\n`);
     startKeepAlive();
   });
 });
