@@ -1,3 +1,35 @@
+'use strict';
+
+/**
+ * ============================================================
+ *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
+ *  Production-Grade | Optimized | Fully Preserved Logic
+ * ============================================================
+ *
+ *  KNOWLEDGE BASE INSERTION POINT:
+ *  Search for the comment:
+ *    // ════════ KNOWLEDGE BASE — PASTE YOUR FULL KB STRING HERE ════════
+ *  Replace the KNOWLEDGE_BASE constant below with your full knowledge base string.
+ *
+ *  ENVIRONMENT VARIABLES REQUIRED (set in .env or Render/Railway dashboard):
+ *    INTERAKT_API_KEY     — Interakt WhatsApp API key
+ *    ANTHROPIC_API_KEY    — Claude API key
+ *    MONGODB_URI          — MongoDB connection string
+ *    GOOGLE_SHEET_ID      — Google Sheet ID for lead logging
+ *    GOOGLE_CREDENTIALS   — Stringified Google service-account JSON
+ *    RESEND_API_KEY       — Resend email API key
+ *    NOTIFY_EMAIL         — Email address to send notifications to
+ *    FROM_EMAIL           — Sender email (Resend verified domain)
+ *    BASE_URL             — Your deployed server URL (e.g. https://complybot.onrender.com)
+ *    HUMAN_TIMEOUT_MS     — ms before bot auto-resumes after human handoff (default 7200000 = 2h)
+ *    PORT                 — Server port (default 5000)
+ *    KEEP_ALIVE_URL       — URL to ping every 14 min (optional; defaults to BASE_URL/health)
+ * ============================================================
+ */
+
+// ─────────────────────────────────────────────
+// DEPENDENCIES
+// ─────────────────────────────────────────────
 const express    = require('express');
 const path       = require('path');
 const fetch      = require('node-fetch');
@@ -2159,6 +2191,19 @@ const NAME_BLACKLIST = new Set([
   'are','is','was','were','be','been','being','do','does','did','get','got',
   // Negatives used in handoff flow
   'nope','nah','none','nothing','nomore','notreally','thatsall','nothinelse',
+  // Adverbs / qualifiers that appear after "I am/I'm" but are NOT names
+  'probably','possibly','currently','actually','basically','honestly','technically',
+  'essentially','generally','normally','usually','typically','definitely','certainly',
+  'simply','really','truly','quite','rather','almost','nearly','already','still',
+  'also','just','only','even','always','never','often','sometimes','here','there',
+  'looking','trying','planning','thinking','considering','interested','hoping',
+  'ready','happy','glad','excited','confused','unsure','wondering','aware',
+  'running','managing','starting','building','growing','expanding','setting',
+  'working','doing','going','coming','reaching','writing','calling','speaking',
+  // Business/context words that follow "I am" naturally
+  'founder','ceo','director','owner','partner','manager','consultant','entrepreneur',
+  'based','located','registered','incorporated','established','operational',
+  'not','new','old','young','senior','junior','indian','foreign','local','global',
 ]);
 
 /**
@@ -2184,27 +2229,34 @@ function looksLikeNameToken(word) {
  * Returns capitalised first name or null.
  */
 function extractNameFromIntroduction(message) {
+  // NOTE ON DESIGN: patterns are ordered most-reliable → least-reliable.
+  // "I am/I'm" is intentionally the STRICTEST pattern:
+  //   it only matches when the name token appears at the very end of the
+  //   message (or before punctuation), preventing false positives like
+  //   "I am probably...", "I am currently...", "I am looking to expand..."
   const patterns = [
-    // "my name is Rahul", "my name's Rahul Sharma"
-    /(?:my\s+name(?:\s+is|'s)?)\s+([A-Za-z][A-Za-z\s\-']{1,40}?)(?:\s*[,\.!?]|$)/i,
-    // "I am Rahul", "I'm Rahul"
-    /\b(?:i\s+am|i'm)\s+([A-Za-z][A-Za-z\s\-']{1,40}?)(?:\s+(?:from|based|calling|reaching|writing|here|and|with)\b|[,\.!?]|$)/i,
-    // "this is Rahul"
-    /\bthis\s+is\s+([A-Za-z][A-Za-z\s\-']{1,40}?)(?:\s*[,\.!?]|$)/i,
-    // "call me Rahul"
-    /\bcall\s+me\s+([A-Za-z][A-Za-z\s\-']{1,30}?)(?:\s*[,\.!?]|$)/i,
-    // "Rahul here" / "Rahul this side"
+    // "my name is Udhay" / "my name's Udhay Sharma" — most reliable
+    /(?:my\s+name(?:\s+is|'s)?)\s+([A-Za-z][A-Za-z\-']{1,30})/i,
+    // "myself Udhay" — common in Indian English
+    /\bmyself\s+([A-Za-z][A-Za-z\-']{1,30})(?:\s*[,\.!?]|\s+(?:from|and|here|calling)|$)/i,
+    // "this is Udhay" — reliable intro
+    /\bthis\s+is\s+([A-Za-z][A-Za-z\-']{1,30})(?:\s*[,\.!?]|$|\s+(?:here|from|calling|speaking))/i,
+    // "call me Udhay" — explicit
+    /\bcall\s+me\s+([A-Za-z][A-Za-z\-']{1,30})(?:\s*[,\.!?]|$)/i,
+    // "it's Udhay" / "it is Udhay" — common WhatsApp intro
+    /\bit(?:'s|\s+is)\s+([A-Za-z][A-Za-z\-']{1,30})(?:\s*[,\.!?]|$|\s+(?:here|from|calling|speaking))/i,
+    // "Udhay here" / "Udhay this side" — must be at START of message
     /^([A-Za-z]{2,25})\s+(?:here|this\s+side)\b/i,
-    // "it's Rahul"
-    /\bit(?:'s|\s+is)\s+([A-Za-z][A-Za-z\s\-']{1,30}?)(?:\s*[,\.!?]|$)/i,
+    // "I am Udhay" / "I'm Udhay" — STRICT: name must be at end of message
+    // Rejects: "I am probably...", "I am currently...", "I am looking..."
+    /\b(?:i\s+am|i'm)\s+([A-Za-z][A-Za-z\-']{1,30})\s*[,\.!?]?\s*$/i,
   ];
 
   for (const pattern of patterns) {
     const match = message.match(pattern);
     if (match) {
-      // Take only the first word to avoid "Rahul Sharma CEO India" misparse
-      const firstToken = match[1].trim().split(/\s+/)[0];
-      const clean = capitalise(firstToken);
+      const candidate = match[1].trim().split(/\s+/)[0]; // first word only
+      const clean = capitalise(candidate);
       if (looksLikeNameToken(clean)) return clean;
     }
   }
