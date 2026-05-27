@@ -2078,7 +2078,14 @@ CONTACT & PRICING
 - Pricing: "Our team will send a custom quote based on your jurisdiction and requirements"
 - Specific legal opinions or complex tax structuring: "Our experts will guide you on the specifics"
 `;
+// ════════════════════════════════════════════════════════════════════════════
+// ════════ END KNOWLEDGE BASE INSERTION POINT ════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
 
+// ─────────────────────────────────────────────
+// QUICK-REPLY TOPIC BANKS
+// These are the numbered options appended to every Claude response.
+// Keys match country/topic slugs. Claude picks the right bank based on context.
 // ─────────────────────────────────────────────
 const QUICK_REPLY_BANKS = {
   uae: [
@@ -2409,14 +2416,15 @@ async function saveSession(session) {
 function freshActiveState(phone) {
   return {
     phone,
-    currentFlow:       'ONBOARDING',
-    conversationStage: 'GREETING',
-    retryCount:        0,
-    humanModeActive:   false,
-    humanModeSince:    null,
-    handoffPending:    false,
-    lastInteractionAt: new Date(),
-    messageCount:      0,
+    currentFlow:        'ONBOARDING',
+    conversationStage:  'GREETING',
+    retryCount:         0,
+    humanModeActive:    false,
+    humanModeSince:     null,
+    handoffPending:     false,
+    handoffStage:       null,   // null | 'ASKED_ADDL_INFO'
+    lastInteractionAt:  new Date(),
+    messageCount:       0,
   };
 }
 
@@ -2677,16 +2685,138 @@ function wantsHuman(msg) {
   return ['human','agent','person','representative','speak to','talk to','connect me','call'].some(t => msg.toLowerCase().includes(t));
 }
 
-async function sendHandoffEmail(phone, leadData, history) {
+async function sendHandoffEmail(phone, leadData, history, additionalInfo) {
   if (!RESEND_API_KEY || !NOTIFY_EMAIL) return;
-  const chatSummary = history.slice(-6).map(m => `${m.role === 'user' ? '👤' : '🤖'}: ${m.content}`).join('\n\n');
+
+  const displayPhone = phone.startsWith('91') ? `+${phone}` : `+${phone}`;
+  const val = (v) => v || '<span style="color:#999">—</span>';
+
+  // Last 8 turns of conversation, nicely formatted
+  const chatRows = history.slice(-8).map(m => {
+    const isBot = m.role === 'assistant';
+    // Strip internal system tags from display
+    const content = m.content
+      .replace(/\[MENU SELECTION:.*?\]/g, '')
+      .replace(/\[CUSTOMER PROFILE.*?\]/gs, '')
+      .replace(/GREETING_RECEIVED/g, '(opened chat)')
+      .trim();
+    return `
+      <tr>
+        <td style="padding:10px 14px;border-bottom:1px solid #f0f0f0;vertical-align:top;width:32px">
+          <span style="font-size:18px">${isBot ? '🤖' : '👤'}</span>
+        </td>
+        <td style="padding:10px 14px;border-bottom:1px solid #f0f0f0;font-size:13px;color:#333;line-height:1.6">
+          <strong style="color:${isBot ? '#6C47FF' : '#1a1a1a'}">${isBot ? 'Advisor' : 'Customer'}:</strong><br>
+          ${content.replace(/\n/g, '<br>')}
+        </td>
+      </tr>`;
+  }).join('');
+
+  const resumeUrl = `${BASE_URL}/admin/resume?phone=${phone}`;
+
+  const html = `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f6f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+  <div style="max-width:640px;margin:32px auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08)">
+
+    <!-- Header -->
+    <div style="background:linear-gradient(135deg,#6C47FF 0%,#4f35c2 100%);padding:28px 32px;text-align:center">
+      <div style="font-size:32px;margin-bottom:8px">🌍</div>
+      <h1 style="margin:0;color:#fff;font-size:20px;font-weight:700">Comply Globally — Human Handoff Alert</h1>
+      <p style="margin:8px 0 0;color:rgba(255,255,255,0.8);font-size:13px">
+        ⏱️ Bot is paused. It will auto-resume after 2 hours if no action is taken.
+      </p>
+    </div>
+
+    <!-- Customer Profile -->
+    <div style="padding:28px 32px">
+      <h2 style="margin:0 0 16px;font-size:15px;font-weight:700;color:#1a1a1a;text-transform:uppercase;letter-spacing:0.5px">
+        Customer Profile
+      </h2>
+      <table style="width:100%;border-collapse:collapse;border:1px solid #e8e8e8;border-radius:8px;overflow:hidden">
+        <tr style="background:#fafafa">
+          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;width:38%;border-bottom:1px solid #e8e8e8">Name</td>
+          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.name)}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Email</td>
+          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.email)}</td>
+        </tr>
+        <tr style="background:#fafafa">
+          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Company</td>
+          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.companyName)}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Phone</td>
+          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${displayPhone}</td>
+        </tr>
+        <tr style="background:#fafafa">
+          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Based In</td>
+          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.currentCountry)}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Target Jurisdiction</td>
+          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.targetCountry)}</td>
+        </tr>
+        <tr style="background:#fafafa">
+          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Service Needed</td>
+          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.serviceNeeded)}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Business Stage</td>
+          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.businessStage)}</td>
+        </tr>
+        <tr style="background:#fafafa">
+          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Timeline</td>
+          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.timeline)}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555">Additional Info</td>
+          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a">${additionalInfo || '<span style="color:#999">None provided</span>'}</td>
+        </tr>
+      </table>
+    </div>
+
+    <!-- Recent Conversation -->
+    <div style="padding:0 32px 28px">
+      <h2 style="margin:0 0 16px;font-size:15px;font-weight:700;color:#1a1a1a;text-transform:uppercase;letter-spacing:0.5px">
+        Recent Conversation
+      </h2>
+      <table style="width:100%;border-collapse:collapse;border:1px solid #e8e8e8;border-radius:8px;overflow:hidden">
+        ${chatRows}
+      </table>
+    </div>
+
+    <!-- Action Buttons -->
+    <div style="padding:0 32px 32px;display:flex;gap:12px">
+      <a href="https://app.interakt.ai" style="display:inline-block;background:#25D366;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-size:14px;font-weight:600;margin-right:12px">
+        Open Interakt →
+      </a>
+      <a href="${resumeUrl}" style="display:inline-block;background:#6C47FF;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-size:14px;font-weight:600">
+        ✅ Resume Bot for ${displayPhone}
+      </a>
+    </div>
+
+    <!-- Footer -->
+    <div style="background:#f9f9f9;border-top:1px solid #eee;padding:16px 32px;text-align:center">
+      <p style="margin:0;font-size:12px;color:#999">
+        Bot auto-resumes after 2h regardless. · Comply Globally · sales@complyglobally.com
+      </p>
+    </div>
+
+  </div>
+</body>
+</html>`;
+
   await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      from: FROM_EMAIL, to: [NOTIFY_EMAIL],
-      subject: `🚨 Handoff Needed — ${leadData.name || phone}`,
-      html: `<h2>Customer Handoff Request</h2><pre>${chatSummary}</pre>`,
+      from:    FROM_EMAIL,
+      to:      [NOTIFY_EMAIL],
+      subject: `🚨 Human Handoff Requested — ${leadData.name || displayPhone}`,
+      html,
     }),
   });
 }
@@ -2809,25 +2939,59 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // ── HUMAN HANDOFF ─────────────────────────────────────────────
-    if (wantsHuman(rawMsg) && !activeState.handoffPending) {
-      console.log(`🙋  Human requested`);
+    // ── HUMAN HANDOFF — 2-STEP FLOW ──────────────────────────────
+    // Step 1: User asks for human → bot asks for any additional info
+    // Step 2: User replies (or says no) → bot confirms + sends email + pauses
+    //
+    // activeState.handoffStage tracks:
+    //   undefined / null  = not in handoff flow
+    //   'ASKED_ADDL_INFO' = we asked for extra info, waiting for reply
+    // ─────────────────────────────────────────────────────────────
+
+    // Step 2 — user just replied to our "any additional info?" question
+    if (activeState.handoffStage === 'ASKED_ADDL_INFO') {
+      const lower = rawMsg.toLowerCase().trim();
+      const additionalInfo = /^(no|nope|nah|none|skip|nothing|not really)$/i.test(lower)
+        ? null
+        : rawMsg;
+
+      const name = session.leadData.name || 'there';
+      const confirmMsg = `Thank you${name !== 'there' ? `, ${name}` : ''}. One of our senior advisors will be in touch with you shortly. 🤝\n\n` +
+        `In the meantime you can reach us at:\n📧 sales@complyglobally.com\n📞 +1 (302) 214-1717 | +91 99999 81613`;
+
+      session.history.push({ role: 'user', content: rawMsg });
+      session.history.push({ role: 'assistant', content: confirmMsg });
+
+      // Now actually pause the bot and send the email
+      activeState.handoffStage    = null;
       activeState.handoffPending  = true;
       activeState.humanModeActive = true;
       activeState.humanModeSince  = new Date();
 
-      const handoffMsg = `Thank you for reaching out. I'm connecting you with our senior advisory team right now. ✅\n\n` +
-        `In the meantime:\n📧 sales@complyglobally.com\n📞 +1 (302) 214-1717 | +91 99999 81613`;
-
       await Promise.all([
-        sendWhatsApp(phone, handoffMsg),
-        sendHandoffEmail(phone, session.leadData, session.history),
+        sendWhatsApp(phone, confirmMsg),
+        sendHandoffEmail(phone, session.leadData, session.history, additionalInfo),
       ]);
 
-      session.history.push({ role: 'user', content: rawMsg });
-      session.history.push({ role: 'assistant', content: handoffMsg });
       if (!session.leadCollected) await finalizeLead(session);
+      await Promise.all([saveSession(session), saveActiveState(activeState)]);
+      return;
+    }
 
+    // Step 1 — user just requested a human for the first time
+    if (wantsHuman(rawMsg) && !activeState.handoffPending) {
+      console.log(`🙋  Human requested — asking for additional info`);
+      activeState.handoffStage = 'ASKED_ADDL_INFO';
+
+      const name = session.leadData.name || '';
+      const askMsg = `Sure${name ? `, ${name}` : ''}! I'm connecting you with one of our senior advisors right now. 🤝\n\n` +
+        `Before I do — is there any specific detail, question, or context you'd like to pass on to the advisor?\n\n` +
+        `_(Reply with your message, or just say *"No"* to connect right away)_`;
+
+      session.history.push({ role: 'user', content: rawMsg });
+      session.history.push({ role: 'assistant', content: askMsg });
+
+      await sendWhatsApp(phone, askMsg);
       await Promise.all([saveSession(session), saveActiveState(activeState)]);
       return;
     }
@@ -2916,6 +3080,30 @@ app.get('/admin/sessions', async (req, res) => {
   res.json(sessions);
 });
 
+// Resume bot manually — linked from the handoff email button
+app.get('/admin/resume', async (req, res) => {
+  const phone = (req.query.phone || '').replace(/\D/g, '');
+  if (!phone) return res.status(400).send('Missing phone parameter');
+
+  try {
+    const activeState = await getActiveState(phone);
+    activeState.humanModeActive = false;
+    activeState.humanModeSince  = null;
+    activeState.handoffPending  = false;
+    activeState.handoffStage    = null;
+    await saveActiveState(activeState);
+
+    console.log(`✅  Bot manually resumed for ${phone}`);
+    res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:60px">
+      <h2>✅ Bot resumed for +${phone}</h2>
+      <p>The bot will now respond to messages from this customer again.</p>
+    </body></html>`);
+  } catch (err) {
+    console.error('Resume error:', err);
+    res.status(500).send('Error resuming bot: ' + err.message);
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -2943,6 +3131,7 @@ connectMongo().then(() => {
     console.log(`📡  POST /webhook`);
     console.log(`📊  GET  /admin/leads`);
     console.log(`📊  GET  /admin/sessions`);
+    console.log(`🔁  GET  /admin/resume?phone=XXXX`);
     console.log(`❤️   GET  /health\n`);
   });
 });
