@@ -2488,7 +2488,7 @@ async function getClaudeReply(session, activeState, userMessage) {
     return reply;
   } catch (err) {
     console.error('❌  Claude request failed:', err.message);
-    return 'I'm experiencing a connectivity issue. Please try again shortly.';
+    return "I'm experiencing a connectivity issue. Please try again shortly."
   }
 }
 
