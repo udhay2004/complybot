@@ -2538,14 +2538,12 @@ function interpretUserInput(msg, menuState) {
 // ─────────────────────────────────────────────
 // SYSTEM PROMPT BUILDER
 // ─────────────────────────────────────────────
-const BASE_SYSTEM_PROMPT = `You are a world-class conversational AI advisor for Comply Globally.
+const BASE_SYSTEM_PROMPT = `You are the Compliance Advisor for Comply Globally — a professional business expansion consultancy.
 
-PERSONALITY:
-- Professional yet warm and approachable
-- Expert in global business expansion (47+ jurisdictions)
-- Deep knowledge of company incorporation, banking, tax, FEMA/ODI, residency
-- Never robotic; always contextual and adaptive
-- Conversational, natural tone for WhatsApp
+YOUR IDENTITY:
+- You are a *Compliance Advisor*, not an "AI" or "chatbot" — never describe or introduce yourself that way
+- You represent the Comply Globally expert team
+- Warm, professional, knowledgeable — like talking to a senior consultant on WhatsApp
 
 RESPONSE RULES:
 - Keep answers under 250 words (brevity = speed)
@@ -2554,7 +2552,8 @@ RESPONSE RULES:
 - Use "we"/"our team" where appropriate
 - ⛔ ABSOLUTELY FORBIDDEN: do NOT write "Quick topics:", "Quick reply:", or any numbered option/menu list
 - ⛔ ABSOLUTELY FORBIDDEN: do NOT end your message with 1️⃣ 2️⃣ 3️⃣ 4️⃣ or any emoji-numbered list
-- The system appends quick-reply options automatically AFTER your response — if you add them too, the user sees them TWICE which is broken
+- ⛔ ABSOLUTELY FORBIDDEN: do NOT introduce yourself as an AI, bot, language model, or assistant
+- The system appends quick-reply options automatically AFTER your response — adding them yourself causes duplicates
 
 LEAD COLLECTION (natural, non-invasive):
 Collect: full name, email, current country, target jurisdiction, service needed, business stage, timeline.
@@ -2858,23 +2857,23 @@ app.post('/webhook', async (req, res) => {
     ]);
 
     // ── NEW USER GREETING ─────────────────────────────────────────
-    // No quick-reply boxes on the opening message — just a clean welcome.
-    // Options appear only after the user shares their name/country.
+    // Hardcoded — does NOT go through Claude, does NOT get a footer.
+    // Quick topics only appear after name + target country are known.
     if (session.history.length === 0) {
-      const greeting = `Welcome to *Comply Globally* — your trusted partner for global business expansion. 🌍\n\n` +
-        `We help Indian businesses set up companies, open bank accounts, handle tax compliance, FEMA/ODI advisory, and residency solutions across 47+ jurisdictions.\n\n` +
-        `To get started, could you share your *full name* and which *country you're looking to expand into*?`;
+      const greeting =
+        `Welcome to *Comply Globally!* 🌍\n\n` +
+        `I'm your *Compliance Advisor* — here to help you expand your business internationally across 47+ jurisdictions.\n\n` +
+        `I can help with company incorporation, banking setup, tax compliance, FEMA/ODI advisory, and residency solutions.\n\n` +
+        `To get started — what's your *name*, and which *country are you looking to expand into*?`;
 
       await sendWhatsApp(phone, greeting);
-      session.history.push({ role: 'user', content: 'GREETING_RECEIVED' });
+      session.history.push({ role: 'user',      content: 'GREETING_RECEIVED' });
       session.history.push({ role: 'assistant', content: greeting });
       activeState.currentFlow       = 'ONBOARDING';
       activeState.conversationStage = 'NAME';
-      // Do NOT set validOptions here — no menu on first message
       menuState.validOptions = [];
       menuState.optionTopics = [];
 
-      // ⚡ Parallel saves
       await Promise.all([saveSession(session), saveActiveState(activeState), saveMenuState(menuState)]);
       return;
     }
@@ -2914,22 +2913,21 @@ app.post('/webhook', async (req, res) => {
       const chosenTopic = menuState.validOptions[num - 1];
       console.log(`✅  Menu selection: ${num} → "${chosenTopic}"`);
 
-      // Build a clear enriched message so Claude knows exactly what was chosen
       const enrichedMsg = `[MENU SELECTION: User chose option ${num} — "${chosenTopic}". Answer this topic thoroughly.]`;
 
       session.history.push({ role: 'user', content: enrichedMsg });
       const sysPrompt = buildSystemPrompt(session, activeState, menuState);
       const rawReply  = await getClaudeReply(sysPrompt, session.history, chosenTopic);
 
-      // Strip any footer Claude generated, then append the system-controlled one
-      const bank        = detectTopicBank(session, chosenTopic);
+      // If user is selecting from a menu they already have name+target (menus only show after that)
+      // so always show topics on menu replies
+      const bank = detectTopicBank(session, chosenTopic);
       const { footer, options } = buildQuickReplyFooter(bank);
-      const finalReply  = stripClaudeGeneratedFooter(rawReply) + footer;
+      const finalReply = stripClaudeGeneratedFooter(rawReply) + footer;
 
       await sendWhatsApp(phone, finalReply);
       session.history.push({ role: 'assistant', content: finalReply });
 
-      // Update menu state with new options
       menuState.validOptions = options;
       menuState.optionTopics = options;
       menuState.menuShownAt  = new Date();
@@ -3044,11 +3042,28 @@ app.post('/webhook', async (req, res) => {
     session.history.push({ role: 'user', content: rawMsg });
     const sysPrompt = buildSystemPrompt(session, activeState, menuState);
     const rawReply  = await getClaudeReply(sysPrompt, session.history, rawMsg);
+    const cleanReply = stripClaudeGeneratedFooter(rawReply);
 
-    // Strip any footer Claude generated, then append the system-controlled one
-    const bank        = detectTopicBank(session, rawMsg);
-    const { footer, options } = buildQuickReplyFooter(bank);
-    const finalReply  = stripClaudeGeneratedFooter(rawReply) + footer;
+    // Quick topics only make sense once we know WHO the user is and WHERE they want to go.
+    // Before that, the options are meaningless — show nothing.
+    const hasName    = !!(session.leadData.name);
+    const hasTarget  = !!(session.leadData.targetCountry || session.leadData.currentCountry);
+    const showTopics = hasName && hasTarget;
+
+    let finalReply;
+    if (showTopics) {
+      const bank = detectTopicBank(session, rawMsg);
+      const { footer, options } = buildQuickReplyFooter(bank);
+      finalReply = cleanReply + footer;
+      menuState.validOptions = options;
+      menuState.optionTopics = options;
+      menuState.menuShownAt  = new Date();
+    } else {
+      // No footer yet — still collecting name / country
+      finalReply = cleanReply;
+      menuState.validOptions = [];
+      menuState.optionTopics = [];
+    }
 
     await sendWhatsApp(phone, finalReply);
     session.history.push({ role: 'assistant', content: finalReply });
