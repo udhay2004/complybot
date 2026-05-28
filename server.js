@@ -3165,7 +3165,52 @@ app.delete('/admin/leads/all', async (req, res) => {
   res.json({ ok: true, deleted: true });
 });
 
-// Clear a bad saved name for a phone number (use when bot saved garbage)
+// ⚠️  NUCLEAR RESET — wipes ALL sessions, leads, menus, active states
+// GET /admin/reset-all?confirm=yes
+app.get('/admin/reset-all', async (req, res) => {
+  if (req.query.confirm !== 'yes') {
+    return res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;max-width:500px">
+      <h2>⚠️ Nuclear Reset</h2>
+      <p>This will delete <strong>every session, lead, menu state, and active state</strong> from MongoDB.</p>
+      <p>All conversations will start fresh. This cannot be undone.</p>
+      <a href="/admin/reset-all?confirm=yes" style="display:inline-block;background:#e53e3e;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600">
+        Yes, wipe everything
+      </a>
+    </body></html>`);
+  }
+
+  try {
+    const results = await Promise.all([
+      sessionsCol    ? sessionsCol.deleteMany({})    : { deletedCount: 0 },
+      leadsCol       ? leadsCol.deleteMany({})       : { deletedCount: 0 },
+      activeStateCol ? activeStateCol.deleteMany({}) : { deletedCount: 0 },
+      menuStateCol   ? menuStateCol.deleteMany({})   : { deletedCount: 0 },
+    ]);
+
+    // Clear all in-memory caches too
+    sessionCache.clear();
+    activeStateCache.clear();
+    menuStateCache.clear();
+    kbChunkCache.clear();
+
+    const [s, l, a, m] = results;
+    console.log(`🗑️  Nuclear reset: sessions=${s.deletedCount} leads=${l.deletedCount} states=${a.deletedCount} menus=${m.deletedCount}`);
+
+    res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;max-width:500px">
+      <h2>✅ Database wiped</h2>
+      <table style="border-collapse:collapse;width:100%">
+        <tr><td style="padding:8px;border-bottom:1px solid #eee">Sessions deleted</td><td style="padding:8px;border-bottom:1px solid #eee"><b>${s.deletedCount}</b></td></tr>
+        <tr><td style="padding:8px;border-bottom:1px solid #eee">Leads deleted</td><td style="padding:8px;border-bottom:1px solid #eee"><b>${l.deletedCount}</b></td></tr>
+        <tr><td style="padding:8px;border-bottom:1px solid #eee">Active states deleted</td><td style="padding:8px;border-bottom:1px solid #eee"><b>${a.deletedCount}</b></td></tr>
+        <tr><td style="padding:8px">Menu states deleted</td><td style="padding:8px"><b>${m.deletedCount}</b></td></tr>
+      </table>
+      <p style="margin-top:20px;color:#666">Every user will now get a fresh greeting on their next message.</p>
+    </body></html>`);
+  } catch (err) {
+    console.error('Reset-all error:', err);
+    res.status(500).send('Error: ' + err.message);
+  }
+});
 // GET /admin/fix-name?phone=918448227988&name=Udhay
 // GET /admin/fix-name?phone=918448227988        (just clears the name)
 app.get('/admin/fix-name', async (req, res) => {
