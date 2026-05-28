@@ -2837,16 +2837,26 @@ async function sendHandoffEmail(phone, leadData, history, additionalInfo) {
 </body>
 </html>`;
 
-  await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      from:    FROM_EMAIL,
-      to:      [NOTIFY_EMAIL],
-      subject: `🚨 Human Handoff Requested — ${leadData.name || displayPhone}`,
-      html,
-    }),
-  });
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from:    FROM_EMAIL,
+        to:      [NOTIFY_EMAIL],
+        subject: `🚨 Human Handoff Requested — ${leadData.name || displayPhone}`,
+        html,
+      }),
+    });
+    const result = await r.json();
+    if (!r.ok) {
+      console.error('❌  Handoff email failed:', JSON.stringify(result));
+    } else {
+      console.log(`✅  Handoff email sent → ${NOTIFY_EMAIL} (id: ${result.id})`);
+    }
+  } catch (err) {
+    console.error('❌  Handoff email error:', err.message);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -2932,7 +2942,8 @@ app.post('/webhook', async (req, res) => {
     console.log(`🧠  Intent: ${intent.type}`);
 
     // ── HANDLE MENU SELECTION ─────────────────────────────────────
-    if (intent.type === 'MENU_SELECT') {
+    // Don't process menu picks during handoff flow
+    if (intent.type === 'MENU_SELECT' && !activeState.handoffStage && !activeState.handoffPending) {
       const num     = intent.menuNumber;
       const maxOpts = menuState.validOptions.length;
 
@@ -2974,34 +2985,34 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ── HUMAN HANDOFF — 2-STEP FLOW ──────────────────────────────
-    // Step 1: User asks for human → bot asks for any additional info
-    // Step 2: User replies (or says no) → bot confirms + sends email + pauses
+    // IMPORTANT: Both steps return early — they NEVER reach the Claude
+    // reply block below. No topics. No Claude. Just clean hardcoded messages.
     //
-    // activeState.handoffStage tracks:
-    //   undefined / null  = not in handoff flow
-    //   'ASKED_ADDL_INFO' = we asked for extra info, waiting for reply
+    // activeState.handoffStage:
+    //   null             = not in handoff
+    //   'ASKED_ADDL_INFO'= asked for extra info, waiting for user reply
     // ─────────────────────────────────────────────────────────────
 
-    // Step 2 — user just replied to our "any additional info?" question
+    // Step 2 — user replied to "any additional info?"
     if (activeState.handoffStage === 'ASKED_ADDL_INFO') {
-      const lower = rawMsg.toLowerCase().trim();
-      const additionalInfo = /^(no|nope|nah|none|skip|nothing|not really)$/i.test(lower)
-        ? null
-        : rawMsg;
+      const isNo = /^(no|nope|nah|none|skip|nothing|not really|just connect|connect me)$/i.test(rawMsg.toLowerCase().trim());
+      const additionalInfo = isNo ? null : rawMsg;
 
-      const name = session.leadData.name || 'there';
-      const confirmMsg = `Thank you${name !== 'there' ? `, ${name}` : ''}. One of our senior advisors will be in touch with you shortly. 🤝\n\n` +
-        `In the meantime you can reach us at:\n📧 sales@complyglobally.com\n📞 +1 (302) 214-1717 | +91 99999 81613`;
+      const name = session.leadData.name ? `, ${session.leadData.name}` : '';
+      // Single clean confirmation — NO topics, NO Claude
+      const confirmMsg = `Got it${name}! Connecting you now. 🤝\n\nOur team will be in touch shortly.\n\n` +
+        `📧 sales@complyglobally.com\n` +
+        `📞 +1 (302) 214-1717  |  +91 99999 81613`;
 
-      session.history.push({ role: 'user', content: rawMsg });
-      session.history.push({ role: 'assistant', content: confirmMsg });
+      session.history.push({ role: 'user',      content: rawMsg      });
+      session.history.push({ role: 'assistant', content: confirmMsg  });
 
-      // Now actually pause the bot and send the email
       activeState.handoffStage    = null;
       activeState.handoffPending  = true;
       activeState.humanModeActive = true;
       activeState.humanModeSince  = new Date();
 
+      // Send confirm + email in parallel
       await Promise.all([
         sendWhatsApp(phone, confirmMsg),
         sendHandoffEmail(phone, session.leadData, session.history, additionalInfo),
@@ -3009,25 +3020,28 @@ app.post('/webhook', async (req, res) => {
 
       if (!session.leadCollected) await finalizeLead(session);
       await Promise.all([saveSession(session), saveActiveState(activeState)]);
-      return;
+      return; // ← hard stop, never reaches Claude or footer logic
     }
 
-    // Step 1 — user just requested a human for the first time
+    // Step 1 — user asks for human for the first time
     if (wantsHuman(rawMsg) && !activeState.handoffPending) {
-      console.log(`🙋  Human requested — asking for additional info`);
+      console.log(`🙋  Human requested`);
       activeState.handoffStage = 'ASKED_ADDL_INFO';
 
-      const name = session.leadData.name || '';
-      const askMsg = `Sure${name ? `, ${name}` : ''}! I'm connecting you with one of our senior advisors right now. 🤝\n\n` +
-        `Before I do — is there any specific detail, question, or context you'd like to pass on to the advisor?\n\n` +
-        `_(Reply with your message, or just say *"No"* to connect right away)_`;
+      const name = session.leadData.name ? `, ${session.leadData.name}` : '';
+      // Single message — ask for extra info, give direct contacts — NO topics
+      const askMsg = `Sure${name}! I'm connecting you with one of our senior advisors right now. 🤝\n\n` +
+        `📧 sales@complyglobally.com\n` +
+        `📞 +1 (302) 214-1717  |  +91 99999 81613\n\n` +
+        `Is there any additional information you'd like to pass on to the advisor?\n` +
+        `_(e.g. team size, urgency, specific questions — or just say *No*)_`;
 
-      session.history.push({ role: 'user', content: rawMsg });
-      session.history.push({ role: 'assistant', content: askMsg });
+      session.history.push({ role: 'user',      content: rawMsg  });
+      session.history.push({ role: 'assistant', content: askMsg  });
 
       await sendWhatsApp(phone, askMsg);
       await Promise.all([saveSession(session), saveActiveState(activeState)]);
-      return;
+      return; // ← hard stop
     }
 
     // ── EXTRACT ENTITIES & UPDATE LEAD ────────────────────────────
@@ -3080,11 +3094,11 @@ app.post('/webhook', async (req, res) => {
     const rawReply  = await getClaudeReply(sysPrompt, session.history, rawMsg);
     const cleanReply = stripClaudeGeneratedFooter(rawReply);
 
-    // Quick topics only make sense once we know WHO the user is and WHERE they want to go.
-    // Before that, the options are meaningless — show nothing.
-    const hasName    = !!(session.leadData.name);
-    const hasTarget  = !!(session.leadData.targetCountry || session.leadData.currentCountry);
-    const showTopics = hasName && hasTarget;
+    // Quick topics only when: name known + country known + NOT in any handoff stage
+    const hasName      = !!(session.leadData.name);
+    const hasTarget    = !!(session.leadData.targetCountry || session.leadData.currentCountry);
+    const inHandoff    = !!(activeState.handoffStage || activeState.handoffPending || activeState.humanModeActive);
+    const showTopics   = hasName && hasTarget && !inHandoff;
 
     let finalReply;
     if (showTopics) {
