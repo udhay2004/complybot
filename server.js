@@ -2172,27 +2172,43 @@ const QUICK_REPLY_BANKS = {
 const EMOJI_NUMS = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣'];
 
 /**
- * Detect which quick-reply bank to use based on conversation context.
- * Checks the last few messages for country/topic keywords.
+ * Detect which quick-reply bank to use.
+ * PRIMARY: leadData.targetCountry (ground truth — set by entity extractor)
+ * FALLBACK: scan only the current user message (not history — avoids stale matches)
  */
 function detectTopicBank(session, userMessage) {
-  const recent = [
-    userMessage,
-    ...(session.history || []).slice(-4).map(m => m.content),
-  ].join(' ').toLowerCase();
+  // Primary — use the known target country from lead data
+  const target = (session.leadData?.targetCountry || session.leadData?.currentCountry || '').toLowerCase();
+  if (target) {
+    if (/uae|dubai|emirates/.test(target))       return 'uae';
+    if (/usa|united states|america/.test(target)) return 'usa';
+    if (/uk|britain|england/.test(target))        return 'uk';
+    if (/singapore/.test(target))                 return 'singapore';
+    if (/canada/.test(target))                    return 'canada';
+    if (/thailand/.test(target))                  return 'thailand';
+    if (/estonia/.test(target))                   return 'estonia';
+    if (/indonesia/.test(target))                 return 'indonesia';
+    if (/philippines/.test(target))               return 'philippines';
+    if (/vietnam/.test(target))                   return 'vietnam';
+    if (/italy/.test(target))                     return 'italy';
+    if (/india/.test(target))                     return 'india_fema';
+  }
 
-  if (/\buae\b|dubai|abu dhabi|emirates|free zone|mainland/.test(recent)) return 'uae';
-  if (/\busa\b|\bus\b|america|delaware|wyoming|llc|c-corp/.test(recent))   return 'usa';
-  if (/\buk\b|britain|england|companies house|hmrc/.test(recent))           return 'uk';
-  if (/singapore|pte\.?\s*ltd|acra|iras/.test(recent))                      return 'singapore';
-  if (/canada|toronto|cra|gst.*hst/.test(recent))                           return 'canada';
-  if (/fema|odi|rbi|apr|fla return|form oi/.test(recent))                   return 'india_fema';
-  if (/thailand|bangkok|boi|fba|thai/.test(recent))                         return 'thailand';
-  if (/estonia|e-residency|estonian|o[uü]/.test(recent))                    return 'estonia';
-  if (/indonesia|pt pma|jakarta|kbli/.test(recent))                         return 'indonesia';
-  if (/philippines|manila|peza|bir|sec/.test(recent))                       return 'philippines';
-  if (/vietnam|ho chi minh|hanoi|vnd/.test(recent))                         return 'vietnam';
-  if (/italy|milan|rome|s\.r\.l|ires|irap/.test(recent))                    return 'italy';
+  // Fallback — scan ONLY the current message (not history, avoids stale data)
+  const msg = userMessage.toLowerCase();
+  if (/\buae\b|dubai|abu dhabi|free zone|mainland/.test(msg))  return 'uae';
+  if (/\busa\b|america|delaware|wyoming|c-corp/.test(msg))     return 'usa';  // removed \bus\b — matches "us" in any word
+  if (/\buk\b|britain|england|companies house/.test(msg))       return 'uk';
+  if (/singapore|pte\.?\s*ltd|acra/.test(msg))                  return 'singapore';
+  if (/canada|toronto|cra/.test(msg))                           return 'canada';
+  if (/fema|odi|rbi|form oi/.test(msg))                         return 'india_fema';
+  if (/thailand|bangkok|boi\b/.test(msg))                       return 'thailand';
+  if (/estonia|e-residency/.test(msg))                          return 'estonia';
+  if (/indonesia|pt pma|jakarta/.test(msg))                     return 'indonesia';
+  if (/philippines|manila|peza/.test(msg))                      return 'philippines';
+  if (/vietnam|ho chi minh|hanoi/.test(msg))                    return 'vietnam';
+  if (/italy|milan|rome/.test(msg))                             return 'italy';
+
   return 'general';
 }
 
@@ -2905,6 +2921,13 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ── INTERPRET INTENT ──────────────────────────────────────────
+    // If this user has no name/country yet, nuke any stale menu options
+    // from MongoDB so old sessions can't ghost-trigger menu selections
+    if (!session.leadData.name && !session.leadData.targetCountry && !session.leadData.currentCountry) {
+      menuState.validOptions = [];
+      menuState.optionTopics = [];
+    }
+
     const intent = interpretUserInput(rawMsg, menuState);
     console.log(`🧠  Intent: ${intent.type}`);
 
@@ -3065,6 +3088,7 @@ app.post('/webhook', async (req, res) => {
 
     let finalReply;
     if (showTopics) {
+      // We know who they are and where they want to go — show relevant topics
       const bank = detectTopicBank(session, rawMsg);
       const { footer, options } = buildQuickReplyFooter(bank);
       finalReply = cleanReply + footer;
@@ -3072,7 +3096,7 @@ app.post('/webhook', async (req, res) => {
       menuState.optionTopics = options;
       menuState.menuShownAt  = new Date();
     } else {
-      // No footer yet — still collecting name / country
+      // Still onboarding — no topics yet, just the clean reply
       finalReply = cleanReply;
       menuState.validOptions = [];
       menuState.optionTopics = [];
@@ -3211,8 +3235,107 @@ app.get('/admin/reset-all', async (req, res) => {
     res.status(500).send('Error: ' + err.message);
   }
 });
-// GET /admin/fix-name?phone=918448227988&name=Udhay
-// GET /admin/fix-name?phone=918448227988        (just clears the name)
+// ─────────────────────────────────────────────
+// ADMIN: SEED / UPDATE USER PROFILE
+// Sets name, countries, service — and optionally injects a context
+// summary into session history so Claude knows past conversations.
+//
+// GET /admin/seed-profile?phone=918448227988&name=Udhay&current=India&targets=Singapore,UAE,Vietnam&service=Company+Incorporation
+// ─────────────────────────────────────────────
+app.get('/admin/seed-profile', async (req, res) => {
+  const phone   = (req.query.phone   || '').replace(/\D/g, '');
+  const name    = (req.query.name    || '').trim();
+  const current = (req.query.current || '').trim();
+  const targets = (req.query.targets || '').trim();   // comma-separated: "Singapore,UAE,Vietnam"
+  const service = (req.query.service || '').trim();
+  const stage   = (req.query.stage   || '').trim();
+
+  if (!phone) return res.status(400).send('Missing phone');
+
+  try {
+    const session     = await getSession(phone);
+    const activeState = await getActiveState(phone);
+    const menuState   = await getMenuState(phone);
+
+    // ── Update lead data ──────────────────────────────────────────
+    if (name)    session.leadData.name           = name;
+    if (current) session.leadData.currentCountry = current;
+    if (service) session.leadData.serviceNeeded  = service;
+    if (stage)   session.leadData.businessStage  = stage;
+
+    // Last target country = what detectTopicBank will use
+    const targetList = targets ? targets.split(',').map(t => t.trim()).filter(Boolean) : [];
+    if (targetList.length > 0) {
+      session.leadData.targetCountry = targetList[targetList.length - 1]; // most recent
+    }
+
+    // ── Advance stage past NAME so bot doesn't re-ask ────────────
+    activeState.conversationStage = 'QA';
+    activeState.currentFlow       = 'NORMAL';
+
+    // ── Inject a context summary into history ─────────────────────
+    // This means Claude will "remember" past discussions naturally.
+    if (name || targetList.length > 0) {
+      const countriesMentioned = targetList.length > 0
+        ? targetList.join(', ')
+        : (current || 'various jurisdictions');
+
+      const contextSummary = [
+        name    ? `The customer's name is ${name}.` : '',
+        current ? `They are based in ${current}.` : '',
+        targetList.length > 0
+          ? `They have previously discussed expanding to: ${countriesMentioned}. They are familiar with these markets and may ask follow-up questions about any of them.`
+          : '',
+        service ? `Their primary interest is ${service}.` : '',
+        stage   ? `Business stage: ${stage}.` : '',
+      ].filter(Boolean).join(' ');
+
+      // Only inject if history is empty or doesn't already have a seed
+      const alreadySeeded = session.history.some(h => h.content.includes('[CONTEXT SEED]'));
+      if (!alreadySeeded && contextSummary) {
+        // Inject as a system-style assistant turn so Claude treats it as established fact
+        session.history.unshift(
+          { role: 'user',      content: '[CONTEXT SEED] Previous conversation context.' },
+          { role: 'assistant', content: `[CONTEXT SEED] ${contextSummary}` }
+        );
+      }
+    }
+
+    // Clear stale menu options
+    menuState.validOptions = [];
+    menuState.optionTopics = [];
+
+    // Clear caches so next message picks up immediately
+    sessionCache.delete(phone);
+    activeStateCache.delete(phone);
+    menuStateCache.delete(phone);
+
+    await Promise.all([saveSession(session), saveActiveState(activeState), saveMenuState(menuState)]);
+
+    const displayPhone = `+${phone}`;
+    res.send(`<!DOCTYPE html>
+<html><body style="font-family:sans-serif;padding:40px;max-width:540px">
+  <h2>✅ Profile seeded for ${displayPhone}</h2>
+  <table style="border-collapse:collapse;width:100%;margin-top:16px">
+    <tr style="background:#f5f5f5"><td style="padding:10px;font-weight:600;border-bottom:1px solid #ddd">Name</td><td style="padding:10px;border-bottom:1px solid #ddd">${session.leadData.name || '—'}</td></tr>
+    <tr><td style="padding:10px;font-weight:600;border-bottom:1px solid #ddd">Based in</td><td style="padding:10px;border-bottom:1px solid #ddd">${session.leadData.currentCountry || '—'}</td></tr>
+    <tr style="background:#f5f5f5"><td style="padding:10px;font-weight:600;border-bottom:1px solid #ddd">Countries discussed</td><td style="padding:10px;border-bottom:1px solid #ddd">${targetList.join(', ') || '—'}</td></tr>
+    <tr><td style="padding:10px;font-weight:600;border-bottom:1px solid #ddd">Primary target</td><td style="padding:10px;border-bottom:1px solid #ddd">${session.leadData.targetCountry || '—'}</td></tr>
+    <tr style="background:#f5f5f5"><td style="padding:10px;font-weight:600;border-bottom:1px solid #ddd">Service</td><td style="padding:10px;border-bottom:1px solid #ddd">${session.leadData.serviceNeeded || '—'}</td></tr>
+    <tr><td style="padding:10px;font-weight:600">Stage</td><td style="padding:10px">${session.leadData.businessStage || '—'}</td></tr>
+  </table>
+  <p style="margin-top:20px;color:#666;font-size:13px">
+    Context injected into session history. Next WhatsApp message will have full memory of this profile and past discussions.
+  </p>
+</body></html>`);
+
+  } catch (err) {
+    console.error('Seed-profile error:', err);
+    res.status(500).send('Error: ' + err.message);
+  }
+});
+
+// GET /admin/fix-name?phone=918448227988&name=Udhay  (quick name-only fix)
 app.get('/admin/fix-name', async (req, res) => {
   const phone   = (req.query.phone || '').replace(/\D/g, '');
   const newName = (req.query.name  || '').trim();
@@ -3223,23 +3346,17 @@ app.get('/admin/fix-name', async (req, res) => {
     const oldName = session.leadData.name || '(none)';
     session.leadData.name = newName || null;
 
-    // Also reset conversationStage so bot doesn't re-ask name
     const activeState = await getActiveState(phone);
-    if (activeState.conversationStage === 'NAME') {
-      activeState.conversationStage = 'QA';
-    }
+    if (activeState.conversationStage === 'NAME') activeState.conversationStage = 'QA';
 
     await Promise.all([saveSession(session), saveActiveState(activeState)]);
-
-    // Clear cache so next message picks up the fix immediately
     sessionCache.delete(phone);
     activeStateCache.delete(phone);
 
     res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;max-width:500px">
       <h2>✅ Name fixed for +${phone}</h2>
       <p><b>Was:</b> ${oldName}</p>
-      <p><b>Now:</b> ${newName || '(cleared — bot will re-ask)'}</p>
-      <p style="color:#666;font-size:13px">Cache cleared. Next message from this user will use the updated name.</p>
+      <p><b>Now:</b> ${newName || '(cleared)'}</p>
     </body></html>`);
   } catch (err) {
     res.status(500).send('Error: ' + err.message);
