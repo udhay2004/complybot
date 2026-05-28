@@ -2,24 +2,28 @@
 
 /**
  * ============================================================
- *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend (v3)
+ *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
+ *  Production-Grade | Deep Conversational Intelligence | Persistent Memory
+ * ============================================================
  *
- *  CHANGES FROM v2:
- *  ⚡ SPEED: max_tokens cut to 350, parallel DB writes, KB retrieval limit=1
- *  🎛️  QUICK REPLIES: every Claude response ends with 1️⃣2️⃣3️⃣4️⃣ topic buttons
- *  ✅ MENU FIX: invalid selections ("5", "6") → clear error; valid → full answer
- *  🧠 MENU CONTENT: stores option TEXT + TOPIC so Claude knows what to answer
+ *  KNOWLEDGE BASE INSERTION POINT:
+ *  Search for the comment:
+ *    // ════════ KNOWLEDGE BASE — PASTE YOUR FULL KB STRING HERE ════════
+ *  Replace the KNOWLEDGE_BASE constant with your full knowledge base string.
  *
  *  ENVIRONMENT VARIABLES REQUIRED:
  *    INTERAKT_API_KEY     — Interakt WhatsApp API key
  *    ANTHROPIC_API_KEY    — Claude API key
  *    MONGODB_URI          — MongoDB connection string
+ *    GOOGLE_SHEET_ID      — Google Sheet ID for lead logging
+ *    GOOGLE_CREDENTIALS   — Stringified Google service-account JSON
  *    RESEND_API_KEY       — Resend email API key
  *    NOTIFY_EMAIL         — Email address to send notifications to
  *    FROM_EMAIL           — Sender email (Resend verified domain)
  *    BASE_URL             — Your deployed server URL
  *    HUMAN_TIMEOUT_MS     — ms before bot auto-resumes after human handoff (default 7200000)
  *    PORT                 — Server port (default 5000)
+ *    KEEP_ALIVE_URL       — URL to ping every 14 min (optional)
  * ============================================================
  */
 
@@ -30,15 +34,16 @@ const express         = require('express');
 const path            = require('path');
 const fetch           = require('node-fetch');
 const { MongoClient } = require('mongodb');
+const { google }      = require('googleapis');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS, PUT');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -47,40 +52,36 @@ app.use((req, res, next) => {
 // ─────────────────────────────────────────────
 // ENVIRONMENT CONFIG
 // ─────────────────────────────────────────────
-const INTERAKT_API_KEY  = (process.env.INTERAKT_API_KEY  || '').replace(/['"` \n\r]/g, '');
-const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || '').replace(/['"` \n\r]/g, '');
-const MONGODB_URI       = process.env.MONGODB_URI        || '';
-const RESEND_API_KEY    = (process.env.RESEND_API_KEY    || '').replace(/['"` \n\r]/g, '');
-const NOTIFY_EMAIL      = process.env.NOTIFY_EMAIL       || 'udhaymarwah96@gmail.com';
-const FROM_EMAIL        = process.env.FROM_EMAIL         || 'onboarding@resend.dev';
-const BASE_URL          = process.env.BASE_URL           || 'https://complybot.onrender.com';
-const HUMAN_TIMEOUT_MS  = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000', 10);
+const INTERAKT_API_KEY   = (process.env.INTERAKT_API_KEY   || '').replace(/['"` \n\r]/g, '');
+const ANTHROPIC_API_KEY  = (process.env.ANTHROPIC_API_KEY  || '').replace(/['"` \n\r]/g, '');
+const MONGODB_URI        = process.env.MONGODB_URI         || '';
+const GOOGLE_SHEET_ID    = process.env.GOOGLE_SHEET_ID     || '';
+const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS  || '';
+const RESEND_API_KEY     = (process.env.RESEND_API_KEY     || '').replace(/['"` \n\r]/g, '');
+const NOTIFY_EMAIL       = process.env.NOTIFY_EMAIL        || 'udhaymarwah96@gmail.com';
+const FROM_EMAIL         = process.env.FROM_EMAIL          || 'onboarding@resend.dev';
+const BASE_URL           = process.env.BASE_URL            || 'https://complybot.onrender.com';
+const HUMAN_TIMEOUT_MS   = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000', 10);
 
 [
   ['INTERAKT_API_KEY',  INTERAKT_API_KEY],
   ['ANTHROPIC_API_KEY', ANTHROPIC_API_KEY],
   ['MONGODB_URI',       MONGODB_URI],
+  ['GOOGLE_SHEET_ID',   GOOGLE_SHEET_ID],
   ['RESEND_API_KEY',    RESEND_API_KEY],
 ].forEach(([k, v]) => {
   if (!v) console.error(`❌  ENV MISSING: ${k}`);
   else    console.log (`✅  ENV loaded:  ${k}`);
 });
 
-// ════════════════════════════════════════════════════════════════════════════
-// ════════ KNOWLEDGE BASE — PASTE YOUR COMPLETE KB HERE ════════════════════
-// ════════════════════════════════════════════════════════════════════════════
-//
-//  HOW TO INSERT YOUR KB:
-//  1. Find the line:  const KNOWLEDGE_BASE = `
-//  2. Paste your entire KB content between the backticks below
-//  3. Keep the closing backtick on its own line
-//
-//  The system will automatically:
-//   - Chunk the KB by ━━━ section headers
-//   - Score chunks against user keywords (TF-IDF)
-//   - Inject only the TOP 1 most relevant chunk per request (speed!)
-//   - Fallback to first 1500 chars if no match
-//
+// ════════ KNOWLEDGE BASE — PASTE YOUR FULL KB STRING HERE ════════
+// Replace the empty string below with your complete knowledge base.
+// Example:
+//   const KNOWLEDGE_BASE = `
+//     Comply Globally offers company incorporation in 47+ jurisdictions...
+//     UAE company setup costs AED 15,000–25,000 depending on free zone...
+//     (continue your full KB here)
+//   `;
 const KNOWLEDGE_BASE = `
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 KNOWLEDGE BASE — USA INCORPORATION (State Navigator)
@@ -2077,159 +2078,79 @@ CONTACT & PRICING
 - Contact: sales@complyglobally.com | +1 (302) 214-1717 | +91 99999 81613
 - Pricing: "Our team will send a custom quote based on your jurisdiction and requirements"
 - Specific legal opinions or complex tax structuring: "Our experts will guide you on the specifics"
+
 `;
-// ════════════════════════════════════════════════════════════════════════════
-// ════════ END KNOWLEDGE BASE INSERTION POINT ════════════════════════════════
-// ════════════════════════════════════════════════════════════════════════════
 
-// ─────────────────────────────────────────────
-// QUICK-REPLY TOPIC BANKS
-// These are the numbered options appended to every Claude response.
-// Keys match country/topic slugs. Claude picks the right bank based on context.
-// ─────────────────────────────────────────────
-const QUICK_REPLY_BANKS = {
-  uae: [
-    'UAE Mainland LLC setup',
-    'Free Zone comparison',
-    'UAE banking requirements',
-    'Corporate tax implications',
-  ],
-  usa: [
-    'Best US state for my business',
-    'LLC vs C-Corp comparison',
-    'US banking without SSN',
-    'Form 5472 & compliance',
-  ],
-  uk: [
-    'UK company incorporation',
-    'UK banking options',
-    'UK tax & VAT overview',
-    'Skilled Worker visa',
-  ],
-  singapore: [
-    'Singapore Pte. Ltd. setup',
-    'Resident director requirement',
-    'Singapore tax benefits',
-    'Banking & account opening',
-  ],
-  canada: [
-    'Canada incorporation options',
-    'GST/HST registration',
-    'Resident director requirement',
-    'Banking & payroll setup',
-  ],
-  india_fema: [
-    'Form OI & UIN registration',
-    'Annual Performance Report (APR)',
-    'FLA Return filing',
-    'Compounding & late rectification',
-  ],
-  thailand: [
-    'BOI promotion benefits',
-    'Foreign Business Act limits',
-    'Thai banking timeline',
-    'Work permit requirements',
-  ],
-  estonia: [
-    'e-Residency application',
-    'Estonian OÜ incorporation',
-    'EU VAT & tax benefits',
-    'Banking for e-residents',
-  ],
-  indonesia: [
-    'PT PMA setup & capital',
-    'Positive Investment List check',
-    'Indonesia banking timeline',
-    'Work permit (ITAS) process',
-  ],
-  philippines: [
-    'Philippines subsidiary setup',
-    'PEZA incentives overview',
-    'BIR & SEC registration',
-    'Employment & payroll rules',
-  ],
-  vietnam: [
-    'Vietnam LLC incorporation',
-    'Foreign ownership rules',
-    'Vietnam banking process',
-    'Work permit requirements',
-  ],
-  italy: [
-    'Italian S.r.l. incorporation',
-    'IRES & IRAP tax rates',
-    'Golden Power & restrictions',
-    'Employment & CCNL rules',
-  ],
-  general: [
-    'Compare jurisdictions for my business',
-    'FEMA/ODI compliance (Indian founders)',
-    'Banking setup in target country',
-    'Speak to an advisor',
-  ],
-};
+const BASE_SYSTEM_PROMPT = `
+You are an expert advisor for Comply Globally, a premium global business expansion consultancy.
+You assist businesses with company incorporation, banking setup, tax compliance, FEMA/ODI advisory, and residency solutions across 47+ jurisdictions.
 
-// Emoji number map for display
-const EMOJI_NUMS = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣'];
+PERSONALITY & TONE:
+- Warm, professional, highly knowledgeable
+- Conversational and human — never robotic or scripted
+- Concise but complete — never truncate important information
+- Proactive: offer relevant insights without being asked
+- WhatsApp-formatted: use *bold*, line breaks, and numbered lists naturally
 
-/**
- * Detect which quick-reply bank to use.
- * PRIMARY: leadData.targetCountry (ground truth — set by entity extractor)
- * FALLBACK: scan only the current user message (not history — avoids stale matches)
- */
-function detectTopicBank(session, userMessage) {
-  // Primary — use the known target country from lead data
-  const target = (session.leadData?.targetCountry || session.leadData?.currentCountry || '').toLowerCase();
-  if (target) {
-    if (/uae|dubai|emirates/.test(target))       return 'uae';
-    if (/usa|united states|america/.test(target)) return 'usa';
-    if (/uk|britain|england/.test(target))        return 'uk';
-    if (/singapore/.test(target))                 return 'singapore';
-    if (/canada/.test(target))                    return 'canada';
-    if (/thailand/.test(target))                  return 'thailand';
-    if (/estonia/.test(target))                   return 'estonia';
-    if (/indonesia/.test(target))                 return 'indonesia';
-    if (/philippines/.test(target))               return 'philippines';
-    if (/vietnam/.test(target))                   return 'vietnam';
-    if (/italy/.test(target))                     return 'italy';
-    if (/india/.test(target))                     return 'india_fema';
-  }
+CRITICAL: SUGGEST_TOPICS RULES (WHEN TO SHOW OPTIONS):
+- ONLY show 4 suggested topic options when ALL these conditions are true:
+  1. User has provided their NAME
+  2. User has provided their TARGET COUNTRY/JURISDICTION
+  3. We are NOT in a human handoff flow
+  4. We are NOT in the initial onboarding greeting
+  5. User is asking a question or requesting information about a service
+  
+- Format: SUGGEST_TOPICS:[Topic One,Topic Two,Topic Three,Topic Four]
+- Topics should be answerable questions the user might ask (e.g., "Singapore incorporation timeline", "Banking requirements for UAE setup", etc.)
+- If ANY of the 5 conditions above are false, DO NOT include SUGGEST_TOPICS in your response
+- If user selects a topic by number, explain that topic in detail WITHOUT showing new options in the same message
 
-  // Fallback — scan ONLY the current message (not history, avoids stale data)
-  const msg = userMessage.toLowerCase();
-  if (/\buae\b|dubai|abu dhabi|free zone|mainland/.test(msg))  return 'uae';
-  if (/\busa\b|america|delaware|wyoming|c-corp/.test(msg))     return 'usa';  // removed \bus\b — matches "us" in any word
-  if (/\buk\b|britain|england|companies house/.test(msg))       return 'uk';
-  if (/singapore|pte\.?\s*ltd|acra/.test(msg))                  return 'singapore';
-  if (/canada|toronto|cra/.test(msg))                           return 'canada';
-  if (/fema|odi|rbi|form oi/.test(msg))                         return 'india_fema';
-  if (/thailand|bangkok|boi\b/.test(msg))                       return 'thailand';
-  if (/estonia|e-residency/.test(msg))                          return 'estonia';
-  if (/indonesia|pt pma|jakarta/.test(msg))                     return 'indonesia';
-  if (/philippines|manila|peza/.test(msg))                      return 'philippines';
-  if (/vietnam|ho chi minh|hanoi/.test(msg))                    return 'vietnam';
-  if (/italy|milan|rome/.test(msg))                             return 'italy';
+CONVERSATIONAL INTELLIGENCE RULES (CRITICAL):
+1. RETURNING USERS: If this is not the first message in the conversation and you know their name, use it naturally. Example: "Hi Uday, great question about Singapore taxation..."
+2. CONTEXT REFERENCES: When the user says "that one", "the second option", "the previous one", "not this, the other" — resolve the reference by looking at the last bot message that contained a list or options, and identify which item they mean.
+3. CORRECTIONS: When the user says "actually", "wait", "no", "I meant", "forget that", "sorry", "I changed my mind" — treat this as a correction. Rollback your understanding of their last intent and adopt the new one. Acknowledge the correction naturally.
+4. PARTIAL INFO: If a user gives partial information across multiple messages, combine it. Never ask for information already given, even if spread across messages.
+5. TOPIC SWITCHES: If the user suddenly changes topic, follow them. Do not force them back into the previous flow. Mentally note where the old thread was — you may return to it naturally later if appropriate.
+6. AMBIGUITY: If a reply is ambiguous, make a reasonable best-guess interpretation and proceed, but briefly confirm your interpretation at the start of your reply ("You mean X — correct?").
+7. NUMERIC REPLIES: A bare number from a user almost certainly refers to a menu option from your last message. Do not ask them to clarify; just act on the selection.
+8. SHORT REPLIES: "Yes", "No", "Sure", "Go ahead", "Ok", "Fine", "Both", "All" are valid answers. Interpret them in context.
+9. FOLLOW-UP REFERENCES: "Tell me more about the third one", "What about option 2 for banking?" — resolve against the most recently shown list.
+10. RESUMING: If a user abandoned a topic and returns to it, pick up where you left off without re-asking questions already answered.
 
-  return 'general';
-}
+LEAD COLLECTION (natural, never interrogative):
+Gather these fields conversationally as the discussion progresses — never fire them as a form:
+- Full name
+- Email address
+- Company name (if applicable)
+- Country they are currently based in
+- Country/jurisdiction they want to expand into
+- Service they need (incorporation / banking / tax / FEMA / residency / other)
+- Business stage (idea / startup / established / large corp)
+- Timeline (urgent / 1–3 months / 3–6 months / flexible)
+- Any additional context
 
-/**
- * Build the quick-reply footer string appended to every bot response.
- * Returns an object: { footer: string, options: string[] }
- */
-function buildQuickReplyFooter(bank) {
-  const options = QUICK_REPLY_BANKS[bank] || QUICK_REPLY_BANKS.general;
-  const lines   = options.map((opt, i) => `${EMOJI_NUMS[i]} ${opt}`);
-  const footer  = `\n\n*Quick topics:*\n${lines.join('\n')}`;
-  return { footer, options };
-}
+RESPONSE FORMAT:
+- Keep replies under 300 words unless the user asks for detail
+- Use numbered lists when presenting options (1. 2. 3.)
+- Use *bold* for key terms
+- Never use markdown headers (#, ##) — WhatsApp doesn't render them
+- End responses with a clear next question or call to action (unless showing SUGGEST_TOPICS)
+
+CONTACT INFO (use when relevant):
+📧 sales@complyglobally.com
+📞 +1 (302) 214-1717 | +91 99999 81613
+`;
 
 // ─────────────────────────────────────────────
 // MONGODB — CONNECTION & COLLECTIONS
 // ─────────────────────────────────────────────
-let db, sessionsCol, leadsCol, activeStateCol, analyticsCol, menuStateCol;
+let db, sessionsCol, leadsCol, activeStateCol, analyticsCol, memoryCol;
 
 async function connectMongo() {
-  if (!MONGODB_URI) { console.warn('⚠️  MONGODB_URI not set — memory-only mode'); return; }
+  if (!MONGODB_URI) {
+    console.warn('⚠️  MONGODB_URI not set — running in memory-only mode');
+    return;
+  }
   try {
     const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 10000 });
     await client.connect();
@@ -2238,14 +2159,16 @@ async function connectMongo() {
     leadsCol       = db.collection('leads');
     activeStateCol = db.collection('activeStates');
     analyticsCol   = db.collection('analytics');
-    menuStateCol   = db.collection('menuState');
+    memoryCol      = db.collection('memory');   // ← NEW: structured entity memory
 
+    // Indexes for performance
     await Promise.all([
       sessionsCol.createIndex({ phone: 1 }, { unique: true }),
       activeStateCol.createIndex({ phone: 1 }, { unique: true }),
-      menuStateCol.createIndex({ phone: 1 }, { unique: true }),
+      memoryCol.createIndex({ phone: 1 }),
       analyticsCol.createIndex({ phone: 1, ts: -1 }),
     ]);
+
     console.log('✅  MongoDB connected — complybot database');
   } catch (err) {
     console.error('❌  MongoDB connection failed:', err.message);
@@ -2255,164 +2178,51 @@ async function connectMongo() {
 // ─────────────────────────────────────────────
 // IN-MEMORY CACHE (TTL: 30 min)
 // ─────────────────────────────────────────────
-const SESSION_TTL      = 30 * 60 * 1000;
-const sessionCache     = new Map();
+const SESSION_TTL     = 30 * 60 * 1000;
+const sessionCache    = new Map();
 const activeStateCache = new Map();
-const menuStateCache   = new Map();
-const kbChunkCache     = new Map();
 
-function cacheSet(map, key, value) { map.set(key, { value, ts: Date.now() }); }
+function cacheSet(map, key, value) {
+  map.set(key, { value, ts: Date.now() });
+}
+
 function cacheGet(map, key) {
-  const e = map.get(key);
-  if (!e) return null;
-  if (Date.now() - e.ts > SESSION_TTL) { map.delete(key); return null; }
-  return e.value;
+  const entry = map.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > SESSION_TTL) { map.delete(key); return null; }
+  return entry.value;
 }
 
-// ─────────────────────────────────────────────
-// KNOWLEDGE BASE CHUNKER & RETRIEVER
-// ⚡ SPEED: limit=1 — only the single best chunk injected per request
-// ─────────────────────────────────────────────
-function extractKeywords(text) {
-  const words = text.toLowerCase().match(/\b\w{4,}\b/g) || [];
-  const freq  = {};
-  words.forEach(w => freq[w] = (freq[w] || 0) + 1);
-  return Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([w]) => w);
-}
-
-function chunkKnowledgeBase(kb) {
-  if (!kb || kb.includes('PASTE_YOUR_KNOWLEDGE_BASE_HERE')) return [];
-  const chunks = [];
-  const sections = kb.split(/━{3,}/);
-  sections.forEach((section, idx) => {
-    if (section.trim().length < 50) return;
-    const subsections = section.split(/(?=^[A-Z][A-Z0-9\s]+:|\n[A-Z][A-Z0-9\s]+:)/gm);
-    subsections.forEach(sub => {
-      if (sub.trim().length > 50) {
-        chunks.push({ id: `${idx}-${chunks.length}`, content: sub.trim(), keywords: extractKeywords(sub) });
-      }
-    });
-  });
-  return chunks;
-}
-
-function retrieveRelevantKB(userMessage, limit = 1) {
-  if (KNOWLEDGE_BASE.includes('PASTE_YOUR_KNOWLEDGE_BASE_HERE')) return '';
-  const cached = cacheGet(kbChunkCache, 'chunks');
-  const chunks = cached || chunkKnowledgeBase(KNOWLEDGE_BASE);
-  if (!cached) cacheSet(kbChunkCache, 'chunks', chunks);
-
-  const msgKeywords = extractKeywords(userMessage);
-  const scored = chunks
-    .map(chunk => ({ ...chunk, score: msgKeywords.filter(kw => chunk.keywords.includes(kw)).length }))
-    .filter(c => c.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit)
-    .map(c => c.content)
-    .join('\n\n');
-
-  return scored || KNOWLEDGE_BASE.substring(0, 1500) + '\n[...full KB available...]';
-}
-
-// ─────────────────────────────────────────────
-// FOOTER DEDUPLICATION
-// Claude sometimes generates its own "Quick topics:" block despite instructions.
-// Strip it before we append the system-controlled footer.
-// ─────────────────────────────────────────────
-function stripClaudeGeneratedFooter(text) {
-  return text
-    // Remove any "*Quick topics:*" / "Quick topics:" block and everything after it
-    .replace(/\n*[\*_]*Quick\s+(?:topics|reply|options)[\*_]*:?[\s\S]*/i, '')
-    // Remove if Claude starts a standalone emoji-number list
-    .replace(/\n+(?:1️⃣|2️⃣|3️⃣|4️⃣|5️⃣|6️⃣)[\s\S]*/m, '')
-    .trimEnd();
-}
-
-// ─────────────────────────────────────────────
-// MENU STATE
-// Stores: validOptions (display labels) + optionTopics (what each option means)
-// ─────────────────────────────────────────────
-function freshMenuState(phone) {
-  return {
-    phone,
-    validOptions:  [],   // e.g. ["UAE Mainland LLC setup", "Free Zone comparison", ...]
-    optionTopics:  [],   // same array — stored for Claude context
-    menuShownAt:   null,
-    updatedAt:     new Date(),
-  };
-}
-
-async function getMenuState(phone) {
-  const cached = cacheGet(menuStateCache, phone);
-  if (cached) return cached;
-  let state = menuStateCol ? await menuStateCol.findOne({ phone }) : null;
-  if (!state) state = freshMenuState(phone);
-  cacheSet(menuStateCache, phone, state);
-  return state;
-}
-
-async function saveMenuState(state) {
-  state.updatedAt = new Date();
-  cacheSet(menuStateCache, state.phone, state);
-  if (menuStateCol) {
-    const { _id, ...doc } = state;
-    await menuStateCol.replaceOne({ phone: state.phone }, doc, { upsert: true });
-  }
-}
-
-// ─────────────────────────────────────────────
-// NAME VALIDATOR
-// ─────────────────────────────────────────────
-const INVALID_NAME_PATTERNS = [
-  /^(yes|no|sure|okay|ok|hello|hi|hey|thanks|thank you|please|more|less|good|bad|other|same|different)$/i,
-  /^(usa|uk|india|canada|australia|singapore|uae|dubai|london|new\s+york|california|florida)$/i,
-  /^(company|business|service|product|office|team|person|people|money|cost|fee|time|date|number)$/i,
-  /^[a-z]{1,2}$/i,
-  /^\d+$/,
-  /^(1|2|3|4|5|option|menu|reply|answer)$/i,
-];
-
-const COMMON_FIRST_NAMES = new Set([
-  'john','james','robert','michael','william','david','richard','joseph','thomas','charles',
-  'christopher','daniel','matthew','anthony','mark','donald','steven','paul','andrew','joshua',
-  'kenneth','kevin','brian','edward','ronald','timothy','jason','jeffrey','ryan','jacob',
-  'mary','patricia','jennifer','linda','barbara','elizabeth','susan','jessica','sarah','karen',
-  'nancy','betty','margaret','sandra','ashley','kimberly','emily','donna','michelle','dorothy',
-  'carol','amanda','melissa','deborah','stephanie','rebecca','sharon','laura','cynthia','anna',
-  'arun','amit','anita','arjun','akshay','ashish','anand','raj','rahul','rohan','ravi',
-  'ritesh','rajesh','ramesh','rakesh','sandeep','sanjay','sameer','saurabh','suresh','sunil',
-  'priya','pooja','priyanka','prakash','neha','nikhil','nishant','neeraj','naresh','naveen',
-  'mahesh','mohit','manoj','murali','mohan','mukesh','harish','harsh','vivek','vikas','varun',
-  'vikram','vinod','vinay','yogesh','yash','udhay','uddhav','umesh','aryan','aarav','kabir',
-  'zara','zoey','zainab','ishaan','ishita','kavya','kavita','meera','naina','pallavi','riya',
-]);
-
-function isValidName(candidate) {
-  if (!candidate || candidate.length < 2 || candidate.length > 50) return false;
-  const trimmed = candidate.trim();
-  const lower   = trimmed.toLowerCase();
-  if (INVALID_NAME_PATTERNS.some(p => p.test(lower))) return false;
-  const words       = trimmed.split(/[\s\-']+/);
-  const hasCommon   = words.some(w => COMMON_FIRST_NAMES.has(w.toLowerCase()));
-  const hasCapital  = /[A-Z]/.test(trimmed);
-  const noNumbers   = !/\d/.test(trimmed);
-  return (hasCommon || hasCapital) && noNumbers && !/[@#$%^&*()_+=[\]{};:'"<>,.?/\\|`~]/.test(trimmed);
+function cacheDelete(map, key) {
+  map.delete(key);
 }
 
 // ─────────────────────────────────────────────
 // SESSION MANAGEMENT
 // ─────────────────────────────────────────────
 function freshSession(phone) {
-  return { phone, history: [], leadData: { phone }, leadCollected: false, createdAt: new Date(), lastActive: new Date() };
+  return {
+    phone,
+    history:        [],    // Full conversation history [{role, content}]
+    leadData:       { phone },
+    leadCollected:  false,
+    createdAt:      new Date(),
+    lastActive:     new Date(),
+  };
 }
 
 async function getSession(phone) {
   const cached = cacheGet(sessionCache, phone);
   if (cached) return cached;
-  let session = sessionsCol ? await sessionsCol.findOne({ phone }) : null;
+
+  let session = null;
+  if (sessionsCol) session = await sessionsCol.findOne({ phone });
   if (!session) session = freshSession(phone);
+
+  // Ensure arrays/objects exist even on old sessions
   session.history  = session.history  || [];
   session.leadData = session.leadData || { phone };
+
   cacheSet(sessionCache, phone, session);
   return session;
 }
@@ -2426,35 +2236,78 @@ async function saveSession(session) {
   }
 }
 
+async function saveLead(leadData) {
+  if (leadsCol) await leadsCol.insertOne({ ...leadData, savedAt: new Date() });
+}
+
 // ─────────────────────────────────────────────
-// ACTIVE STATE MANAGER
+// ACTIVE STATE — Tracks conversational state per user
+// This is the "working memory" of the conversation.
 // ─────────────────────────────────────────────
 function freshActiveState(phone) {
   return {
     phone,
-    currentFlow:        'ONBOARDING',
-    conversationStage:  'GREETING',
-    retryCount:         0,
-    humanModeActive:    false,
-    humanModeSince:     null,
-    handoffPending:     false,
-    handoffStage:       null,   // null | 'ASKED_ADDL_INFO'
-    lastInteractionAt:  new Date(),
-    messageCount:       0,
+    // ── Core flow state ──
+    currentFlow:           'ONBOARDING',  // ONBOARDING | NORMAL_QA | HANDOFF | HUMAN_MODE
+    currentQuestion:       null,          // What question the bot just asked
+    expectedInputType:     'ANY',         // ANY | MENU_1_N | YES_NO | EMAIL
+    detailsCollected:      false,         // Has user provided name + target country?
+
+    // ── Menu memory (critical for context resolution) ──
+    expectedMenuMax:       null,          // How many options were shown
+    menuOptions:           [],            // The actual option texts shown
+    menuShownAt:           null,          // Timestamp the menu was shown
+    lastMenuContext:       null,          // What topic the menu was about
+
+    // ── Retry + validation ──
+    retryCount:            0,
+    lastInvalidInput:      null,
+
+    // ── Human handoff ──
+    humanMode:             false,
+    humanModeAt:           null,
+    pendingHumanHandoff:   false,
+    awaitingHandoffExtraInfo: false,
+    handoffEmailSent:      false,
+
+    // ── Rich conversational context ──
+    lastBotMessage:        '',            // Full text of the last bot reply
+    lastBotMessageAt:      null,
+    recentTopics:          [],            // Rolling list of topics discussed (last 5)
+    pendingThread:         null,          // Saved thread context if user switched topics
+    resolvedIntents:       [],            // Log of user intents that were resolved
+    unresolvedQuestions:   [],            // Bot questions user hasn't answered yet
+
+    // ── Short-term memory window ──
+    // Stores the last N turns as flat context for fast reference resolution
+    shortTermMemory:       [],            // [{role, content, intent, entities}]
+
+    lastActive:            new Date(),
   };
 }
 
 async function getActiveState(phone) {
   const cached = cacheGet(activeStateCache, phone);
   if (cached) return cached;
-  let state = activeStateCol ? await activeStateCol.findOne({ phone }) : null;
+
+  let state = null;
+  if (activeStateCol) state = await activeStateCol.findOne({ phone });
   if (!state) state = freshActiveState(phone);
+
+  // Back-fill fields that may not exist in old records
+  state.menuOptions         = state.menuOptions         || [];
+  state.recentTopics        = state.recentTopics        || [];
+  state.shortTermMemory     = state.shortTermMemory     || [];
+  state.resolvedIntents     = state.resolvedIntents     || [];
+  state.unresolvedQuestions = state.unresolvedQuestions || [];
+  state.detailsCollected    = state.detailsCollected    || false;
+
   cacheSet(activeStateCache, phone, state);
   return state;
 }
 
 async function saveActiveState(state) {
-  state.lastInteractionAt = new Date();
+  state.lastActive = new Date();
   cacheSet(activeStateCache, state.phone, state);
   if (activeStateCol) {
     const { _id, ...doc } = state;
@@ -2463,192 +2316,450 @@ async function saveActiveState(state) {
 }
 
 // ─────────────────────────────────────────────
-// ENTITY EXTRACTOR
+// ENTITY MEMORY — Persistent per-user facts in MongoDB
+// Stores things like: name, email, preferences, past interests
+// Survives across sessions.
+// ─────────────────────────────────────────────
+async function getEntityMemory(phone) {
+  if (!memoryCol) return {};
+  try {
+    const doc = await memoryCol.findOne({ phone });
+    return doc?.entities || {};
+  } catch {
+    return {};
+  }
+}
+
+async function updateEntityMemory(phone, newEntities) {
+  if (!memoryCol) return;
+  try {
+    await memoryCol.updateOne(
+      { phone },
+      { $set: { entities: newEntities, updatedAt: new Date() } },
+      { upsert: true }
+    );
+  } catch (err) {
+    console.error('❌  Entity memory update failed:', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// KNOWLEDGE BASE RETRIEVER
+// Returns the full KB for now; can be upgraded to semantic chunking later.
+// ─────────────────────────────────────────────
+function getRelevantKnowledge(session, userMessage) {
+  if (!KNOWLEDGE_BASE || KNOWLEDGE_BASE.includes('[PASTE YOUR FULL KNOWLEDGE BASE HERE]')) {
+    return '';
+  }
+  // Simple keyword relevance: return full KB
+  // TODO: Replace with vector/semantic search if KB exceeds ~10,000 tokens
+  return `\n\n[KNOWLEDGE BASE]\n${KNOWLEDGE_BASE}\n[END KNOWLEDGE BASE]`;
+}
+
+// ─────────────────────────────────────────────
+// LEAD DATA EXTRACTOR
+// Parses user messages for structured lead fields.
+// Runs on every message to progressively fill the lead profile.
 // ─────────────────────────────────────────────
 const EMAIL_RE = /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/;
 
-const COUNTRIES_DICT = {
-  usa:'USA','united states':'USA',america:'USA','us':'USA',
-  canada:'Canada',mexico:'Mexico',brazil:'Brazil',
-  uk:'UK',britain:'UK',england:'UK',scotland:'UK',wales:'UK',london:'UK',
-  germany:'Germany',france:'France',italy:'Italy',spain:'Spain',
-  netherlands:'Netherlands',ireland:'Ireland',luxembourg:'Luxembourg',malta:'Malta',estonia:'Estonia',
-  uae:'UAE','united arab emirates':'UAE',dubai:'UAE','abu dhabi':'Abu Dhabi',
-  saudi:'Saudi Arabia',qatar:'Qatar',oman:'Oman',bahrain:'Bahrain',
-  india:'India',indian:'India',delhi:'India',mumbai:'India',bangalore:'India',
-  singapore:'Singapore',sg:'Singapore','hong kong':'Hong Kong',
-  thailand:'Thailand',vietnam:'Vietnam',philippines:'Philippines',
-  indonesia:'Indonesia',malaysia:'Malaysia','sri lanka':'Sri Lanka',
-  japan:'Japan','south korea':'South Korea',china:'China',taiwan:'Taiwan',
-  australia:'Australia','new zealand':'New Zealand',
-  'south africa':'South Africa',egypt:'Egypt',kenya:'Kenya',nigeria:'Nigeria',
+const COUNTRY_KEYWORDS = {
+  uae: 'UAE', dubai: 'UAE', abu: 'UAE',
+  usa: 'USA', america: 'USA', 'united states': 'USA',
+  uk: 'UK', britain: 'UK', england: 'UK', london: 'UK',
+  singapore: 'Singapore', sg: 'Singapore',
+  india: 'India', indian: 'India',
+  canada: 'Canada', canadian: 'Canada',
+  australia: 'Australia',
+  germany: 'Germany', german: 'Germany',
+  netherlands: 'Netherlands', holland: 'Netherlands',
+  cayman: 'Cayman Islands', bvi: 'BVI',
+  mauritius: 'Mauritius', malta: 'Malta',
+  ireland: 'Ireland', luxembourg: 'Luxembourg',
+  hongkong: 'Hong Kong', 'hong kong': 'Hong Kong',
 };
 
-const SERVICES_DICT = {
-  incorporat:'Company Incorporation',register:'Company Incorporation',
-  setup:'Company Incorporation','set up':'Company Incorporation',
-  banking:'Banking Setup',bank:'Banking Setup',account:'Banking Setup',
-  tax:'Tax Compliance',gst:'Tax Compliance',vat:'Tax Compliance',compliance:'Tax Compliance',
-  fema:'FEMA/ODI Advisory',odi:'FEMA/ODI Advisory',remittance:'FEMA/ODI Advisory',
-  residency:'Residency Solutions',visa:'Residency Solutions',immigration:'Residency Solutions',
+const SERVICE_KEYWORDS = {
+  incorporat: 'Company Incorporation',
+  register:   'Company Incorporation',
+  banking:    'Banking Setup',
+  bank:       'Banking Setup',
+  account:    'Banking Setup',
+  tax:        'Tax Compliance',
+  fema:       'FEMA/ODI Advisory',
+  odi:        'FEMA/ODI Advisory',
+  residency:  'Residency Solutions',
+  visa:       'Residency Solutions',
+  compliance: 'Tax Compliance',
 };
 
-function extractEntities(msg) {
-  const entities = { email: null, country: null, service: null };
-  const emailMatch = msg.match(EMAIL_RE);
-  if (emailMatch) entities.email = emailMatch[0];
-  const lower = msg.toLowerCase();
-  for (const [kw, country] of Object.entries(COUNTRIES_DICT)) {
-    if (lower.includes(kw)) { entities.country = country; break; }
+const STAGE_KEYWORDS = {
+  startup:     'Startup',
+  'start-up':  'Startup',
+  idea:        'Idea Stage',
+  established: 'Established Business',
+  enterprise:  'Large Enterprise',
+  corporate:   'Large Enterprise',
+};
+
+const TIMELINE_KEYWORDS = {
+  urgent:    'Urgent (ASAP)',
+  asap:      'Urgent (ASAP)',
+  immediate: 'Urgent (ASAP)',
+  '1 month': '1–3 months',
+  '2 month': '1–3 months',
+  '3 month': '1–3 months',
+  '6 month': '3–6 months',
+  flexible:  'Flexible',
+  'no rush': 'Flexible',
+};
+
+function extractLeadData(session, activeState, rawMsg) {
+  const msg  = rawMsg.toLowerCase();
+  const lead = session.leadData;
+
+  // Email
+  const emailMatch = rawMsg.match(EMAIL_RE);
+  if (emailMatch && !lead.email) lead.email = emailMatch[0];
+
+  // Name — if the bot just asked for name
+  if (
+    !lead.name &&
+    activeState.currentQuestion &&
+    ['ASK_NAME_AND_TARGET', 'ASK_NAME'].includes(activeState.currentQuestion) &&
+    rawMsg.length < 60 &&
+    !/[@.]\w+/.test(rawMsg) // not an email
+  ) {
+    // Take the first "word group" that looks like a name (capitalised or simple)
+    const nameMatch = rawMsg.match(/^[A-Za-z][A-Za-z\s'-]{1,40}(?=[\s,]|$)/);
+    if (nameMatch) lead.name = nameMatch[0].trim();
   }
-  for (const [kw, service] of Object.entries(SERVICES_DICT)) {
-    if (lower.includes(kw)) { entities.service = service; break; }
+
+  // Countries — detect both "based in" and "target"
+  for (const [kw, country] of Object.entries(COUNTRY_KEYWORDS)) {
+    if (msg.includes(kw)) {
+      // Heuristic: if message contains "expand", "move", "incorporate", "setup" → target country
+      if (!lead.targetCountry && /expand|move to|incorporate|setup|set up|register|looking at|going to|want to/.test(msg)) {
+        lead.targetCountry = country;
+      } else if (!lead.currentCountry) {
+        lead.currentCountry = country;
+      }
+    }
   }
-  return entities;
+
+  // Services
+  for (const [kw, service] of Object.entries(SERVICE_KEYWORDS)) {
+    if (msg.includes(kw) && !lead.serviceNeeded) {
+      lead.serviceNeeded = service;
+      break;
+    }
+  }
+
+  // Business stage
+  for (const [kw, stage] of Object.entries(STAGE_KEYWORDS)) {
+    if (msg.includes(kw) && !lead.businessStage) {
+      lead.businessStage = stage;
+      break;
+    }
+  }
+
+  // Timeline
+  for (const [kw, timeline] of Object.entries(TIMELINE_KEYWORDS)) {
+    if (msg.includes(kw) && !lead.timeline) {
+      lead.timeline = timeline;
+      break;
+    }
+  }
+
+  // Mark detailsCollected if name + targetCountry are now present
+  if (lead.name && lead.targetCountry) {
+    activeState.detailsCollected = true;
+  }
+
+  session.leadData = lead;
 }
 
 // ─────────────────────────────────────────────
 // INTENT INTERPRETER
+// Converts raw user messages into structured intents.
+// This is the "semantic understanding" layer before Claude sees the message.
 // ─────────────────────────────────────────────
-function interpretUserInput(msg, menuState) {
-  const trimmed = msg.trim();
-  const lower   = trimmed.toLowerCase();
+function interpretUserInput(rawMsg, activeState) {
+  const msg     = rawMsg.trim();
+  const lower   = msg.toLowerCase();
+  const result  = {
+    menuNumber:     null,    // If user selected a numbered option
+    yesNo:          null,    // 'yes' | 'no' | null
+    isCorrection:   false,   // User is correcting/modifying previous reply
+    isNegation:     false,   // User is cancelling/negating something
+    isConfirmation: false,   // User is confirming something
+    isReference:    false,   // User refers to a previously shown item
+    referencedIndex: null,   // Which item they referenced (0-based)
+    resolvedText:   null,    // If we resolved a reference, the actual option text
+    topicShift:     false,   // User switched topic
+    enrichedMessage: null,   // Optional enriched message to pass to Claude instead
+  };
 
-  // Pure number → menu select
-  const numMatch = trimmed.match(/^(\d+)\.?$/);
-  if (numMatch) {
-    return { type: 'MENU_SELECT', menuNumber: parseInt(numMatch[1], 10) };
+  // ── Numeric selection ──────────────────────────────────────────────
+  const numericMatch = msg.match(/^(\d+)\.?$/);
+  if (numericMatch) {
+    result.menuNumber = parseInt(numericMatch[1], 10);
+    return result;
   }
 
-  // "option N" / "choice N"
-  const optMatch = lower.match(/(?:option|choice|number|#)\s*(\d+)/);
-  if (optMatch) {
-    return { type: 'MENU_SELECT', menuNumber: parseInt(optMatch[1], 10) };
+  // Also handle "option 3", "number 2", "#4" etc.
+  const optionMatch = lower.match(/(?:option|choice|number|#)\s*(\d+)/);
+  if (optionMatch) {
+    result.menuNumber = parseInt(optionMatch[1], 10);
+    return result;
   }
 
-  // Ordinals
+  // ── Ordinal references ("the second one", "first option") ─────────
   const ORDINALS = { first: 1, second: 2, third: 3, fourth: 4, fifth: 5, sixth: 6, last: -1 };
   for (const [word, idx] of Object.entries(ORDINALS)) {
     if (lower.includes(word)) {
-      const maxOpts = menuState?.validOptions?.length || 4;
-      const actual  = idx === -1 ? maxOpts : idx;
-      return { type: 'MENU_SELECT', menuNumber: actual };
+      result.isReference  = true;
+      // Resolve "last" against the menu length
+      const actual = idx === -1 ? (activeState.expectedMenuMax || 1) : idx;
+      result.referencedIndex = actual;
+      result.menuNumber      = actual;
+
+      // Enrich the message for Claude with the resolved option text
+      if (activeState.menuOptions && activeState.menuOptions[actual - 1]) {
+        result.resolvedText     = activeState.menuOptions[actual - 1];
+        result.enrichedMessage  = `[User referenced "${result.resolvedText}" (option ${actual}) from the previous list]`;
+      } else {
+        result.enrichedMessage = `[User selected option ${actual} from the previous list]`;
+      }
+      return result;
     }
   }
 
-  // Corrections
-  const CORRECTIONS = ['actually','wait','no wait','forget that','sorry','i meant','i mean','scratch that','never mind','go back'];
-  if (CORRECTIONS.some(w => lower.includes(w))) {
-    return { type: 'CORRECTION' };
+  // ── "That one" / "this one" / "the previous one" ──────────────────
+  if (/\b(that one|this one|the previous one|the other one|the last one)\b/.test(lower)) {
+    result.isReference = true;
+    // Default to last mentioned option or option 1 if ambiguous
+    result.enrichedMessage = `[User said "${msg}" — likely referring to an option from the previous bot message: "${activeState.lastBotMessage.substring(0, 300)}". Interpret in context and confirm which option they mean.]`;
+    return result;
   }
 
-  // Yes / No
-  if (/^(yes|yeah|yep|yup|sure|ok|okay|correct|right|absolutely|definitely)$/i.test(lower))
-    return { type: 'YES_NO', yesNo: 'yes' };
-  if (/^(no|nope|nah|not|false|never|none)$/i.test(lower))
-    return { type: 'YES_NO', yesNo: 'no' };
+  // ── Corrections ("actually", "wait", "forget that", "I meant") ────
+  if (/\b(actually|wait|no wait|forget that|sorry|i meant|i mean|scratch that|not that|not this|never mind|nevermind|i changed my mind|go back)\b/.test(lower)) {
+    result.isCorrection    = true;
+    result.enrichedMessage = `[USER CORRECTION: "${msg}". The user is modifying or retracting their previous intent. Acknowledge the correction, update your understanding, and re-ask or re-present the relevant part of the conversation naturally.]`;
+    return result;
+  }
 
-  return { type: 'TEXT' };
+  // ── Negations ─────────────────────────────────────────────────────
+  if (/^(no|nope|nah|nope|not really|not yet|none|nothing)$/i.test(lower)) {
+    result.isNegation = true;
+    result.yesNo      = 'no';
+    return result;
+  }
+
+  // ── Confirmations ─────────────────────────────────────────────────
+  if (/^(yes|yeah|yep|sure|ok|okay|correct|right|go ahead|proceed|yup|absolutely|definitely|of course)$/i.test(lower)) {
+    result.isConfirmation = true;
+    result.yesNo          = 'yes';
+    return result;
+  }
+
+  // ── Topic shift detection ─────────────────────────────────────────
+  // Detect if user asks about something completely off-topic from the current flow
+  const TOPIC_KEYWORDS = ['what about', 'can you tell me', 'how about', 'different question', 'another thing', 'by the way', 'quick question'];
+  if (TOPIC_KEYWORDS.some(k => lower.includes(k))) {
+    result.topicShift = true;
+  }
+
+  return result;
+}
+
+// ─────────────────────────────────────────────
+// SHORT-TERM MEMORY UPDATER
+// Maintains a rolling window of enriched turn summaries.
+// ─────────────────────────────────────────────
+function pushToShortTermMemory(activeState, role, content, interpretation = null) {
+  const entry = {
+    role,
+    content: content.substring(0, 500),  // Trim very long messages
+    ts: new Date().toISOString(),
+  };
+  if (interpretation) {
+    if (interpretation.menuNumber)  entry.selectedOption = interpretation.menuNumber;
+    if (interpretation.isCorrection) entry.wasCorrection = true;
+    if (interpretation.yesNo)       entry.yesNo          = interpretation.yesNo;
+  }
+
+  activeState.shortTermMemory.push(entry);
+  // Keep only last 10 turns in short-term memory
+  if (activeState.shortTermMemory.length > 10) {
+    activeState.shortTermMemory = activeState.shortTermMemory.slice(-10);
+  }
+}
+
+function updateRecentTopics(activeState, topic) {
+  if (!topic) return;
+  activeState.recentTopics = [topic, ...activeState.recentTopics.filter(t => t !== topic)].slice(0, 5);
 }
 
 // ─────────────────────────────────────────────
 // SYSTEM PROMPT BUILDER
+// Assembles the full context-rich system prompt for each Claude call.
+// This is where all memory is injected.
 // ─────────────────────────────────────────────
-const BASE_SYSTEM_PROMPT = `You are the Compliance Advisor for Comply Globally — a professional business expansion consultancy.
+function buildSystemPrompt(session, activeState, userMessage, interpretation) {
+  const relevantKB = getRelevantKnowledge(session, userMessage);
+  const lead       = session.leadData;
 
-YOUR IDENTITY:
-- You are a *Compliance Advisor*, not an "AI" or "chatbot" — never describe or introduce yourself that way
-- You represent the Comply Globally expert team
-- Warm, professional, knowledgeable — like talking to a senior consultant on WhatsApp
+  // ── Build known customer profile string ──────────────────────────
+  const knownFields = [];
+  if (lead.name)           knownFields.push(`Name: ${lead.name}`);
+  if (lead.email)          knownFields.push(`Email: ${lead.email}`);
+  if (lead.companyName)    knownFields.push(`Company: ${lead.companyName}`);
+  if (lead.currentCountry) knownFields.push(`Based in: ${lead.currentCountry}`);
+  if (lead.targetCountry)  knownFields.push(`Target jurisdiction: ${lead.targetCountry}`);
+  if (lead.serviceNeeded)  knownFields.push(`Service requested: ${lead.serviceNeeded}`);
+  if (lead.businessStage)  knownFields.push(`Business stage: ${lead.businessStage}`);
+  if (lead.timeline)       knownFields.push(`Timeline: ${lead.timeline}`);
+  if (lead.additionalInfo) knownFields.push(`Additional context: ${lead.additionalInfo}`);
 
-RETURNING USERS — CRITICAL:
-- If the CUSTOMER PROFILE below has a name, this is a RETURNING user — do NOT re-introduce yourself
-- Do NOT say "Hi there", "Welcome", or give an intro paragraph to returning users
-- Do NOT list bullet points of what you can help with — just respond to what they said
-- If they say "hello" or "hi", just greet them by name and ask what they need today
-- Example: "Hey Udhay! 👋 What can I help you with today?"
+  let systemPrompt = BASE_SYSTEM_PROMPT + relevantKB;
 
-RESPONSE RULES:
-- Keep answers under 250 words (brevity = speed)
-- Use *bold* for key terms, line breaks for readability
-- Always end with a clear next step or question
-- Use "we"/"our team" where appropriate
-- ⛔ ABSOLUTELY FORBIDDEN: do NOT write "Quick topics:", "Quick reply:", or any numbered list of options
-- ⛔ ABSOLUTELY FORBIDDEN: do NOT end with 1️⃣ 2️⃣ 3️⃣ 4️⃣ emoji-number lines — the system adds these automatically
-- ⛔ ABSOLUTELY FORBIDDEN: do NOT introduce yourself, list your capabilities, or give a welcome speech to returning users
-
-LEAD COLLECTION (natural, non-invasive):
-Collect: full name, email, current country, target jurisdiction, service needed, business stage, timeline.
-NEVER ask for info already known from the profile below.
-
-MENU HANDLING:
-- When the user sends a number (1, 2, 3, 4), you WILL be told exactly which option they selected in the [MENU SELECTION] tag
-- Answer that topic thoroughly — do not ask "what did you mean by 2?"
-
-KNOWLEDGE BASE:
-- Cite specific facts from the injected KB section
-- For custom quotes: direct to sales@complyglobally.com or +91 99999 81613
-`;
-
-function buildSystemPrompt(session, activeState, menuState) {
-  const lead = session.leadData || {};
-  const isReturning = !!(lead.name || lead.targetCountry || lead.currentCountry);
-
-  const leadSummary = [
-    lead.name          ? `Name: ${lead.name}`                : null,
-    lead.email         ? `Email: ${lead.email}`              : null,
-    lead.companyName   ? `Company: ${lead.companyName}`      : null,
-    lead.currentCountry? `Based in: ${lead.currentCountry}`  : null,
-    lead.targetCountry ? `Target: ${lead.targetCountry}`     : null,
-    lead.serviceNeeded ? `Service: ${lead.serviceNeeded}`    : null,
-    lead.businessStage ? `Stage: ${lead.businessStage}`      : null,
-    lead.timeline      ? `Timeline: ${lead.timeline}`        : null,
-  ].filter(Boolean).join(' | ');
-
-  let prompt = BASE_SYSTEM_PROMPT;
-
-  if (isReturning) {
-    prompt += `\n\n[USER STATUS: RETURNING USER — do NOT re-introduce yourself or list your capabilities. Greet by name if they say hi, then ask what they need.]`;
-  } else {
-    prompt += `\n\n[USER STATUS: NEW USER — ask for their name and which country they want to expand into.]`;
+  // ── Customer profile ─────────────────────────────────────────────
+  if (knownFields.length > 0) {
+    systemPrompt += `\n\n[CUSTOMER PROFILE — already known, do NOT ask again:\n${knownFields.join('\n')}]`;
+    if (session.history.length > 2 && lead.name) {
+      systemPrompt += `\n[Address ${lead.name} by name where it feels natural.]`;
+    }
   }
 
-  if (leadSummary) {
-    prompt += `\n\n[CUSTOMER PROFILE — ALREADY KNOWN (do NOT ask again):\n${leadSummary}]`;
+  // ── Details collection status (critical for SUGGEST_TOPICS) ──────
+  systemPrompt += `\n\n[DETAILS STATUS:
+User name provided: ${!!lead.name}
+User target country provided: ${!!lead.targetCountry}
+Can show 4-option menu: ${activeState.detailsCollected}
+${activeState.detailsCollected ? '✅ Show SUGGEST_TOPICS with 4 relevant options if user asks a question' : '❌ Do NOT show options yet — still gathering basic details'}
+]`;
+
+  // ── Active conversational state ──────────────────────────────────
+  systemPrompt += `\n\n[ACTIVE FLOW STATE:
+Current flow: ${activeState.currentFlow}
+Current question/topic: ${activeState.currentQuestion || 'none'}
+Expected input type: ${activeState.expectedInputType}
+${activeState.expectedMenuMax ? `Menu was shown with ${activeState.expectedMenuMax} options` : ''}
+${activeState.menuOptions?.length ? `Menu options shown: ${activeState.menuOptions.map((o, i) => `${i + 1}. ${o.trim()}`).join(' | ')}` : ''}
+Retry count for current question: ${activeState.retryCount}
+Last bot message (last 400 chars): "${activeState.lastBotMessage.substring(0, 400)}"
+]`;
+
+  // ── Short-term memory ─────────────────────────────────────────────
+  if (activeState.shortTermMemory.length > 0) {
+    const memSummary = activeState.shortTermMemory.map(m =>
+      `  [${m.role === 'user' ? 'CUSTOMER' : 'BOT'}${m.wasCorrection ? ' (CORRECTION)' : ''}${m.selectedOption ? ` (selected #${m.selectedOption})` : ''}]: ${m.content.substring(0, 200)}`
+    ).join('\n');
+    systemPrompt += `\n\n[SHORT-TERM MEMORY (last ${activeState.shortTermMemory.length} turns):\n${memSummary}\n]`;
   }
 
-  if (menuState?.validOptions?.length > 0) {
-    const optList = menuState.validOptions.map((o, i) => `${i + 1}. ${o}`).join('\n');
-    prompt += `\n\n[LAST QUICK-REPLY MENU SHOWN TO USER:\n${optList}\nIf user sends a number 1-${menuState.validOptions.length}, treat it as selecting the matching option above.]`;
+  // ── Recent topics discussed ───────────────────────────────────────
+  if (activeState.recentTopics.length > 0) {
+    systemPrompt += `\n\n[TOPICS DISCUSSED SO FAR: ${activeState.recentTopics.join(', ')}]`;
   }
 
-  if (activeState?.currentFlow) {
-    prompt += `\n\n[FLOW: ${activeState.currentFlow} | Stage: ${activeState.conversationStage}]`;
+  // ── Unresolved questions ──────────────────────────────────────────
+  if (activeState.unresolvedQuestions.length > 0) {
+    systemPrompt += `\n\n[UNRESOLVED QUESTIONS you asked but user hasn't answered: ${activeState.unresolvedQuestions.join(' | ')}]`;
   }
 
-  return prompt;
+  // ── Pending thread from topic switch ─────────────────────────────
+  if (activeState.pendingThread) {
+    systemPrompt += `\n\n[PAUSED THREAD: User earlier switched topics. The paused thread was: "${activeState.pendingThread}". You may return to it naturally if the current topic is resolved.]`;
+  }
+
+  // ── Interpretation context ─────────────────────────────────────────
+  if (interpretation) {
+    const hints = [];
+    if (interpretation.isCorrection)     hints.push('User is CORRECTING a previous reply — acknowledge and adapt.');
+    if (interpretation.isReference)      hints.push(`User REFERENCED a previous option (resolved index: ${interpretation.referencedIndex}).`);
+    if (interpretation.topicShift)       hints.push('User appears to be SWITCHING TOPIC — follow them.');
+    if (interpretation.yesNo)            hints.push(`User replied with a clear ${interpretation.yesNo.toUpperCase()}.`);
+    if (hints.length > 0) {
+      systemPrompt += `\n\n[INTERPRETATION HINTS:\n${hints.map(h => '• ' + h).join('\n')}\n]`;
+    }
+  }
+
+  // ── Lead status ───────────────────────────────────────────────────
+  if (session.leadCollected) {
+    systemPrompt += '\n\n[LEAD SUBMITTED: Our team will contact this customer. Reassure them and answer further questions freely.]';
+  }
+
+  return systemPrompt;
 }
 
 // ─────────────────────────────────────────────
-// CLAUDE API CALLER
-// ⚡ SPEED: max_tokens=350, last 10 turns only, single KB chunk
+// HUMAN HANDOFF DETECTION
 // ─────────────────────────────────────────────
-async function getClaudeReply(systemPrompt, messages, userMessage) {
-  // ⚡ Only last 10 turns to reduce payload size
-  const trimmedHistory = messages.slice(-10);
+const HUMAN_TRIGGERS = [
+  'human','agent','real person','speak to someone','talk to someone',
+  'call me','speak with','talk with','connect me','senior','manager',
+  'expert','representative','live person','actual person','not a bot',
+  'talk to a person','speak to a person','need a person','need human',
+  'customer support','support team','your team','contact team',
+  'connect call','connect an agent','connect advisor',
+  'talk to advisor','speak advisor','speak to advisor',
+  'connect to a human','want a human','prefer human',
+];
 
-  // ⚡ Only inject 1 KB chunk (most relevant)
-  const relevantKB = retrieveRelevantKB(userMessage, 1);
-  if (relevantKB && !relevantKB.includes('PASTE_YOUR_KNOWLEDGE_BASE_HERE')) {
-    systemPrompt += `\n\n[RELEVANT KNOWLEDGE BASE:\n${relevantKB}]`;
+function wantsHuman(msg) {
+  const lower = msg.toLowerCase();
+  return HUMAN_TRIGGERS.some(t => lower.includes(t));
+}
+
+// ─────────────────────────────────────────────
+// TOPIC EXTRACTOR — Infers the topic from a message for memory
+// ─────────────────────────────────────────────
+function inferTopic(msg) {
+  const lower = msg.toLowerCase();
+  if (/banking|bank account/.test(lower))         return 'Banking Setup';
+  if (/incorporat|register|company/.test(lower))  return 'Company Incorporation';
+  if (/tax|gst|vat|compliance/.test(lower))       return 'Tax Compliance';
+  if (/fema|odi|remittance/.test(lower))          return 'FEMA/ODI';
+  if (/residency|visa|immigration/.test(lower))   return 'Residency';
+  if (/cost|fee|price|charges/.test(lower))       return 'Pricing';
+  if (/timeline|how long|duration/.test(lower))   return 'Timeline';
+  if (/document|required|need/.test(lower))       return 'Documentation';
+  return null;
+}
+
+// ─────────────────────────────────────────────
+// SUGGEST TOPICS HELPERS
+// ─────────────────────────────────────────────
+function stripSuggestTopics(text) {
+  return text.replace(/SUGGEST_TOPICS:\[.*?\]/gs, '').trim();
+}
+
+function formatForWhatsApp(text) {
+  const match     = text.match(/SUGGEST_TOPICS:\[(.*?)\]/s);
+  const cleanText = stripSuggestTopics(text);
+  if (!match) return cleanText;
+  try {
+    const topics   = JSON.parse('[' + match[1] + ']');
+    const numbered = topics.map((t, i) => `${i + 1}️⃣ ${t}`).join('\n');
+    return `${cleanText}\n\n*Quick topics:*\n${numbered}`;
+  } catch {
+    return cleanText;
   }
+}
 
-  const payload = {
-    model:      'claude-sonnet-4-20250514',
-    max_tokens: 350,   // ⚡ Reduced from 600 — faster responses
-    system:     systemPrompt,
-    messages:   trimmedHistory,
-  };
+// ─────────────────────────────────────────────
+// CLAUDE API — Main conversation call
+// ─────────────────────────────────────────────
+async function getClaudeReply(session, activeState, userMessage, interpretation = null) {
+  // Add the user message to history
+  session.history.push({ role: 'user', content: userMessage });
+
+  // Use last 20 messages to stay within token limits while preserving deep context
+  const trimmedHistory = session.history.slice(-20);
+  const systemPrompt   = buildSystemPrompt(session, activeState, userMessage, interpretation);
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -2658,485 +2769,293 @@ async function getClaudeReply(systemPrompt, messages, userMessage) {
         'x-api-key':         ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        model:      'claude-sonnet-4-20250514',
+        max_tokens: 600,           // Slightly higher for rich responses
+        system:     systemPrompt,
+        messages:   trimmedHistory,
+      }),
     });
 
     const data = await response.json();
     if (!response.ok) {
-      console.error('❌  Claude error:', data);
-      return 'I apologize for the technical difficulty. Please try again or contact sales@complyglobally.com.';
+      console.error('❌  Claude API error:', data);
+      return 'I apologise for the inconvenience. Please try again in a moment, or contact us at sales@complyglobally.com.';
     }
 
-    return (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim()
-      || 'I was unable to generate a response. Please try again.';
+    const reply = (data.content || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('\n')
+      .trim();
+
+    if (!reply) return 'I was unable to retrieve a response. Please try again or contact our team directly.';
+
+    // Store clean reply (without SUGGEST_TOPICS metadata) in history
+    session.history.push({ role: 'assistant', content: stripSuggestTopics(reply) });
+
+    // Trim history if it grows very long (keep last 30 turns)
+    if (session.history.length > 30) session.history = session.history.slice(-30);
+
+    return reply;
 
   } catch (err) {
     console.error('❌  Claude request failed:', err.message);
-    return 'I am experiencing connectivity issues. Please try again shortly.';
+    return 'I am experiencing a connectivity issue. Please try again shortly, or reach us at sales@complyglobally.com.';
+  }
+}
+
+async function generateSummary(history) {
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model:      'claude-sonnet-4-20250514',
+        max_tokens: 200,
+        messages: [{
+          role:    'user',
+          content: `Summarise this WhatsApp conversation in 2–3 professional sentences, focusing on what the customer needs:\n\n${
+            history.slice(-10).map(m => `${m.role === 'user' ? 'Customer' : 'Advisor'}: ${m.content}`).join('\n')
+          }`,
+        }],
+      }),
+    });
+    const data = await res.json();
+    return data.content?.[0]?.text || '';
+  } catch {
+    return '';
   }
 }
 
 // ─────────────────────────────────────────────
 // WHATSAPP SENDER
 // ─────────────────────────────────────────────
-function parsePhone(raw) {
-  const d = String(raw).replace(/\D/g, '');
-  if (/^91[6-9]\d{9}$/.test(d))   return { countryCode: '+91',  phoneNumber: d.slice(2) };
-  if (/^1[2-9]\d{9}$/.test(d))    return { countryCode: '+1',   phoneNumber: d.slice(1) };
-  if (/^971\d{9}$/.test(d))        return { countryCode: '+971', phoneNumber: d.slice(3) };
-  if (/^44[1-9]\d{8,9}$/.test(d)) return { countryCode: '+44',  phoneNumber: d.slice(2) };
-  if (/^[6-9]\d{9}$/.test(d))     return { countryCode: '+91',  phoneNumber: d };
-  console.warn(`⚠️  Unknown phone format: ${raw}`);
-  return { countryCode: '+91', phoneNumber: d };
+function parsePhone(rawPhone) {
+  const digits = String(rawPhone).replace(/\D/g, '');
+  if (/^91[6-9]\d{9}$/.test(digits))  return { countryCode: '+91',  phoneNumber: digits.slice(2) };
+  if (/^1[2-9]\d{9}$/.test(digits))   return { countryCode: '+1',   phoneNumber: digits.slice(1) };
+  if (/^971\d{9}$/.test(digits))       return { countryCode: '+971', phoneNumber: digits.slice(3) };
+  if (/^44[1-9]\d{8,9}$/.test(digits)) return { countryCode: '+44',  phoneNumber: digits.slice(2) };
+  if (/^65\d{8}$/.test(digits))        return { countryCode: '+65',  phoneNumber: digits.slice(2) };
+  if (/^[6-9]\d{9}$/.test(digits))    return { countryCode: '+91',  phoneNumber: digits };
+  if (/^[2-9]\d{9}$/.test(digits))    return { countryCode: '+1',   phoneNumber: digits };
+  console.warn(`⚠️  Unknown phone format: ${rawPhone}`);
+  return { countryCode: '+91', phoneNumber: digits };
 }
 
-async function sendWhatsApp(phone, text) {
-  console.log(`📤  [${phone}] ${text.substring(0, 80)}…`);
-  if (!INTERAKT_API_KEY) { console.warn('⚠️  INTERAKT_API_KEY missing'); return; }
-  const { countryCode, phoneNumber } = parsePhone(phone);
-  try {
-    await fetch('https://api.interakt.ai/v1/public/message/', {
-      method: 'POST',
-      headers: { Authorization: `Basic ${INTERAKT_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ countryCode, phoneNumber, type: 'Text', data: { message: text } }),
-    });
-    console.log('✅  Sent');
-  } catch (err) {
-    console.error('❌  Send error:', err.message);
+async function sendWhatsAppMessage(phone, text) {
+  const cleanText = formatForWhatsApp(text);
+  console.log(`📤  Sending to ${phone}: ${cleanText.substring(0, 120)}…`);
+
+  if (!INTERAKT_API_KEY) {
+    console.warn('⚠️  INTERAKT_API_KEY not set — message NOT sent');
+    return;
   }
-}
 
-// ─────────────────────────────────────────────
-// HUMAN HANDOFF
-// ─────────────────────────────────────────────
-function wantsHuman(msg) {
-  return ['human','agent','person','representative','speak to','talk to','connect me','call'].some(t => msg.toLowerCase().includes(t));
-}
-
-async function sendHandoffEmail(phone, leadData, history, additionalInfo) {
-  if (!RESEND_API_KEY || !NOTIFY_EMAIL) return;
-
-  const displayPhone = phone.startsWith('91') ? `+${phone}` : `+${phone}`;
-  const val = (v) => v || '<span style="color:#999">—</span>';
-
-  // Last 8 turns of conversation, nicely formatted
-  const chatRows = history.slice(-8).map(m => {
-    const isBot = m.role === 'assistant';
-    // Strip internal system tags from display
-    const content = m.content
-      .replace(/\[MENU SELECTION:.*?\]/g, '')
-      .replace(/\[CUSTOMER PROFILE.*?\]/gs, '')
-      .replace(/GREETING_RECEIVED/g, '(opened chat)')
-      .trim();
-    return `
-      <tr>
-        <td style="padding:10px 14px;border-bottom:1px solid #f0f0f0;vertical-align:top;width:32px">
-          <span style="font-size:18px">${isBot ? '🤖' : '👤'}</span>
-        </td>
-        <td style="padding:10px 14px;border-bottom:1px solid #f0f0f0;font-size:13px;color:#333;line-height:1.6">
-          <strong style="color:${isBot ? '#6C47FF' : '#1a1a1a'}">${isBot ? 'Advisor' : 'Customer'}:</strong><br>
-          ${content.replace(/\n/g, '<br>')}
-        </td>
-      </tr>`;
-  }).join('');
-
-  const resumeUrl = `${BASE_URL}/admin/resume?phone=${phone}`;
-
-  const html = `<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f4f6f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
-  <div style="max-width:640px;margin:32px auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08)">
-
-    <!-- Header -->
-    <div style="background:linear-gradient(135deg,#6C47FF 0%,#4f35c2 100%);padding:28px 32px;text-align:center">
-      <div style="font-size:32px;margin-bottom:8px">🌍</div>
-      <h1 style="margin:0;color:#fff;font-size:20px;font-weight:700">Comply Globally — Human Handoff Alert</h1>
-      <p style="margin:8px 0 0;color:rgba(255,255,255,0.8);font-size:13px">
-        ⏱️ Bot is paused. It will auto-resume after 2 hours if no action is taken.
-      </p>
-    </div>
-
-    <!-- Customer Profile -->
-    <div style="padding:28px 32px">
-      <h2 style="margin:0 0 16px;font-size:15px;font-weight:700;color:#1a1a1a;text-transform:uppercase;letter-spacing:0.5px">
-        Customer Profile
-      </h2>
-      <table style="width:100%;border-collapse:collapse;border:1px solid #e8e8e8;border-radius:8px;overflow:hidden">
-        <tr style="background:#fafafa">
-          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;width:38%;border-bottom:1px solid #e8e8e8">Name</td>
-          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.name)}</td>
-        </tr>
-        <tr>
-          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Email</td>
-          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.email)}</td>
-        </tr>
-        <tr style="background:#fafafa">
-          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Company</td>
-          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.companyName)}</td>
-        </tr>
-        <tr>
-          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Phone</td>
-          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${displayPhone}</td>
-        </tr>
-        <tr style="background:#fafafa">
-          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Based In</td>
-          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.currentCountry)}</td>
-        </tr>
-        <tr>
-          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Target Jurisdiction</td>
-          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.targetCountry)}</td>
-        </tr>
-        <tr style="background:#fafafa">
-          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Service Needed</td>
-          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.serviceNeeded)}</td>
-        </tr>
-        <tr>
-          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Business Stage</td>
-          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.businessStage)}</td>
-        </tr>
-        <tr style="background:#fafafa">
-          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #e8e8e8">Timeline</td>
-          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a;border-bottom:1px solid #e8e8e8">${val(leadData.timeline)}</td>
-        </tr>
-        <tr>
-          <td style="padding:10px 16px;font-size:13px;font-weight:600;color:#555">Additional Info</td>
-          <td style="padding:10px 16px;font-size:13px;color:#1a1a1a">${additionalInfo || '<span style="color:#999">None provided</span>'}</td>
-        </tr>
-      </table>
-    </div>
-
-    <!-- Recent Conversation -->
-    <div style="padding:0 32px 28px">
-      <h2 style="margin:0 0 16px;font-size:15px;font-weight:700;color:#1a1a1a;text-transform:uppercase;letter-spacing:0.5px">
-        Recent Conversation
-      </h2>
-      <table style="width:100%;border-collapse:collapse;border:1px solid #e8e8e8;border-radius:8px;overflow:hidden">
-        ${chatRows}
-      </table>
-    </div>
-
-    <!-- Action Buttons -->
-    <div style="padding:0 32px 32px;display:flex;gap:12px">
-      <a href="https://app.interakt.ai" style="display:inline-block;background:#25D366;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-size:14px;font-weight:600;margin-right:12px">
-        Open Interakt →
-      </a>
-      <a href="${resumeUrl}" style="display:inline-block;background:#6C47FF;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-size:14px;font-weight:600">
-        ✅ Resume Bot for ${displayPhone}
-      </a>
-    </div>
-
-    <!-- Footer -->
-    <div style="background:#f9f9f9;border-top:1px solid #eee;padding:16px 32px;text-align:center">
-      <p style="margin:0;font-size:12px;color:#999">
-        Bot auto-resumes after 2h regardless. · Comply Globally · sales@complyglobally.com
-      </p>
-    </div>
-
-  </div>
-</body>
-</html>`;
+  const { countryCode, phoneNumber } = parsePhone(phone);
 
   try {
-    const r = await fetch('https://api.resend.com/emails', {
+    const res = await fetch('https://api.interakt.ai/v1/public/message/', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      headers: {
+        Authorization:  `Basic ${INTERAKT_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
       body: JSON.stringify({
-        from:    FROM_EMAIL,
-        to:      [NOTIFY_EMAIL],
-        subject: `🚨 Human Handoff Requested — ${leadData.name || displayPhone}`,
-        html,
+        countryCode,
+        phoneNumber,
+        callbackData: 'bot_reply',
+        type:          'Text',
+        data:          { message: cleanText },
       }),
     });
-    const result = await r.json();
-    if (!r.ok) {
-      console.error('❌  Handoff email failed:', JSON.stringify(result));
+    if (!res.ok) {
+      const errBody = await res.text();
+      console.error(`❌  Interakt error: ${res.status}`, errBody);
     } else {
-      console.log(`✅  Handoff email sent → ${NOTIFY_EMAIL} (id: ${result.id})`);
+      console.log('✅  WhatsApp message sent');
     }
   } catch (err) {
-    console.error('❌  Handoff email error:', err.message);
+    console.error('❌  Interakt send error:', err.message);
   }
 }
 
 // ─────────────────────────────────────────────
-// LEAD FINALIZATION
+// LEAD COMPLETION
 // ─────────────────────────────────────────────
-function isLeadComplete(lead) {
+function isLeadCoreComplete(lead) {
   return !!(lead.name && lead.currentCountry && lead.targetCountry && lead.serviceNeeded);
 }
 
 async function finalizeLead(session) {
   session.leadCollected = true;
-  console.log(`🎯  Lead finalized: ${session.leadData.name}`);
-  if (leadsCol) await leadsCol.insertOne({ ...session.leadData, completedAt: new Date() });
+  console.log(`🎯  Lead finalised for ${session.phone}`);
+  const summary = await generateSummary(session.history);
+  try {
+    await Promise.allSettled([
+      appendToSheet(session.leadData, summary),
+      saveLead({ ...session.leadData, summary, completedAt: new Date() }),
+      sendLeadCapturedEmail(session.leadData),
+    ]);
+  } catch (err) {
+    console.error('❌  Lead finalisation error:', err.message);
+  }
 }
 
 // ─────────────────────────────────────────────
-// WEBHOOK — MAIN BOT LOGIC
+// GOOGLE SHEETS
 // ─────────────────────────────────────────────
-app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // ⚡ Respond immediately before any async work
-
-  try {
-    const body = req.body;
-    if (body.type !== 'message_received') return;
-
-    const phone  = (body.data?.customer?.phone_number || '').replace(/\D/g, '');
-    const rawMsg = (body.data?.message?.message || '').trim();
-    if (!phone || !rawMsg) return;
-
-    console.log(`\n📩  [${phone}] "${rawMsg}"`);
-
-    // ⚡ Load all state in parallel
-    const [session, activeState, menuState] = await Promise.all([
-      getSession(phone),
-      getActiveState(phone),
-      getMenuState(phone),
-    ]);
-
-    // ── NEW USER GREETING ─────────────────────────────────────────
-    // Hardcoded — does NOT go through Claude, does NOT get a footer.
-    // Quick topics only appear after name + target country are known.
-    if (session.history.length === 0) {
-      const greeting =
-        `Welcome to *Comply Globally!* 🌍\n\n` +
-        `I'm your *Compliance Advisor* — here to help you expand your business internationally across 47+ jurisdictions.\n\n` +
-        `I can help with company incorporation, banking setup, tax compliance, FEMA/ODI advisory, and residency solutions.\n\n` +
-        `To get started — what's your *name*, and which *country are you looking to expand into*?`;
-
-      await sendWhatsApp(phone, greeting);
-      session.history.push({ role: 'user',      content: 'GREETING_RECEIVED' });
-      session.history.push({ role: 'assistant', content: greeting });
-      activeState.currentFlow       = 'ONBOARDING';
-      activeState.conversationStage = 'NAME';
-      menuState.validOptions = [];
-      menuState.optionTopics = [];
-
-      await Promise.all([saveSession(session), saveActiveState(activeState), saveMenuState(menuState)]);
-      return;
-    }
-
-    // ── AUTO-RESUME FROM HUMAN MODE ───────────────────────────────
-    if (activeState.humanModeActive) {
-      const elapsed = Date.now() - new Date(activeState.humanModeSince || 0).getTime();
-      if (elapsed >= HUMAN_TIMEOUT_MS) {
-        activeState.humanModeActive = false;
-        activeState.humanModeSince  = null;
-        console.log(`⏰  Auto-resuming: ${phone}`);
-      } else {
-        console.log(`🧑  Human mode active — suppressed`);
-        return;
-      }
-    }
-
-    // ── INTERPRET INTENT ──────────────────────────────────────────
-    // If this user has no name/country yet, nuke any stale menu options
-    // from MongoDB so old sessions can't ghost-trigger menu selections
-    if (!session.leadData.name && !session.leadData.targetCountry && !session.leadData.currentCountry) {
-      menuState.validOptions = [];
-      menuState.optionTopics = [];
-    }
-
-    const intent = interpretUserInput(rawMsg, menuState);
-    console.log(`🧠  Intent: ${intent.type}`);
-
-    // ── HANDLE MENU SELECTION ─────────────────────────────────────
-    // Don't process menu picks during handoff flow
-    if (intent.type === 'MENU_SELECT' && !activeState.handoffStage && !activeState.handoffPending) {
-      const num     = intent.menuNumber;
-      const maxOpts = menuState.validOptions.length;
-
-      // Invalid selection (e.g. user sends 5 when only 4 options exist)
-      if (!maxOpts || num < 1 || num > maxOpts) {
-        const invalidMsg = maxOpts > 0
-          ? `That's not a valid option. Please choose *1 to ${maxOpts}* from the menu above. 👆`
-          : `I don't have an active menu right now. What would you like to know about?`;
-        await sendWhatsApp(phone, invalidMsg);
-        return;
-      }
-
-      // Valid selection — inject the chosen topic into the user message for Claude
-      const chosenTopic = menuState.validOptions[num - 1];
-      console.log(`✅  Menu selection: ${num} → "${chosenTopic}"`);
-
-      const enrichedMsg = `[MENU SELECTION: User chose option ${num} — "${chosenTopic}". Answer this topic thoroughly.]`;
-
-      session.history.push({ role: 'user', content: enrichedMsg });
-      const sysPrompt = buildSystemPrompt(session, activeState, menuState);
-      const rawReply  = await getClaudeReply(sysPrompt, session.history, chosenTopic);
-
-      // If user is selecting from a menu they already have name+target (menus only show after that)
-      // so always show topics on menu replies
-      const bank = detectTopicBank(session, chosenTopic);
-      const { footer, options } = buildQuickReplyFooter(bank);
-      const finalReply = stripClaudeGeneratedFooter(rawReply) + footer;
-
-      await sendWhatsApp(phone, finalReply);
-      session.history.push({ role: 'assistant', content: finalReply });
-
-      menuState.validOptions = options;
-      menuState.optionTopics = options;
-      menuState.menuShownAt  = new Date();
-
-      // ⚡ Parallel saves
-      await Promise.all([saveSession(session), saveActiveState(activeState), saveMenuState(menuState)]);
-      return;
-    }
-
-    // ── HUMAN HANDOFF — 2-STEP FLOW ──────────────────────────────
-    // IMPORTANT: Both steps return early — they NEVER reach the Claude
-    // reply block below. No topics. No Claude. Just clean hardcoded messages.
-    //
-    // activeState.handoffStage:
-    //   null             = not in handoff
-    //   'ASKED_ADDL_INFO'= asked for extra info, waiting for user reply
-    // ─────────────────────────────────────────────────────────────
-
-    // Step 2 — user replied to "any additional info?"
-    if (activeState.handoffStage === 'ASKED_ADDL_INFO') {
-      const isNo = /^(no|nope|nah|none|skip|nothing|not really|just connect|connect me)$/i.test(rawMsg.toLowerCase().trim());
-      const additionalInfo = isNo ? null : rawMsg;
-
-      const name = session.leadData.name ? `, ${session.leadData.name}` : '';
-      // Single clean confirmation — NO topics, NO Claude
-      const confirmMsg = `Got it${name}! Connecting you now. 🤝\n\nOur team will be in touch shortly.\n\n` +
-        `📧 sales@complyglobally.com\n` +
-        `📞 +1 (302) 214-1717  |  +91 99999 81613`;
-
-      session.history.push({ role: 'user',      content: rawMsg      });
-      session.history.push({ role: 'assistant', content: confirmMsg  });
-
-      activeState.handoffStage    = null;
-      activeState.handoffPending  = true;
-      activeState.humanModeActive = true;
-      activeState.humanModeSince  = new Date();
-
-      // Send confirm + email in parallel
-      await Promise.all([
-        sendWhatsApp(phone, confirmMsg),
-        sendHandoffEmail(phone, session.leadData, session.history, additionalInfo),
-      ]);
-
-      if (!session.leadCollected) await finalizeLead(session);
-      await Promise.all([saveSession(session), saveActiveState(activeState)]);
-      return; // ← hard stop, never reaches Claude or footer logic
-    }
-
-    // Step 1 — user asks for human for the first time
-    if (wantsHuman(rawMsg) && !activeState.handoffPending) {
-      console.log(`🙋  Human requested`);
-      activeState.handoffStage = 'ASKED_ADDL_INFO';
-
-      const name = session.leadData.name ? `, ${session.leadData.name}` : '';
-      // Single message — ask for extra info, give direct contacts — NO topics
-      const askMsg = `Sure${name}! I'm connecting you with one of our senior advisors right now. 🤝\n\n` +
-        `📧 sales@complyglobally.com\n` +
-        `📞 +1 (302) 214-1717  |  +91 99999 81613\n\n` +
-        `Is there any additional information you'd like to pass on to the advisor?\n` +
-        `_(e.g. team size, urgency, specific questions — or just say *No*)_`;
-
-      session.history.push({ role: 'user',      content: rawMsg  });
-      session.history.push({ role: 'assistant', content: askMsg  });
-
-      await sendWhatsApp(phone, askMsg);
-      await Promise.all([saveSession(session), saveActiveState(activeState)]);
-      return; // ← hard stop
-    }
-
-    // ── EXTRACT ENTITIES & UPDATE LEAD ────────────────────────────
-    const entities = extractEntities(rawMsg);
-    if (entities.email)   session.leadData.email = entities.email;
-    if (entities.country) {
-      if (/expand|move|setup|incorporate|register/.test(rawMsg.toLowerCase())) {
-        session.leadData.targetCountry = entities.country;
-      } else {
-        session.leadData.currentCountry = entities.country;
-      }
-    }
-    if (entities.service) session.leadData.serviceNeeded = entities.service;
-
-    // ── NAME EXTRACTION — tight rules, runs ONCE, then stage advances ──
-    // Only attempt when:
-    //   1. We are still in NAME stage (bot just asked "what's your name?")
-    //   2. No name is saved yet
-    //   3. The message is SHORT (≤6 words) — real name answers are short
-    //   4. The message doesn't look like a question or sentence
-    if (
-      activeState.conversationStage === 'NAME' &&
-      !session.leadData.name
-    ) {
-      const wordCount = rawMsg.trim().split(/\s+/).length;
-      const looksLikeName =
-        wordCount <= 4 &&                          // names are short
-        !/[?!]/.test(rawMsg) &&                    // not a question
-        !/\b(tell|about|expand|how|what|where|when|why|want|would|looking|help|can|i am|my name is)\b/i.test(rawMsg) && // not a sentence
-        /^[A-Za-z]/.test(rawMsg.trim());           // starts with a letter
-
-      if (looksLikeName) {
-        // Extract just the first 1-3 words as the name candidate
-        const candidate = rawMsg.trim().split(/\s+/).slice(0, 3).join(' ');
-        if (isValidName(candidate)) {
-          session.leadData.name = candidate;
-          console.log(`✅  Name saved: "${candidate}"`);
-        }
-      }
-
-      // Always advance past NAME stage after first user reply
-      // so we NEVER run name extraction on a second message
-      activeState.conversationStage = 'QA';
-      console.log(`📍  Stage → QA`);
-    }
-
-    // ── NORMAL CLAUDE REPLY ───────────────────────────────────────
-    session.history.push({ role: 'user', content: rawMsg });
-    const sysPrompt = buildSystemPrompt(session, activeState, menuState);
-    const rawReply  = await getClaudeReply(sysPrompt, session.history, rawMsg);
-    const cleanReply = stripClaudeGeneratedFooter(rawReply);
-
-    // Quick topics only when: name known + country known + NOT in any handoff stage
-    const hasName      = !!(session.leadData.name);
-    const hasTarget    = !!(session.leadData.targetCountry || session.leadData.currentCountry);
-    const inHandoff    = !!(activeState.handoffStage || activeState.handoffPending || activeState.humanModeActive);
-    const showTopics   = hasName && hasTarget && !inHandoff;
-
-    let finalReply;
-    if (showTopics) {
-      // We know who they are and where they want to go — show relevant topics
-      const bank = detectTopicBank(session, rawMsg);
-      const { footer, options } = buildQuickReplyFooter(bank);
-      finalReply = cleanReply + footer;
-      menuState.validOptions = options;
-      menuState.optionTopics = options;
-      menuState.menuShownAt  = new Date();
-    } else {
-      // Still onboarding — no topics yet, just the clean reply
-      finalReply = cleanReply;
-      menuState.validOptions = [];
-      menuState.optionTopics = [];
-    }
-
-    await sendWhatsApp(phone, finalReply);
-    session.history.push({ role: 'assistant', content: finalReply });
-
-    // menuState already updated correctly inside the if/else above — do NOT overwrite here
-
-    // Lead completion check
-    if (!session.leadCollected && isLeadComplete(session.leadData)) {
-      await finalizeLead(session);
-    }
-
-    activeState.lastInteractionAt = new Date();
-    activeState.messageCount++;
-
-    // ⚡ Parallel saves
-    await Promise.all([saveSession(session), saveActiveState(activeState), saveMenuState(menuState)]);
-    await logInteraction(phone, 'QA', { intent: intent.type });
-
-  } catch (err) {
-    console.error('❌  Webhook error:', err.message, err.stack);
+async function appendToSheet(leadData, conversationSummary) {
+  if (!GOOGLE_SHEET_ID || !GOOGLE_CREDENTIALS) {
+    console.warn('⚠️  Skipping Sheets — missing credentials');
+    return;
   }
-});
+  try {
+    const creds  = JSON.parse(GOOGLE_CREDENTIALS);
+    const auth   = new google.auth.GoogleAuth({ credentials: creds, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+    const sheets = google.sheets({ version: 'v4', auth });
+    const now    = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+
+    const HEADERS = [
+      'Timestamp','Name','Email','Company','Phone',
+      'Current Country','Target Country','Service Needed',
+      'Business Stage','Timeline','Additional Info','Conversation Summary',
+    ];
+    const row = [
+      now,
+      leadData.name           || '',
+      leadData.email          || '',
+      leadData.companyName    || '',
+      leadData.phone          || '',
+      leadData.currentCountry || '',
+      leadData.targetCountry  || '',
+      leadData.serviceNeeded  || '',
+      leadData.businessStage  || '',
+      leadData.timeline       || '',
+      leadData.additionalInfo || '',
+      conversationSummary     || '',
+    ];
+
+    const existing = await sheets.spreadsheets.values.get({ spreadsheetId: GOOGLE_SHEET_ID, range: 'Sheet1!A1:A1' });
+    if (!existing.data.values) {
+      await sheets.spreadsheets.values.append({ spreadsheetId: GOOGLE_SHEET_ID, range: 'Sheet1!A1', valueInputOption: 'RAW', requestBody: { values: [HEADERS] } });
+    }
+    await sheets.spreadsheets.values.append({ spreadsheetId: GOOGLE_SHEET_ID, range: 'Sheet1!A1', valueInputOption: 'RAW', requestBody: { values: [row] } });
+    console.log('✅  Lead appended to Google Sheet');
+  } catch (err) {
+    console.error('❌  Google Sheets error:', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// EMAIL HELPERS
+// ─────────────────────────────────────────────
+async function sendEmail({ subject, html }) {
+  if (!RESEND_API_KEY || !NOTIFY_EMAIL) {
+    console.warn('⚠️  Email skipped — missing RESEND_API_KEY or NOTIFY_EMAIL');
+    return { success: false };
+  }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: FROM_EMAIL, to: [NOTIFY_EMAIL], subject, html }),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) { console.error('❌  Resend error:', res.status, json); return { success: false }; }
+    console.log('✅  Email sent:', json.id || 'ok');
+    return { success: true, id: json.id };
+  } catch (err) {
+    console.error('❌  Email error:', err.message);
+    return { success: false };
+  }
+}
+
+async function sendHumanHandoffEmail(phone, leadData, history) {
+  const chatPreview = history.slice(-8)
+    .map(m => `${m.role === 'user' ? '👤 Customer' : '🤖 Advisor'}: ${m.content}`)
+    .join('\n\n');
+  const resumeUrl  = `${BASE_URL}/resume-bot/${phone}`;
+  const timeoutHrs = Math.round(HUMAN_TIMEOUT_MS / 3600000);
+
+  await sendEmail({
+    subject: `🚨 Human Handoff — ${leadData.name || phone}`,
+    html: `
+      <div style="font-family:sans-serif;max-width:620px;margin:0 auto">
+        <div style="background:#1a1a2e;color:white;padding:20px;border-radius:8px 8px 0 0">
+          <h2 style="margin:0">🌍 Comply Globally — Human Handoff Alert</h2>
+        </div>
+        <div style="background:#f9f9f9;padding:20px;border:1px solid #eee">
+          <div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin-bottom:16px">
+            ⏱️ <b>Bot is paused.</b> Auto-resumes after <b>${timeoutHrs} hours</b> of inactivity.
+          </div>
+          <h3>Customer Profile</h3>
+          <table style="width:100%;border-collapse:collapse">
+            ${[
+              ['Name',               leadData.name           || '—'],
+              ['Email',              leadData.email          || '—'],
+              ['Company',            leadData.companyName    || '—'],
+              ['Phone',              `+${phone}`],
+              ['Based In',           leadData.currentCountry || '—'],
+              ['Target Jurisdiction',leadData.targetCountry  || '—'],
+              ['Service Needed',     leadData.serviceNeeded  || '—'],
+              ['Business Stage',     leadData.businessStage  || '—'],
+              ['Timeline',           leadData.timeline       || '—'],
+              ['Additional Info',    leadData.additionalInfo || '—'],
+            ].map(([label, val]) => `
+              <tr>
+                <td style="padding:6px;color:#666;width:170px">${label}</td>
+                <td style="padding:6px"><b>${val}</b></td>
+              </tr>`).join('')}
+          </table>
+          <h3>Recent Conversation</h3>
+          <pre style="background:#fff;border:1px solid #ddd;padding:12px;border-radius:4px;white-space:pre-wrap;font-size:13px">${chatPreview}</pre>
+          <div style="margin-top:16px;display:flex;gap:10px;flex-wrap:wrap">
+            <a href="https://app.interakt.ai" style="display:inline-block;background:#1a1a2e;color:white;padding:10px 20px;border-radius:6px;text-decoration:none">Open Interakt →</a>
+            <a href="${resumeUrl}" style="display:inline-block;background:#166534;color:white;padding:10px 20px;border-radius:6px;text-decoration:none">✅ Resume Bot for +${phone}</a>
+          </div>
+          <p style="color:#aaa;font-size:11px;margin-top:16px">Bot auto-resumes after ${timeoutHrs}h.</p>
+        </div>
+      </div>`,
+  });
+}
+
+async function sendLeadCapturedEmail(leadData) {
+  await sendEmail({
+    subject: `✅ New Lead — ${leadData.name || leadData.phone}`,
+    html: `
+      <div style="font-family:sans-serif;max-width:620px;margin:0 auto">
+        <div style="background:#166534;color:white;padding:20px;border-radius:8px 8px 0 0">
+          <h2 style="margin:0">✅ New Lead — Comply Globally</h2>
+        </div>
+        <div style="background:#f9f9f9;padding:20px;border:1px solid #eee">
+          <table style="width:100%;border-collapse:collapse">
+            ${[
+              ['Name',               leadData.name           || '—'],
+              ['Email',              leadData.email          || '—'],
+              ['Company',            leadData.companyName    || '—'],
+              ['Phone',              `+${leadData.phone}`],
+              ['Based In',           leadData.currentCountry || '—'],
+              ['Target Jurisdiction',leadData.targetCountry  || '—'],
+              ['Service Needed',     leadData.serviceNeeded  || '—'],
+              ['Business Stage',     leadData.businessStage  || '—'],
+              ['Timeline',           leadData.timeline       || '—'],
+              ['Additional Info',    leadData.additionalInfo || '—'],
+            ].map(([label, val]) => `
+              <tr>
+                <td style="padding:6px;color:#666;width:170px">${label}</td>
+                <td style="padding:6px"><b>${val}</b></td>
+              </tr>`).join('')}
+          </table>
+        </div>
+      </div>`,
+  });
+}
 
 // ─────────────────────────────────────────────
 // ANALYTICS LOGGER
@@ -3147,324 +3066,532 @@ async function logInteraction(phone, type, data = {}) {
 }
 
 // ─────────────────────────────────────────────
-// ADMIN ENDPOINTS
+// ACTIVE STATE UPDATER
+// Analyses the bot's reply to infer the next expected input type.
+// Also maintains topic memory, menu history, and unresolved questions.
 // ─────────────────────────────────────────────
-// ─────────────────────────────────────────────
-// CRM COMPATIBILITY ENDPOINTS
-// The CRM dashboard pings these to show "connected" status.
-// Multiple URL patterns covered since the CRM may use any of them.
-// ─────────────────────────────────────────────
+function updateActiveStateFromReply(activeState, reply) {
+  const clean            = stripSuggestTopics(reply);
+  activeState.lastBotMessage    = clean;
+  activeState.lastBotMessageAt  = new Date();
+  activeState.currentFlow       = activeState.currentFlow === 'HUMAN_MODE' ? 'HUMAN_MODE' : 'NORMAL_QA';
+  activeState.expectedInputType = 'ANY';
+  activeState.retryCount        = 0;
 
-// Status / ping — CRM checks this to show "WhatsApp backend ✓"
-app.get('/api/status',    (req, res) => res.json({ status: 'ok', service: 'whatsapp-bot', ts: new Date() }));
-app.get('/api/ping',      (req, res) => res.json({ status: 'ok', ts: new Date() }));
-app.get('/status',        (req, res) => res.json({ status: 'ok', service: 'whatsapp-bot', ts: new Date() }));
-app.get('/ping',          (req, res) => res.json({ ok: true }));
-app.get('/whatsapp/ping', (req, res) => res.json({ status: 'ok', ts: new Date() }));
+  // ── Detect numbered menu ─────────────────────────────────────────
+  const lines         = clean.split('\n');
+  const numberedLines = lines.filter(l => /^\s*\d+[\.\)]\s+\S/.test(l));
 
-// Leads endpoints — alias under /api/ and /crm/ in case the CRM uses those paths
-app.get('/api/leads', async (req, res) => {
-  if (!leadsCol) return res.json([]);
-  const leads = await leadsCol.find({}).sort({ completedAt: -1 }).limit(200).toArray();
-  // Normalise field names to match what the CRM expects
-  const normalised = leads.map(l => ({
-    ...l,
-    source: l.source || 'whatsapp',
-    name:   l.name   || l.leadData?.name,
-    phone:  l.phone  || l.leadData?.phone,
-    email:  l.email  || l.leadData?.email,
-    currentCountry:  l.currentCountry  || l.leadData?.currentCountry,
-    targetCountry:   l.targetCountry   || l.leadData?.targetCountry,
-    serviceNeeded:   l.serviceNeeded   || l.leadData?.serviceNeeded,
-    businessStage:   l.businessStage   || l.leadData?.businessStage,
-    timeline:        l.timeline        || l.leadData?.timeline,
-  }));
-  res.json(normalised);
-});
-
-app.get('/crm/leads',      async (req, res) => { req.url = '/api/leads'; app.handle(req, res); });
-app.get('/whatsapp/leads', async (req, res) => { req.url = '/api/leads'; app.handle(req, res); });
-
-// Delete a lead — CRM "Reset CRM" or per-row delete button
-app.delete('/api/leads/:id', async (req, res) => {
-  if (!leadsCol) return res.json({ ok: false, error: 'no db' });
-  try {
-    const { ObjectId } = require('mongodb');
-    await leadsCol.deleteOne({ _id: new ObjectId(req.params.id) });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(400).json({ ok: false, error: e.message });
-  }
-});
-
-app.delete('/admin/leads/all', async (req, res) => {
-  if (!leadsCol) return res.json({ ok: false });
-  await leadsCol.deleteMany({});
-  res.json({ ok: true, deleted: true });
-});
-
-// ⚠️  NUCLEAR RESET — wipes ALL sessions, leads, menus, active states
-// GET /admin/reset-all?confirm=yes
-app.get('/admin/reset-all', async (req, res) => {
-  if (req.query.confirm !== 'yes') {
-    return res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;max-width:500px">
-      <h2>⚠️ Nuclear Reset</h2>
-      <p>This will delete <strong>every session, lead, menu state, and active state</strong> from MongoDB.</p>
-      <p>All conversations will start fresh. This cannot be undone.</p>
-      <a href="/admin/reset-all?confirm=yes" style="display:inline-block;background:#e53e3e;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600">
-        Yes, wipe everything
-      </a>
-    </body></html>`);
+  if (numberedLines.length >= 2 && numberedLines.length <= 10) {
+    activeState.expectedInputType = 'MENU_1_N';
+    activeState.expectedMenuMax   = numberedLines.length;
+    activeState.menuOptions       = numberedLines;
+    activeState.menuShownAt       = new Date();
+    activeState.lastMenuContext   = clean.substring(0, 200);
+    activeState.currentQuestion   = 'MENU_SELECTION';
+    console.log(`📋  Bot presented ${numberedLines.length}-option menu`);
+    return;
   }
 
+  // If not a menu, clear menu state (but preserve menuOptions for reference resolution)
+  // NOTE: We keep menuOptions so the user can still say "the second one" after the menu
+  activeState.expectedMenuMax = null;
+
+  // ── Detect yes/no question ───────────────────────────────────────
+  if (/\?/.test(clean) && /\b(yes|no|y\/n|confirm|proceed|correct)\b/i.test(clean)) {
+    activeState.expectedInputType = 'YES_NO';
+    activeState.currentQuestion   = 'YES_NO_ANSWER';
+    // Track as unresolved question
+    const q = clean.match(/[^.!?]*\?/)?.[0]?.substring(0, 100);
+    if (q) {
+      activeState.unresolvedQuestions = [q, ...activeState.unresolvedQuestions].slice(0, 3);
+    }
+    return;
+  }
+
+  // ── Detect name question ─────────────────────────────────────────
+  if (/your name|may i (know|have) your name|what('s| is) your name/i.test(clean)) {
+    activeState.currentQuestion   = 'ASK_NAME';
+    activeState.expectedInputType = 'ANY';
+    activeState.unresolvedQuestions = ['What is your name?', ...activeState.unresolvedQuestions].slice(0, 3);
+    return;
+  }
+
+  // ── Detect email question ────────────────────────────────────────
+  if (/\bemail\b/i.test(clean) && /\?/.test(clean)) {
+    activeState.currentQuestion   = 'ASK_EMAIL';
+    activeState.expectedInputType = 'EMAIL';
+    return;
+  }
+
+  // ── Default: free text ───────────────────────────────────────────
+  activeState.currentQuestion   = null;
+  activeState.expectedInputType = 'ANY';
+}
+
+// ─────────────────────────────────────────────
+// WEBHOOK — MAIN BOT LOGIC
+// ─────────────────────────────────────────────
+app.post('/webhook', async (req, res) => {
+  // Always acknowledge quickly to prevent Interakt timeouts
+  res.sendStatus(200);
+
   try {
-    const results = await Promise.all([
-      sessionsCol    ? sessionsCol.deleteMany({})    : { deletedCount: 0 },
-      leadsCol       ? leadsCol.deleteMany({})       : { deletedCount: 0 },
-      activeStateCol ? activeStateCol.deleteMany({}) : { deletedCount: 0 },
-      menuStateCol   ? menuStateCol.deleteMany({})   : { deletedCount: 0 },
+    const body = req.body;
+    if (body.type !== 'message_received') return;
+
+    const phone  = (body.data?.customer?.phone_number || '').replace(/\D/g, '');
+    const rawMsg = (body.data?.message?.message       || '').trim();
+    if (!phone || !rawMsg) return;
+
+    console.log(`\n📩  [${phone}] "${rawMsg}"`);
+
+    // ── Load session + active state in parallel ──────────────────────────
+    const isNewUser = sessionsCol ? !(await sessionsCol.findOne({ phone })) : false;
+    const [session, activeState] = await Promise.all([
+      getSession(phone),
+      getActiveState(phone),
     ]);
 
-    // Clear all in-memory caches too
-    sessionCache.clear();
-    activeStateCache.clear();
-    menuStateCache.clear();
-    kbChunkCache.clear();
+    // ══════════════════════════════════════════════════════════════════
+    // NEW USER — warm, detailed greeting
+    // ══════════════════════════════════════════════════════════════════
+    if (isNewUser) {
+      const greeting =
+        `🌍 *Welcome to Comply Globally* — Your Partner in Global Business Expansion\n\n` +
+        `Thank you for reaching out! We're delighted to connect with you.\n\n` +
+        `At Comply Globally, we specialise in helping ambitious businesses expand across 47+ jurisdictions. Whether you're a startup with a bold vision or an established enterprise looking to scale internationally, we've got you covered.\n\n` +
+        `*Our Core Services:*\n` +
+        `✅ Company Incorporation & Registration\n` +
+        `✅ Banking Setup & Account Opening\n` +
+        `✅ Tax Planning & Compliance\n` +
+        `✅ FEMA & Outbound Investment Advisory\n` +
+        `✅ Residency & Immigration Solutions\n\n` +
+        `To give you the most tailored guidance, could you please share:\n\n` +
+        `1️⃣ *Your full name*\n` +
+        `2️⃣ *Which country you'd like to expand into* (or the jurisdictions you're considering)\n\n` +
+        `Once I understand your situation better, I can guide you through exactly what you need.`;
 
-    const [s, l, a, m] = results;
-    console.log(`🗑️  Nuclear reset: sessions=${s.deletedCount} leads=${l.deletedCount} states=${a.deletedCount} menus=${m.deletedCount}`);
+      await sendWhatsAppMessage(phone, greeting);
+      session.history.push({ role: 'assistant', content: greeting });
 
-    res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;max-width:500px">
-      <h2>✅ Database wiped</h2>
-      <table style="border-collapse:collapse;width:100%">
-        <tr><td style="padding:8px;border-bottom:1px solid #eee">Sessions deleted</td><td style="padding:8px;border-bottom:1px solid #eee"><b>${s.deletedCount}</b></td></tr>
-        <tr><td style="padding:8px;border-bottom:1px solid #eee">Leads deleted</td><td style="padding:8px;border-bottom:1px solid #eee"><b>${l.deletedCount}</b></td></tr>
-        <tr><td style="padding:8px;border-bottom:1px solid #eee">Active states deleted</td><td style="padding:8px;border-bottom:1px solid #eee"><b>${a.deletedCount}</b></td></tr>
-        <tr><td style="padding:8px">Menu states deleted</td><td style="padding:8px"><b>${m.deletedCount}</b></td></tr>
-      </table>
-      <p style="margin-top:20px;color:#666">Every user will now get a fresh greeting on their next message.</p>
-    </body></html>`);
-  } catch (err) {
-    console.error('Reset-all error:', err);
-    res.status(500).send('Error: ' + err.message);
-  }
-});
-// ─────────────────────────────────────────────
-// ADMIN: SEED / UPDATE USER PROFILE
-// Sets name, countries, service — and optionally injects a context
-// summary into session history so Claude knows past conversations.
-//
-// GET /admin/seed-profile?phone=918448227988&name=Udhay&current=India&targets=Singapore,UAE,Vietnam&service=Company+Incorporation
-// ─────────────────────────────────────────────
-app.get('/admin/seed-profile', async (req, res) => {
-  const phone   = (req.query.phone   || '').replace(/\D/g, '');
-  const name    = (req.query.name    || '').trim();
-  const current = (req.query.current || '').trim();
-  const targets = (req.query.targets || '').trim();   // comma-separated: "Singapore,UAE,Vietnam"
-  const service = (req.query.service || '').trim();
-  const stage   = (req.query.stage   || '').trim();
+      activeState.currentFlow       = 'ONBOARDING';
+      activeState.currentQuestion   = 'ASK_NAME_AND_TARGET';
+      activeState.expectedInputType = 'ANY';
+      activeState.detailsCollected  = false;
+      activeState.lastBotMessage    = greeting;
+      activeState.lastBotMessageAt  = new Date();
+      activeState.retryCount        = 0;
 
-  if (!phone) return res.status(400).send('Missing phone');
+      pushToShortTermMemory(activeState, 'assistant', greeting);
 
-  try {
-    const session     = await getSession(phone);
-    const activeState = await getActiveState(phone);
-    const menuState   = await getMenuState(phone);
-
-    // ── Update lead data ──────────────────────────────────────────
-    if (name)    session.leadData.name           = name;
-    if (current) session.leadData.currentCountry = current;
-    if (service) session.leadData.serviceNeeded  = service;
-    if (stage)   session.leadData.businessStage  = stage;
-
-    // Last target country = what detectTopicBank will use
-    const targetList = targets ? targets.split(',').map(t => t.trim()).filter(Boolean) : [];
-    if (targetList.length > 0) {
-      session.leadData.targetCountry = targetList[targetList.length - 1]; // most recent
+      await Promise.all([saveSession(session), saveActiveState(activeState)]);
+      await logInteraction(phone, 'NEW_USER');
+      return;
     }
 
-    // ── Advance stage past NAME so bot doesn't re-ask ────────────
-    activeState.conversationStage = 'QA';
-    activeState.currentFlow       = 'NORMAL';
+    // ══════════════════════════════════════════════════════════════════
+    // RETURNING USER — Check if we know their name, warm greeting
+    // ══════════════════════════════════════════════════════════════════
+    if (session.history.length > 0 && session.history.length <= 4) {
+      // This is the second message from a returning user (short conversation)
+      const lead = session.leadData;
+      const isJustHello = /^(hi|hello|hey|h[ey]+|sup|hey there|hii)$/i.test(rawMsg);
 
-    // ── Inject a context summary into history ─────────────────────
-    // This means Claude will "remember" past discussions naturally.
-    if (name || targetList.length > 0) {
-      const countriesMentioned = targetList.length > 0
-        ? targetList.join(', ')
-        : (current || 'various jurisdictions');
+      if (isJustHello && lead.name) {
+        // User said hello again, we know their name
+        const reGreeting =
+          `Hi ${lead.name}! Great to see you again. 😊\n\n` +
+          `Last time, we were discussing your plans to expand into ${lead.targetCountry || 'new markets'}.\n\n` +
+          `What else can I help you with today? Feel free to ask me anything about:` +
+          `\n• Company incorporation & setup costs` +
+          `\n• Banking requirements` +
+          `\n• Tax planning strategies` +
+          `\n• Residency options\n\n` +
+          `What's on your mind?`;
 
-      const contextSummary = [
-        name    ? `The customer's name is ${name}.` : '',
-        current ? `They are based in ${current}.` : '',
-        targetList.length > 0
-          ? `They have previously discussed expanding to: ${countriesMentioned}. They are familiar with these markets and may ask follow-up questions about any of them.`
-          : '',
-        service ? `Their primary interest is ${service}.` : '',
-        stage   ? `Business stage: ${stage}.` : '',
-      ].filter(Boolean).join(' ');
-
-      // Only inject if history is empty or doesn't already have a seed
-      const alreadySeeded = session.history.some(h => h.content.includes('[CONTEXT SEED]'));
-      if (!alreadySeeded && contextSummary) {
-        // Inject as a system-style assistant turn so Claude treats it as established fact
-        session.history.unshift(
-          { role: 'user',      content: '[CONTEXT SEED] Previous conversation context.' },
-          { role: 'assistant', content: `[CONTEXT SEED] ${contextSummary}` }
-        );
+        await sendWhatsAppMessage(phone, reGreeting);
+        session.history.push({ role: 'user', content: rawMsg });
+        session.history.push({ role: 'assistant', content: reGreeting });
+        activeState.lastBotMessage = reGreeting;
+        activeState.lastBotMessageAt = new Date();
+        pushToShortTermMemory(activeState, 'user', rawMsg);
+        pushToShortTermMemory(activeState, 'assistant', reGreeting);
+        await Promise.all([saveSession(session), saveActiveState(activeState)]);
+        return;
       }
     }
 
-    // Clear stale menu options
-    menuState.validOptions = [];
-    menuState.optionTopics = [];
+    // ══════════════════════════════════════════════════════════════════
+    // AUTO-RESUME from human mode if timeout elapsed
+    // ══════════════════════════════════════════════════════════════════
+    if (activeState.humanMode) {
+      const elapsed = Date.now() - new Date(activeState.humanModeAt || 0).getTime();
+      if (elapsed >= HUMAN_TIMEOUT_MS) {
+        console.log(`⏰  Auto-resuming bot for ${phone}`);
+        activeState.humanMode             = false;
+        activeState.humanModeAt           = null;
+        activeState.handoffEmailSent      = false;
+        activeState.currentFlow           = 'NORMAL_QA';
+        await saveActiveState(activeState);
+        // Fall through to normal processing
+      } else {
+        console.log(`🧑  Human mode active for ${phone} — message suppressed`);
+        return;
+      }
+    }
 
-    // Clear caches so next message picks up immediately
-    sessionCache.delete(phone);
-    activeStateCache.delete(phone);
-    menuStateCache.delete(phone);
+    // ══════════════════════════════════════════════════════════════════
+    // STATE: HANDOFF_EXTRA — awaiting "anything to add?" reply
+    // ══════════════════════════════════════════════════════════════════
+    if (activeState.pendingHumanHandoff && activeState.awaitingHandoffExtraInfo) {
+      console.log(`📝  Handoff extra-info received from ${phone}: "${rawMsg}"`);
 
-    await Promise.all([saveSession(session), saveActiveState(activeState), saveMenuState(menuState)]);
+      const isNegative = /^(no|nope|nothing|nah|none|not really|that'?s?\s+all|nothing\s+else|nil|n\/a)$/i.test(rawMsg.trim());
+      session.leadData.additionalInfo = isNegative ? 'None provided' : rawMsg;
 
-    const displayPhone = `+${phone}`;
-    res.send(`<!DOCTYPE html>
-<html><body style="font-family:sans-serif;padding:40px;max-width:540px">
-  <h2>✅ Profile seeded for ${displayPhone}</h2>
-  <table style="border-collapse:collapse;width:100%;margin-top:16px">
-    <tr style="background:#f5f5f5"><td style="padding:10px;font-weight:600;border-bottom:1px solid #ddd">Name</td><td style="padding:10px;border-bottom:1px solid #ddd">${session.leadData.name || '—'}</td></tr>
-    <tr><td style="padding:10px;font-weight:600;border-bottom:1px solid #ddd">Based in</td><td style="padding:10px;border-bottom:1px solid #ddd">${session.leadData.currentCountry || '—'}</td></tr>
-    <tr style="background:#f5f5f5"><td style="padding:10px;font-weight:600;border-bottom:1px solid #ddd">Countries discussed</td><td style="padding:10px;border-bottom:1px solid #ddd">${targetList.join(', ') || '—'}</td></tr>
-    <tr><td style="padding:10px;font-weight:600;border-bottom:1px solid #ddd">Primary target</td><td style="padding:10px;border-bottom:1px solid #ddd">${session.leadData.targetCountry || '—'}</td></tr>
-    <tr style="background:#f5f5f5"><td style="padding:10px;font-weight:600;border-bottom:1px solid #ddd">Service</td><td style="padding:10px;border-bottom:1px solid #ddd">${session.leadData.serviceNeeded || '—'}</td></tr>
-    <tr><td style="padding:10px;font-weight:600">Stage</td><td style="padding:10px">${session.leadData.businessStage || '—'}</td></tr>
-  </table>
-  <p style="margin-top:20px;color:#666;font-size:13px">
-    Context injected into session history. Next WhatsApp message will have full memory of this profile and past discussions.
-  </p>
-</body></html>`);
+      extractLeadData(session, activeState, rawMsg);
 
-  } catch (err) {
-    console.error('Seed-profile error:', err);
-    res.status(500).send('Error: ' + err.message);
-  }
-});
+      const nameGreeting = session.leadData.name ? `, ${session.leadData.name}` : '';
+      const confirmMsg =
+        `Thank you${nameGreeting}. One of our senior advisors will be in touch with you shortly.\n\n` +
+        `In the meantime, you are welcome to reach us at:\n` +
+        `📧 sales@complyglobally.com\n` +
+        `📞 +1 (302) 214-1717 | +91 99999 81613`;
 
-// GET /admin/fix-name?phone=918448227988&name=Udhay  (quick name-only fix)
-app.get('/admin/fix-name', async (req, res) => {
-  const phone   = (req.query.phone || '').replace(/\D/g, '');
-  const newName = (req.query.name  || '').trim();
-  if (!phone) return res.status(400).send('Missing phone');
+      await sendWhatsAppMessage(phone, confirmMsg);
+      session.history.push({ role: 'user',      content: rawMsg });
+      session.history.push({ role: 'assistant', content: confirmMsg });
 
-  try {
-    const session = await getSession(phone);
-    const oldName = session.leadData.name || '(none)';
-    session.leadData.name = newName || null;
+      activeState.humanMode                = true;
+      activeState.humanModeAt              = new Date();
+      activeState.pendingHumanHandoff      = false;
+      activeState.awaitingHandoffExtraInfo = false;
+      activeState.currentFlow              = 'HUMAN_MODE';
+      activeState.currentQuestion          = null;
+      activeState.lastBotMessage           = confirmMsg;
 
-    const activeState = await getActiveState(phone);
-    if (activeState.conversationStage === 'NAME') activeState.conversationStage = 'QA';
+      if (!session.leadCollected) await finalizeLead(session);
+
+      if (!activeState.handoffEmailSent) {
+        activeState.handoffEmailSent = true;
+        await sendHumanHandoffEmail(phone, session.leadData, session.history);
+      }
+
+      await Promise.all([saveSession(session), saveActiveState(activeState)]);
+      await logInteraction(phone, 'HANDOFF_COMPLETED');
+      return;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // HUMAN TRIGGER — NO "ABSOLUTELY" message, just ask for extra info
+    // ══════════════════════════════════════════════════════════════════
+    if (!activeState.pendingHumanHandoff && wantsHuman(rawMsg)) {
+      console.log(`🙋  Human requested by ${phone}`);
+      session.history.push({ role: 'user', content: rawMsg });
+
+      const extraAsk =
+        `I'll connect you with one of our senior advisors right away.\n\n` +
+        `Before I do, is there any specific information or additional questions you'd like to pass along to the team? ` +
+        `(You can simply reply *"No"* if not.)`;
+
+      await sendWhatsAppMessage(phone, extraAsk);
+      session.history.push({ role: 'assistant', content: extraAsk });
+
+      activeState.pendingHumanHandoff      = true;
+      activeState.awaitingHandoffExtraInfo = true;
+      activeState.currentFlow              = 'HANDOFF';
+      activeState.currentQuestion          = 'HANDOFF_EXTRA_INFO';
+      activeState.expectedInputType        = 'ANY';
+      activeState.lastBotMessage           = extraAsk;
+      activeState.retryCount               = 0;
+
+      await Promise.all([saveSession(session), saveActiveState(activeState)]);
+      await logInteraction(phone, 'HUMAN_REQUESTED');
+      return;
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // INTELLIGENT MESSAGE PROCESSING
+    //
+    // This is the core intelligence layer. We:
+    // 1. Interpret the user's message in context
+    // 2. Resolve references to previous options/topics
+    // 3. Handle corrections and topic switches
+    // 4. Build a rich prompt with all memory layers
+    // 5. Pass to Claude for generation
+    // ══════════════════════════════════════════════════════════════════
+
+    // Step 1: Interpret the message in its conversational context
+    const interpretation = interpretUserInput(rawMsg, activeState);
+    console.log(`🧠  Interpreted: menuNumber=${interpretation.menuNumber} correction=${interpretation.isCorrection} reference=${interpretation.isReference} topicShift=${interpretation.topicShift}`);
+
+    // Step 2: Determine the actual message to send to Claude
+    let messageForClaude = rawMsg;
+
+    if (interpretation.enrichedMessage) {
+      // Interpretation layer has a better enriched version
+      messageForClaude = interpretation.enrichedMessage;
+      console.log(`🔀  Enriched message: ${messageForClaude}`);
+    }
+
+    // Step 3: Handle topic switch — save current thread before switching
+    if (interpretation.topicShift && activeState.currentQuestion) {
+      activeState.pendingThread = `Was in flow "${activeState.currentFlow}", question "${activeState.currentQuestion}"`;
+      console.log(`🔀  Topic switch detected — saved pending thread`);
+    }
+
+    // Step 4: Handle invalid menu range
+    if (
+      interpretation.menuNumber !== null &&
+      activeState.expectedInputType === 'MENU_1_N' &&
+      activeState.expectedMenuMax
+    ) {
+      const max = activeState.expectedMenuMax;
+      if (interpretation.menuNumber < 1 || interpretation.menuNumber > max) {
+        // Invalid range — reprompt with context
+        activeState.retryCount = (activeState.retryCount || 0) + 1;
+
+        let reprompt;
+        if (activeState.retryCount === 1) {
+          reprompt = `I am sorry, that is not a valid option. Please reply with a number between *1 and ${max}*.`;
+        } else {
+          const optionsList = activeState.menuOptions.filter(l => /^\s*\d/.test(l)).join('\n');
+          reprompt =
+            `Please choose from the options listed above by replying with a number from *1 to ${max}*.\n\n` +
+            `Here are the options again:\n${optionsList}`;
+        }
+
+        await sendWhatsAppMessage(phone, reprompt);
+        session.history.push({ role: 'user',      content: rawMsg });
+        session.history.push({ role: 'assistant', content: reprompt });
+        pushToShortTermMemory(activeState, 'user',      rawMsg);
+        pushToShortTermMemory(activeState, 'assistant', reprompt);
+        activeState.lastBotMessage = reprompt;
+
+        await Promise.all([saveSession(session), saveActiveState(activeState)]);
+        await logInteraction(phone, 'INVALID_MENU_INPUT', { input: rawMsg, max });
+        return;
+      }
+      // Valid menu selection — enrich if not already enriched
+      if (!interpretation.enrichedMessage) {
+        const optionText = activeState.menuOptions[interpretation.menuNumber - 1] || '';
+        messageForClaude = `[User selected option ${interpretation.menuNumber}${optionText ? `: "${optionText.trim()}"` : ''}]`;
+      }
+    }
+
+    // Step 5: Extract any lead data from the raw message (always run on raw msg)
+    extractLeadData(session, activeState, rawMsg);
+
+    // Step 6: Infer topic and update topic memory
+    const topic = inferTopic(rawMsg);
+    if (topic) updateRecentTopics(activeState, topic);
+
+    // Step 7: Push to short-term memory before Claude call
+    pushToShortTermMemory(activeState, 'user', rawMsg, interpretation);
+
+    // Step 8: Mark unresolved questions as answered if this message seems like an answer
+    if (activeState.unresolvedQuestions.length > 0 && rawMsg.length > 1) {
+      activeState.unresolvedQuestions = activeState.unresolvedQuestions.slice(1);
+    }
+
+    // Step 9: Get Claude's reply with full context
+    const reply = await getClaudeReply(session, activeState, messageForClaude, interpretation);
+    await sendWhatsAppMessage(phone, reply);
+
+    // Step 10: Update active state from Claude's reply (detects menus, questions, etc.)
+    updateActiveStateFromReply(activeState, reply);
+
+    // Step 11: Push bot reply to short-term memory
+    pushToShortTermMemory(activeState, 'assistant', stripSuggestTopics(reply));
+
+    // Step 12: Clear pending thread if Claude seems to have resolved it
+    if (activeState.pendingThread && !interpretation.topicShift) {
+      activeState.pendingThread = null;
+    }
+
+    // Step 13: Finalize lead if core fields are now complete
+    if (!session.leadCollected && isLeadCoreComplete(session.leadData)) {
+      await finalizeLead(session);
+    }
+
+    // Step 14: Update entity memory in MongoDB (persist cross-session facts)
+    if (session.leadData.name || session.leadData.email) {
+      const existingEntities = await getEntityMemory(phone);
+      const mergedEntities   = { ...existingEntities };
+      if (session.leadData.name)           mergedEntities.name           = session.leadData.name;
+      if (session.leadData.email)          mergedEntities.email          = session.leadData.email;
+      if (session.leadData.companyName)    mergedEntities.companyName    = session.leadData.companyName;
+      if (session.leadData.currentCountry) mergedEntities.currentCountry = session.leadData.currentCountry;
+      if (session.leadData.targetCountry)  mergedEntities.targetCountry  = session.leadData.targetCountry;
+      if (session.leadData.serviceNeeded)  mergedEntities.serviceNeeded  = session.leadData.serviceNeeded;
+      await updateEntityMemory(phone, mergedEntities);
+    }
 
     await Promise.all([saveSession(session), saveActiveState(activeState)]);
-    sessionCache.delete(phone);
-    activeStateCache.delete(phone);
+    await logInteraction(phone, 'NORMAL_QA', {
+      interpretation: {
+        menuNumber:  interpretation.menuNumber,
+        correction:  interpretation.isCorrection,
+        reference:   interpretation.isReference,
+        topicShift:  interpretation.topicShift,
+      },
+    });
 
-    res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;max-width:500px">
-      <h2>✅ Name fixed for +${phone}</h2>
-      <p><b>Was:</b> ${oldName}</p>
-      <p><b>Now:</b> ${newName || '(cleared)'}</p>
-    </body></html>`);
   } catch (err) {
-    res.status(500).send('Error: ' + err.message);
+    console.error('❌  Webhook error:', err.message, err.stack);
   }
 });
 
-// Full session reset for a phone (fresh start, keeps nothing)
-app.get('/admin/reset-session', async (req, res) => {
-  const phone = (req.query.phone || '').replace(/\D/g, '');
-  if (!phone) return res.status(400).send('Missing phone');
+// ─────────────────────────────────────────────
+// CONTROL ENDPOINTS
+// ─────────────────────────────────────────────
+async function resumeBot(phone, res) {
+  const [session, activeState] = await Promise.all([
+    getSession(phone),
+    getActiveState(phone),
+  ]);
+  activeState.humanMode                = false;
+  activeState.humanModeAt              = null;
+  activeState.pendingHumanHandoff      = false;
+  activeState.awaitingHandoffExtraInfo = false;
+  activeState.handoffEmailSent         = false;
+  activeState.currentFlow              = 'NORMAL_QA';
+  activeState.currentQuestion          = null;
+  await saveActiveState(activeState);
 
-  try {
-    if (sessionsCol)    await sessionsCol.deleteOne({ phone });
-    if (activeStateCol) await activeStateCol.deleteOne({ phone });
-    if (menuStateCol)   await menuStateCol.deleteOne({ phone });
-    sessionCache.delete(phone);
-    activeStateCache.delete(phone);
-    menuStateCache.delete(phone);
+  const resumeMsg = 'Welcome back. Your Comply Globally advisor is here — how may I assist you further?';
+  await sendWhatsAppMessage(phone, resumeMsg);
+  session.history.push({ role: 'assistant', content: resumeMsg });
+  await saveSession(session);
 
-    res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px">
-      <h2>✅ Session fully reset for +${phone}</h2>
-      <p>Next message from this user will get a fresh greeting.</p>
-    </body></html>`);
-  } catch (err) {
-    res.status(500).send('Error: ' + err.message);
-  }
+  if (res) res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px"><h2 style="color:#166534">✅ Bot resumed for +${phone}</h2><p>The customer will receive a WhatsApp message.</p></body></html>`);
+}
+
+app.get('/resume-bot/:phone', async (req, res) => {
+  await resumeBot(req.params.phone.replace(/\D/g, ''), res);
 });
 
-app.get('/admin/leads', async (req, res) => {
+app.post('/resume-bot/:phone', async (req, res) => {
+  await resumeBot(req.params.phone.replace(/\D/g, ''), null);
+  res.json({ success: true });
+});
+
+/** Admin: view all leads */
+app.get('/leads', async (req, res) => {
   if (!leadsCol) return res.json([]);
   const leads = await leadsCol.find({}).sort({ completedAt: -1 }).limit(100).toArray();
   res.json(leads);
 });
 
-app.get('/admin/sessions', async (req, res) => {
+/** Admin: view session summaries */
+app.get('/sessions', async (req, res) => {
   if (!sessionsCol) return res.json([]);
   const sessions = await sessionsCol
-    .find({}, { projection: { phone: 1, leadData: 1, leadCollected: 1, lastActive: 1 } })
-    .sort({ lastActive: -1 }).limit(50).toArray();
+    .find({}, {
+      projection: {
+        phone: 1, 'leadData.name': 1, 'leadData.targetCountry': 1,
+        'leadData.serviceNeeded': 1, leadCollected: 1, lastActive: 1,
+      },
+    })
+    .sort({ lastActive: -1 })
+    .limit(100)
+    .toArray();
+
+  if (activeStateCol) {
+    const phones     = sessions.map(s => s.phone);
+    const states     = await activeStateCol.find({ phone: { $in: phones } }).toArray();
+    const stateByPhone = Object.fromEntries(states.map(s => [s.phone, s]));
+    sessions.forEach(s => {
+      const st = stateByPhone[s.phone];
+      if (st) {
+        s.humanMode   = st.humanMode;
+        s.currentFlow = st.currentFlow;
+      }
+    });
+  }
+
   res.json(sessions);
 });
 
-// Resume bot manually — linked from the handoff email button
-app.get('/admin/resume', async (req, res) => {
-  const phone = (req.query.phone || '').replace(/\D/g, '');
-  if (!phone) return res.status(400).send('Missing phone parameter');
-
-  try {
-    const activeState = await getActiveState(phone);
-    activeState.humanModeActive = false;
-    activeState.humanModeSince  = null;
-    activeState.handoffPending  = false;
-    activeState.handoffStage    = null;
-    await saveActiveState(activeState);
-
-    console.log(`✅  Bot manually resumed for ${phone}`);
-    res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:60px">
-      <h2>✅ Bot resumed for +${phone}</h2>
-      <p>The bot will now respond to messages from this customer again.</p>
-    </body></html>`);
-  } catch (err) {
-    console.error('Resume error:', err);
-    res.status(500).send('Error resuming bot: ' + err.message);
-  }
+/** Admin: view active states (includes short-term memory) */
+app.get('/active-states', async (req, res) => {
+  if (!activeStateCol) return res.json([]);
+  const states = await activeStateCol.find({}).sort({ lastActive: -1 }).limit(100).toArray();
+  res.json(states);
 });
 
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    uptime: process.uptime(),
-    caches: {
-      sessions:     sessionCache.size,
-      activeStates: activeStateCache.size,
-      menus:        menuStateCache.size,
-      kbChunks:     kbChunkCache.size,
-    },
-  });
+/** Admin: view entity memory for a user */
+app.get('/memory/:phone', async (req, res) => {
+  const phone = req.params.phone.replace(/\D/g, '');
+  const entities = await getEntityMemory(phone);
+  res.json({ phone, entities });
 });
 
-app.get('/', (req, res) => {
-  res.send('<h1>Comply Globally — WhatsApp Bot v3</h1><p>Webhook ready.</p>');
+/** Admin: reset a user's active state (useful for testing) */
+app.post('/reset-state/:phone', async (req, res) => {
+  const phone = req.params.phone.replace(/\D/g, '');
+  const fresh = freshActiveState(phone);
+  cacheDelete(activeStateCache, phone);
+  if (activeStateCol) await activeStateCol.replaceOne({ phone }, fresh, { upsert: true });
+  res.json({ success: true, message: `Active state reset for ${phone}` });
 });
+
+/** Admin: full reset (session + active state) for testing */
+app.post('/reset-all/:phone', async (req, res) => {
+  const phone = req.params.phone.replace(/\D/g, '');
+  cacheDelete(sessionCache, phone);
+  cacheDelete(activeStateCache, phone);
+  if (sessionsCol)    await sessionsCol.deleteOne({ phone });
+  if (activeStateCol) await activeStateCol.deleteOne({ phone });
+  res.json({ success: true, message: `Full reset for ${phone}` });
+});
+
+/** Health check */
+app.get('/health', (req, res) => res.json({
+  status:               'ok',
+  uptime:              process.uptime(),
+  memory:               process.memoryUsage(),
+  sessionCacheSize:     sessionCache.size,
+  activeStateCacheSize: activeStateCache.size,
+  kbLoaded:             !KNOWLEDGE_BASE.includes('[PASTE YOUR FULL KNOWLEDGE BASE HERE]'),
+}));
+
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+// ─────────────────────────────────────────────
+// KEEP-ALIVE
+// ─────────────────────────────────────────────
+function startKeepAlive() {
+  const url = process.env.KEEP_ALIVE_URL || `${BASE_URL}/health`;
+  console.log(`💓  Keep-alive pinging ${url} every 14 min`);
+  setInterval(async () => {
+    try {
+      const res = await fetch(url);
+      console.log(`💓  Keep-alive: ${res.status}`);
+    } catch (err) {
+      console.error('💔  Keep-alive failed:', err.message);
+    }
+  }, 14 * 60 * 1000);
+}
 
 // ─────────────────────────────────────────────
 // START SERVER
 // ─────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
+
 connectMongo().then(() => {
   app.listen(PORT, () => {
     console.log(`\n🚀  Server running on port ${PORT}`);
-    console.log(`📡  POST /webhook`);
-    console.log(`📊  GET  /admin/leads`);
-    console.log(`📊  GET  /admin/sessions`);
-    console.log(`🔁  GET  /admin/resume?phone=XXXX`);
-    console.log(`❤️   GET  /health\n`);
+    console.log(`📡  POST /webhook              — WhatsApp message receiver`);
+    console.log(`📊  GET  /leads                — view captured leads`);
+    console.log(`🔧  GET  /sessions             — view active sessions`);
+    console.log(`🧠  GET  /active-states        — view conversational state per user`);
+    console.log(`🧬  GET  /memory/:phone        — view entity memory for a user`);
+    console.log(`✅  GET  /resume-bot/:phone    — resume bot after human handoff`);
+    console.log(`🔄  POST /reset-state/:phone   — reset active state`);
+    console.log(`🗑️   POST /reset-all/:phone     — full session + state reset`);
+    console.log(`❤️   GET  /health              — health check\n`);
+    startKeepAlive();
   });
 });
