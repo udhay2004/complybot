@@ -83,7 +83,6 @@ const HUMAN_TIMEOUT_MS   = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000', 1
 //     (continue your full KB here)
 //   `;
 const KNOWLEDGE_BASE = `
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 KNOWLEDGE BASE — USA INCORPORATION (State Navigator)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -2081,65 +2080,29 @@ CONTACT & PRICING
 
 `;
 
-const BASE_SYSTEM_PROMPT = `
-You are an expert advisor for Comply Globally, a premium global business expansion consultancy.
-You assist businesses with company incorporation, banking setup, tax compliance, FEMA/ODI advisory, and residency solutions across 47+ jurisdictions.
+const BASE_SYSTEM_PROMPT = `You are an expert advisor for Comply Global, helping with business expansion.
 
-PERSONALITY & TONE:
-- Warm, professional, highly knowledgeable
-- Conversational and human — never robotic or scripted
-- Concise but complete — never truncate important information
-- Proactive: offer relevant insights without being asked
-- WhatsApp-formatted: use *bold*, line breaks, and numbered lists naturally
+PERSONALITY: Warm, professional, brief, WhatsApp-friendly. Use *bold*, emojis, short paragraphs.
 
-CRITICAL: SUGGEST_TOPICS RULES (WHEN TO SHOW OPTIONS):
-- ONLY show 4 suggested topic options when ALL these conditions are true:
-  1. User has provided their NAME
-  2. User has provided their TARGET COUNTRY/JURISDICTION
-  3. We are NOT in a human handoff flow
-  4. We are NOT in the initial onboarding greeting
-  5. User is asking a question or requesting information about a service
-  
-- Format: SUGGEST_TOPICS:[Topic One,Topic Two,Topic Three,Topic Four]
-- Topics should be answerable questions the user might ask (e.g., "Singapore incorporation timeline", "Banking requirements for UAE setup", etc.)
-- If ANY of the 5 conditions above are false, DO NOT include SUGGEST_TOPICS in your response
-- If user selects a topic by number, explain that topic in detail WITHOUT showing new options in the same message
+OPTION RULES:
+- Show 4 options (format: SUGGEST_TOPICS:[A,B,C,D]) ONLY if:
+  1. User provided NAME + TARGET COUNTRY
+  2. NOT in human handoff
+  3. NOT initial greeting
+  4. User asking a question
+- If user picked a number (e.g. "5"), reject if > 4: "Sorry, only 1-4 available"
+- If user picks a valid option, explain it WITHOUT new options
 
-CONVERSATIONAL INTELLIGENCE RULES (CRITICAL):
-1. RETURNING USERS: If this is not the first message in the conversation and you know their name, use it naturally. Example: "Hi Uday, great question about Singapore taxation..."
-2. CONTEXT REFERENCES: When the user says "that one", "the second option", "the previous one", "not this, the other" — resolve the reference by looking at the last bot message that contained a list or options, and identify which item they mean.
-3. CORRECTIONS: When the user says "actually", "wait", "no", "I meant", "forget that", "sorry", "I changed my mind" — treat this as a correction. Rollback your understanding of their last intent and adopt the new one. Acknowledge the correction naturally.
-4. PARTIAL INFO: If a user gives partial information across multiple messages, combine it. Never ask for information already given, even if spread across messages.
-5. TOPIC SWITCHES: If the user suddenly changes topic, follow them. Do not force them back into the previous flow. Mentally note where the old thread was — you may return to it naturally later if appropriate.
-6. AMBIGUITY: If a reply is ambiguous, make a reasonable best-guess interpretation and proceed, but briefly confirm your interpretation at the start of your reply ("You mean X — correct?").
-7. NUMERIC REPLIES: A bare number from a user almost certainly refers to a menu option from your last message. Do not ask them to clarify; just act on the selection.
-8. SHORT REPLIES: "Yes", "No", "Sure", "Go ahead", "Ok", "Fine", "Both", "All" are valid answers. Interpret them in context.
-9. FOLLOW-UP REFERENCES: "Tell me more about the third one", "What about option 2 for banking?" — resolve against the most recently shown list.
-10. RESUMING: If a user abandoned a topic and returns to it, pick up where you left off without re-asking questions already answered.
+SMART CONTEXT:
+- Use user's NAME if you know it
+- Remember their TARGET COUNTRY
+- Track what SERVICES they need
+- Handle corrections ("actually", "wait", "I meant") — acknowledge & adapt
+- Resolve references ("that one", "option 2", "the previous one")
 
-LEAD COLLECTION (natural, never interrogative):
-Gather these fields conversationally as the discussion progresses — never fire them as a form:
-- Full name
-- Email address
-- Company name (if applicable)
-- Country they are currently based in
-- Country/jurisdiction they want to expand into
-- Service they need (incorporation / banking / tax / FEMA / residency / other)
-- Business stage (idea / startup / established / large corp)
-- Timeline (urgent / 1–3 months / 3–6 months / flexible)
-- Any additional context
+OUTPUT: Keep under 200 words. Conversational. No markdown headers.
 
-RESPONSE FORMAT:
-- Keep replies under 300 words unless the user asks for detail
-- Use numbered lists when presenting options (1. 2. 3.)
-- Use *bold* for key terms
-- Never use markdown headers (#, ##) — WhatsApp doesn't render them
-- End responses with a clear next question or call to action (unless showing SUGGEST_TOPICS)
-
-CONTACT INFO (use when relevant):
-📧 sales@complyglobally.com
-📞 +1 (302) 214-1717 | +91 99999 81613
-`;
+CONTACT: 📧 sales@complyglobally.com | 📞 +1 (302) 214-1717`;
 
 // ─────────────────────────────────────────────
 // MONGODB — CONNECTION & COLLECTIONS
@@ -2344,17 +2307,9 @@ async function updateEntityMemory(phone, newEntities) {
 }
 
 // ─────────────────────────────────────────────
-// KNOWLEDGE BASE RETRIEVER
-// Returns the full KB for now; can be upgraded to semantic chunking later.
+// KNOWLEDGE BASE RETRIEVER (REMOVED)
+// Not needed for fast responses — kept simple
 // ─────────────────────────────────────────────
-function getRelevantKnowledge(session, userMessage) {
-  if (!KNOWLEDGE_BASE || KNOWLEDGE_BASE.includes('[PASTE YOUR FULL KNOWLEDGE BASE HERE]')) {
-    return '';
-  }
-  // Simple keyword relevance: return full KB
-  // TODO: Replace with vector/semantic search if KB exceeds ~10,000 tokens
-  return `\n\n[KNOWLEDGE BASE]\n${KNOWLEDGE_BASE}\n[END KNOWLEDGE BASE]`;
-}
 
 // ─────────────────────────────────────────────
 // LEAD DATA EXTRACTOR
@@ -2608,88 +2563,29 @@ function updateRecentTopics(activeState, topic) {
 // This is where all memory is injected.
 // ─────────────────────────────────────────────
 function buildSystemPrompt(session, activeState, userMessage, interpretation) {
-  const relevantKB = getRelevantKnowledge(session, userMessage);
-  const lead       = session.leadData;
+  const lead = session.leadData;
 
-  // ── Build known customer profile string ──────────────────────────
-  const knownFields = [];
-  if (lead.name)           knownFields.push(`Name: ${lead.name}`);
-  if (lead.email)          knownFields.push(`Email: ${lead.email}`);
-  if (lead.companyName)    knownFields.push(`Company: ${lead.companyName}`);
-  if (lead.currentCountry) knownFields.push(`Based in: ${lead.currentCountry}`);
-  if (lead.targetCountry)  knownFields.push(`Target jurisdiction: ${lead.targetCountry}`);
-  if (lead.serviceNeeded)  knownFields.push(`Service requested: ${lead.serviceNeeded}`);
-  if (lead.businessStage)  knownFields.push(`Business stage: ${lead.businessStage}`);
-  if (lead.timeline)       knownFields.push(`Timeline: ${lead.timeline}`);
-  if (lead.additionalInfo) knownFields.push(`Additional context: ${lead.additionalInfo}`);
+  // ── MINIMAL context — only what Claude needs ──
+  let systemPrompt = BASE_SYSTEM_PROMPT;
 
-  let systemPrompt = BASE_SYSTEM_PROMPT + relevantKB;
+  // Quick customer profile (2-3 lines max)
+  const profile = [];
+  if (lead.name)           profile.push(`Name: ${lead.name}`);
+  if (lead.targetCountry)  profile.push(`Expanding to: ${lead.targetCountry}`);
+  if (lead.serviceNeeded)  profile.push(`Service: ${lead.serviceNeeded}`);
 
-  // ── Customer profile ─────────────────────────────────────────────
-  if (knownFields.length > 0) {
-    systemPrompt += `\n\n[CUSTOMER PROFILE — already known, do NOT ask again:\n${knownFields.join('\n')}]`;
-    if (session.history.length > 2 && lead.name) {
-      systemPrompt += `\n[Address ${lead.name} by name where it feels natural.]`;
-    }
+  if (profile.length > 0) {
+    systemPrompt += `\n\n[CUSTOMER: ${profile.join(' | ')}]`;
   }
 
-  // ── Details collection status (critical for SUGGEST_TOPICS) ──────
-  systemPrompt += `\n\n[DETAILS STATUS:
-User name provided: ${!!lead.name}
-User target country provided: ${!!lead.targetCountry}
-Can show 4-option menu: ${activeState.detailsCollected}
-${activeState.detailsCollected ? '✅ Show SUGGEST_TOPICS with 4 relevant options if user asks a question' : '❌ Do NOT show options yet — still gathering basic details'}
-]`;
+  // State (1 line)
+  systemPrompt += `\n[DETAILS_READY: ${activeState.detailsCollected ? 'YES - can show 4 options' : 'NO - still gathering info'}]`;
 
-  // ── Active conversational state ──────────────────────────────────
-  systemPrompt += `\n\n[ACTIVE FLOW STATE:
-Current flow: ${activeState.currentFlow}
-Current question/topic: ${activeState.currentQuestion || 'none'}
-Expected input type: ${activeState.expectedInputType}
-${activeState.expectedMenuMax ? `Menu was shown with ${activeState.expectedMenuMax} options` : ''}
-${activeState.menuOptions?.length ? `Menu options shown: ${activeState.menuOptions.map((o, i) => `${i + 1}. ${o.trim()}`).join(' | ')}` : ''}
-Retry count for current question: ${activeState.retryCount}
-Last bot message (last 400 chars): "${activeState.lastBotMessage.substring(0, 400)}"
-]`;
-
-  // ── Short-term memory ─────────────────────────────────────────────
-  if (activeState.shortTermMemory.length > 0) {
-    const memSummary = activeState.shortTermMemory.map(m =>
-      `  [${m.role === 'user' ? 'CUSTOMER' : 'BOT'}${m.wasCorrection ? ' (CORRECTION)' : ''}${m.selectedOption ? ` (selected #${m.selectedOption})` : ''}]: ${m.content.substring(0, 200)}`
-    ).join('\n');
-    systemPrompt += `\n\n[SHORT-TERM MEMORY (last ${activeState.shortTermMemory.length} turns):\n${memSummary}\n]`;
-  }
-
-  // ── Recent topics discussed ───────────────────────────────────────
-  if (activeState.recentTopics.length > 0) {
-    systemPrompt += `\n\n[TOPICS DISCUSSED SO FAR: ${activeState.recentTopics.join(', ')}]`;
-  }
-
-  // ── Unresolved questions ──────────────────────────────────────────
-  if (activeState.unresolvedQuestions.length > 0) {
-    systemPrompt += `\n\n[UNRESOLVED QUESTIONS you asked but user hasn't answered: ${activeState.unresolvedQuestions.join(' | ')}]`;
-  }
-
-  // ── Pending thread from topic switch ─────────────────────────────
-  if (activeState.pendingThread) {
-    systemPrompt += `\n\n[PAUSED THREAD: User earlier switched topics. The paused thread was: "${activeState.pendingThread}". You may return to it naturally if the current topic is resolved.]`;
-  }
-
-  // ── Interpretation context ─────────────────────────────────────────
-  if (interpretation) {
-    const hints = [];
-    if (interpretation.isCorrection)     hints.push('User is CORRECTING a previous reply — acknowledge and adapt.');
-    if (interpretation.isReference)      hints.push(`User REFERENCED a previous option (resolved index: ${interpretation.referencedIndex}).`);
-    if (interpretation.topicShift)       hints.push('User appears to be SWITCHING TOPIC — follow them.');
-    if (interpretation.yesNo)            hints.push(`User replied with a clear ${interpretation.yesNo.toUpperCase()}.`);
-    if (hints.length > 0) {
-      systemPrompt += `\n\n[INTERPRETATION HINTS:\n${hints.map(h => '• ' + h).join('\n')}\n]`;
-    }
-  }
-
-  // ── Lead status ───────────────────────────────────────────────────
-  if (session.leadCollected) {
-    systemPrompt += '\n\n[LEAD SUBMITTED: Our team will contact this customer. Reassure them and answer further questions freely.]';
+  // Only add interpretation if it's important
+  if (interpretation && interpretation.menuNumber) {
+    systemPrompt += `\n[USER_SELECTED_OPTION: ${interpretation.menuNumber}]`;
+  } else if (interpretation && interpretation.isCorrection) {
+    systemPrompt += `\n[USER_CORRECTING: acknowledge the change]`;
   }
 
   return systemPrompt;
@@ -2757,8 +2653,8 @@ async function getClaudeReply(session, activeState, userMessage, interpretation 
   // Add the user message to history
   session.history.push({ role: 'user', content: userMessage });
 
-  // Use last 20 messages to stay within token limits while preserving deep context
-  const trimmedHistory = session.history.slice(-20);
+  // Use ONLY last 6 messages — way faster than 20
+  const trimmedHistory = session.history.slice(-6);
   const systemPrompt   = buildSystemPrompt(session, activeState, userMessage, interpretation);
 
   try {
