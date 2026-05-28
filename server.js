@@ -3008,16 +3008,36 @@ app.post('/webhook', async (req, res) => {
     }
     if (entities.service) session.leadData.serviceNeeded = entities.service;
 
-    // Name extraction (only during onboarding stage)
-    if (activeState.conversationStage === 'NAME' && !session.leadData.name) {
-      const nameMatch = rawMsg.match(/^([A-Za-z][A-Za-z\s'-]{1,40})(?:\s|,|$)/);
-      if (nameMatch) {
-        const candidate = nameMatch[1].trim();
+    // ── NAME EXTRACTION — tight rules, runs ONCE, then stage advances ──
+    // Only attempt when:
+    //   1. We are still in NAME stage (bot just asked "what's your name?")
+    //   2. No name is saved yet
+    //   3. The message is SHORT (≤6 words) — real name answers are short
+    //   4. The message doesn't look like a question or sentence
+    if (
+      activeState.conversationStage === 'NAME' &&
+      !session.leadData.name
+    ) {
+      const wordCount = rawMsg.trim().split(/\s+/).length;
+      const looksLikeName =
+        wordCount <= 4 &&                          // names are short
+        !/[?!]/.test(rawMsg) &&                    // not a question
+        !/\b(tell|about|expand|how|what|where|when|why|want|would|looking|help|can|i am|my name is)\b/i.test(rawMsg) && // not a sentence
+        /^[A-Za-z]/.test(rawMsg.trim());           // starts with a letter
+
+      if (looksLikeName) {
+        // Extract just the first 1-3 words as the name candidate
+        const candidate = rawMsg.trim().split(/\s+/).slice(0, 3).join(' ');
         if (isValidName(candidate)) {
           session.leadData.name = candidate;
-          console.log(`✅  Name: ${candidate}`);
+          console.log(`✅  Name saved: "${candidate}"`);
         }
       }
+
+      // Always advance past NAME stage after first user reply
+      // so we NEVER run name extraction on a second message
+      activeState.conversationStage = 'QA';
+      console.log(`📍  Stage → QA`);
     }
 
     // ── NORMAL CLAUDE REPLY ───────────────────────────────────────
@@ -3066,6 +3086,118 @@ async function logInteraction(phone, type, data = {}) {
 // ─────────────────────────────────────────────
 // ADMIN ENDPOINTS
 // ─────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// CRM COMPATIBILITY ENDPOINTS
+// The CRM dashboard pings these to show "connected" status.
+// Multiple URL patterns covered since the CRM may use any of them.
+// ─────────────────────────────────────────────
+
+// Status / ping — CRM checks this to show "WhatsApp backend ✓"
+app.get('/api/status',    (req, res) => res.json({ status: 'ok', service: 'whatsapp-bot', ts: new Date() }));
+app.get('/api/ping',      (req, res) => res.json({ status: 'ok', ts: new Date() }));
+app.get('/status',        (req, res) => res.json({ status: 'ok', service: 'whatsapp-bot', ts: new Date() }));
+app.get('/ping',          (req, res) => res.json({ ok: true }));
+app.get('/whatsapp/ping', (req, res) => res.json({ status: 'ok', ts: new Date() }));
+
+// Leads endpoints — alias under /api/ and /crm/ in case the CRM uses those paths
+app.get('/api/leads', async (req, res) => {
+  if (!leadsCol) return res.json([]);
+  const leads = await leadsCol.find({}).sort({ completedAt: -1 }).limit(200).toArray();
+  // Normalise field names to match what the CRM expects
+  const normalised = leads.map(l => ({
+    ...l,
+    source: l.source || 'whatsapp',
+    name:   l.name   || l.leadData?.name,
+    phone:  l.phone  || l.leadData?.phone,
+    email:  l.email  || l.leadData?.email,
+    currentCountry:  l.currentCountry  || l.leadData?.currentCountry,
+    targetCountry:   l.targetCountry   || l.leadData?.targetCountry,
+    serviceNeeded:   l.serviceNeeded   || l.leadData?.serviceNeeded,
+    businessStage:   l.businessStage   || l.leadData?.businessStage,
+    timeline:        l.timeline        || l.leadData?.timeline,
+  }));
+  res.json(normalised);
+});
+
+app.get('/crm/leads',      async (req, res) => { req.url = '/api/leads'; app.handle(req, res); });
+app.get('/whatsapp/leads', async (req, res) => { req.url = '/api/leads'; app.handle(req, res); });
+
+// Delete a lead — CRM "Reset CRM" or per-row delete button
+app.delete('/api/leads/:id', async (req, res) => {
+  if (!leadsCol) return res.json({ ok: false, error: 'no db' });
+  try {
+    const { ObjectId } = require('mongodb');
+    await leadsCol.deleteOne({ _id: new ObjectId(req.params.id) });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.delete('/admin/leads/all', async (req, res) => {
+  if (!leadsCol) return res.json({ ok: false });
+  await leadsCol.deleteMany({});
+  res.json({ ok: true, deleted: true });
+});
+
+// Clear a bad saved name for a phone number (use when bot saved garbage)
+// GET /admin/fix-name?phone=918448227988&name=Udhay
+// GET /admin/fix-name?phone=918448227988        (just clears the name)
+app.get('/admin/fix-name', async (req, res) => {
+  const phone   = (req.query.phone || '').replace(/\D/g, '');
+  const newName = (req.query.name  || '').trim();
+  if (!phone) return res.status(400).send('Missing phone');
+
+  try {
+    const session = await getSession(phone);
+    const oldName = session.leadData.name || '(none)';
+    session.leadData.name = newName || null;
+
+    // Also reset conversationStage so bot doesn't re-ask name
+    const activeState = await getActiveState(phone);
+    if (activeState.conversationStage === 'NAME') {
+      activeState.conversationStage = 'QA';
+    }
+
+    await Promise.all([saveSession(session), saveActiveState(activeState)]);
+
+    // Clear cache so next message picks up the fix immediately
+    sessionCache.delete(phone);
+    activeStateCache.delete(phone);
+
+    res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;max-width:500px">
+      <h2>✅ Name fixed for +${phone}</h2>
+      <p><b>Was:</b> ${oldName}</p>
+      <p><b>Now:</b> ${newName || '(cleared — bot will re-ask)'}</p>
+      <p style="color:#666;font-size:13px">Cache cleared. Next message from this user will use the updated name.</p>
+    </body></html>`);
+  } catch (err) {
+    res.status(500).send('Error: ' + err.message);
+  }
+});
+
+// Full session reset for a phone (fresh start, keeps nothing)
+app.get('/admin/reset-session', async (req, res) => {
+  const phone = (req.query.phone || '').replace(/\D/g, '');
+  if (!phone) return res.status(400).send('Missing phone');
+
+  try {
+    if (sessionsCol)    await sessionsCol.deleteOne({ phone });
+    if (activeStateCol) await activeStateCol.deleteOne({ phone });
+    if (menuStateCol)   await menuStateCol.deleteOne({ phone });
+    sessionCache.delete(phone);
+    activeStateCache.delete(phone);
+    menuStateCache.delete(phone);
+
+    res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px">
+      <h2>✅ Session fully reset for +${phone}</h2>
+      <p>Next message from this user will get a fresh greeting.</p>
+    </body></html>`);
+  } catch (err) {
+    res.status(500).send('Error: ' + err.message);
+  }
+});
+
 app.get('/admin/leads', async (req, res) => {
   if (!leadsCol) return res.json([]);
   const leads = await leadsCol.find({}).sort({ completedAt: -1 }).limit(100).toArray();
