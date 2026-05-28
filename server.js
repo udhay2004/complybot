@@ -3,8 +3,8 @@
 /**
  * ============================================================
  *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  CONVERSATIONAL INTELLIGENCE EDITION
- *  Premium Advisory First | Lead Capture Second
+ *  PRODUCTION EDITION v3.0
+ *  Premium Advisory First | Smart Lead Capture | Memory-Aware
  * ============================================================
  */
 
@@ -12,7 +12,6 @@ const express         = require('express');
 const path            = require('path');
 const fetch           = require('node-fetch');
 const { MongoClient } = require('mongodb');
-const { google }      = require('googleapis');
 require('dotenv').config();
 
 const app = express();
@@ -27,15 +26,15 @@ app.use((req, res, next) => {
   next();
 });
 
+// ─────────────────────────────────────────────
+// ENV
+// ─────────────────────────────────────────────
 const INTERAKT_API_KEY   = (process.env.INTERAKT_API_KEY   || '').replace(/['"` \n\r]/g, '');
 const ANTHROPIC_API_KEY  = (process.env.ANTHROPIC_API_KEY  || '').replace(/['"` \n\r]/g, '');
 const MONGODB_URI        = process.env.MONGODB_URI         || '';
-const GOOGLE_SHEET_ID    = process.env.GOOGLE_SHEET_ID     || '';
-const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS  || '';
 const RESEND_API_KEY     = (process.env.RESEND_API_KEY     || '').replace(/['"` \n\r]/g, '');
 const NOTIFY_EMAIL       = process.env.NOTIFY_EMAIL        || 'udhaymarwah96@gmail.com';
 const FROM_EMAIL         = process.env.FROM_EMAIL          || 'onboarding@resend.dev';
-const BASE_URL           = process.env.BASE_URL            || 'https://complybot.onrender.com';
 const HUMAN_TIMEOUT_MS   = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000', 10);
 
 [
@@ -46,6 +45,32 @@ const HUMAN_TIMEOUT_MS   = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000', 1
   if (!v) console.error(`❌  ENV MISSING: ${k}`);
   else    console.log (`✅  ENV loaded:  ${k}`);
 });
+
+// ─────────────────────────────────────────────
+// KNOWLEDGE BASE
+// ─────────────────────────────────────────────
+
+// TODO: Replace this comment block with your full KNOWLEDGE_BASE string.
+// Example:
+// const KNOWLEDGE_BASE = `
+//   ... your full knowledge base text here ...
+// `;
+//
+// The knowledge base should contain all jurisdiction guides:
+//   - USA Incorporation (State Navigator)
+//   - FEMA ODI Compliance
+//   - Canada (Entry Canada Guide 2026)
+//   - United Kingdom (Entry UK Guide 2026)
+//   - Singapore (Entry Singapore Guide 2026)
+//   - UAE (Entry UAE Guide 2026)
+//   - Philippines (Entry Philippines Guide 2026)
+//   - Thailand (Entry Thailand Guide 2026)
+//   - Estonia (Entry Estonia Guide 2026)
+//   - Italy (Entry Italy Guide 2026)
+//   - Vietnam (Entry Vietnam Guide 2026)
+//   - Indonesia (Entry Indonesia Guide 2026)
+//   - Documents Required
+//   - Contact & Pricing
 
 const KNOWLEDGE_BASE = `
 KNOWLEDGE BASE — USA INCORPORATION (State Navigator)
@@ -2044,114 +2069,78 @@ CONTACT & PRICING
 - Specific legal opinions or complex tax structuring: "Our experts will guide you on the specifics"
 `;
 
-// ════════════════════════════════════════════════════════════════════
-// SYSTEM PROMPT — CONVERSATIONAL INTELLIGENCE FOCUSED
-// ════════════════════════════════════════════════════════════════════
-const BASE_SYSTEM_PROMPT = `You are a premium international business expansion consultant.
-Your expertise spans global company incorporation, banking, tax planning, compliance, residency, and expansion strategy across 47+ jurisdictions.
+// ─────────────────────────────────────────────
+// SYSTEM PROMPT — CORE (static, never changes)
+// ─────────────────────────────────────────────
+const CORE_SYSTEM_PROMPT = `You are a premium international business expansion advisor for Comply Globally.
+You help founders and businesses expand internationally — covering incorporation, banking, tax, compliance, residency, and FEMA/ODI for Indian clients.
 
-CORE PHILOSOPHY:
-- You are an ADVISOR first, a lead generator second.
-- Prioritize helpfulness and expertise over form-filling.
-- Have natural, intelligent conversations about business challenges.
-- Only capture information when it naturally fits the conversation flow.
-- Sound like a seasoned consultant, not a sales bot.
+━━━ PERSONALITY ━━━
+- Warm, sharp, consultative — like a trusted advisor, not a bot
+- Sound genuinely interested. Use the person's name naturally when you have it
+- Never robotic, never templated, never repetitive openings
+- Vary your sentence structures. Real humans don't repeat phrases.
 
-CONVERSATION STYLE:
-- Warm, professional, strategic, consultative
-- Use natural language — conversational but credible
-- Vary your phrasing — never repeat the same sentences
-- Be concise but insightful — deliver real value
-- Ask intelligent follow-up questions that show deep understanding
-- Use specific examples and jurisdictions when relevant
-- Reference timelines, costs, processes without sounding robotic
+━━━ GREETING RULES ━━━
+FIRST MESSAGE EVER: Warm welcome. Introduce yourself briefly. Ask open-endedly what they're working on.
+RETURNING USER: ALWAYS acknowledge the return. Reference what was discussed before (topics/jurisdiction from context). Say something like "Welcome back, [name]! Last time we were looking at [topic] — want to pick up there, or something new?"
+NEVER: "Great question!", "How can I help you today?", "Certainly!", "Of course!"
 
-INFORMATION GATHERING — SUBTLE & NATURAL:
-DO gather this progressively over multiple messages:
-- Full name (ask naturally: "Who should I address you as?" or "What's your name?")
-- Target jurisdiction (ask strategically: "Which markets are you considering?" or "Where are you looking to expand?")
-- Service needed (understand from context: "So you're focused on incorporation?" or "Is tax optimization your main priority?")
-- Timeline (weave in: "How quickly do you need to move?" or "What's your timeline looking like?")
-- Current location (infer from context or ask: "Are you planning this from India, or have you already relocated?")
+━━━ INFORMATION GATHERING ━━━
+Gather name and target country ONLY through natural conversation — never ask both at once.
+- Ask name first, casually, like: "Before we dive in — who am I speaking with?"
+- Then ask target country: "And which market are you exploring?" or "Where are you looking to set up?"
+- Once you have name + country, get into advisory mode. Stop collecting unless needed.
+- NEVER re-ask what you already know.
 
-DO NOT:
-- Ask name, country, email in the first message
-- Repeat questions they already answered
-- Ask "What's your name and country?" — too robotic
-- Push for email before establishing value
-- Use checklists or forms in conversation
-- Interrupt valuable discussion to collect fields
-- Say "Great! Now let me collect your details..."
+━━━ KNOWLEDGE BASE USAGE ━━━
+You have detailed jurisdiction guides below. Use them accurately.
+When discussing a specific topic (taxation, banking, incorporation, etc.):
+1. Give a clear, useful answer from the knowledge base
+2. After giving a substantive answer (not in greetings/small talk/handoff), offer 3-4 smart follow-up questions
+   Format exactly like this:
+   
+   Want to explore further?
+   1️⃣ [relevant follow-up question]
+   2️⃣ [relevant follow-up question]
+   3️⃣ [relevant follow-up question]
+   4️⃣ [relevant follow-up question]
 
-ESCALATION (when to share contact info):
-Share sales contact ONLY when:
-1. User explicitly asks for consultation/expert help
-2. User is ready to move forward (urgent, specific needs)
-3. You've provided good context and they want next steps
-4. The conversation naturally leads to "Let's get you connected with the right person"
+━━━ MENU / NUMBERED OPTION RULES ━━━
+- When you show numbered options (1-4), track them internally
+- If user says "3", "option 3", "third one", "question 3" → answer question 3 from your last menu
+- If user says a number > 4 or nonsensical → gently say: "I had options 1 through 4 — did you mean one of those? Or feel free to ask anything directly."
+- After answering a numbered option, you can offer a new set of follow-ups if relevant
+- NEVER show numbered follow-ups during: greetings, small talk, human handoff flow
 
-NEVER:
-- Push contact info after every message
-- End every response with "sales@complyglobally.com"
-- Use contact details as a CTA when just answering questions
+━━━ HUMAN HANDOFF FLOW ━━━
+ONLY initiate handoff when user explicitly asks (human/agent/call/speak to someone/connect me).
+Step 1 — Confirm + share contacts + ask for extra info:
+"Of course! I'll get our specialist team connected with you right away. 📞 You can also reach us directly:
+• Email: sales@complyglobally.com
+• Phone: +1 (302) 214-1717 | +91 99999 81613
 
-RETURNING USERS:
-- Recognize ongoing conversations and prior topics
-- Continue where you left off, don't restart onboarding
-- If they say "hello", respond naturally to the context
-- Reference previous discussions: "As we discussed about Singapore..."
+Is there any additional information or context you'd like to share before they reach out?"
 
-DYNAMIC RESPONSES:
-- Avoid templated phrasing
-- Vary how you ask follow-ups
-- Don't use the same opening lines repeatedly
-- Adapt to the user's style and needs
-- Stay conversational, not corporate-speak
+Step 2 — After their response (yes/no/details):
+"Perfect — our team will be in touch shortly. Looking forward to getting you the right help!"
 
-OPTIONS & SUGGESTIONS (use sparingly):
-- Show 4 numbered options ONLY if user seems lost or needs direction
-- When they pick an option, answer fully WITHOUT new options in same message
-- Don't force options into valuable conversations
-- Let natural dialogue flow instead
+Then trigger the email with ALL collected info. That's it. No menus. No follow-up questions.
 
-EXAMPLE GOOD CONVERSATIONS:
+━━━ WHAT NOT TO DO ━━━
+- Never push contact info unless user is ready / asks for next steps
+- Never end every message with the email address
+- Never show 4 follow-up questions in greetings, casual chat, or during handoff
+- Never guess or infer names from normal sentences
+- Never hallucinate data not in the knowledge base
 
-User: "Tell me about Singapore incorporation"
-BAD BOT: "Great question! Let me collect your details first. What's your name?"
-GOOD BOT: "Singapore is excellent for tech startups and regional HQs. The process is streamlined — typically 3-5 days, costs around SGD 300-400. The key advantage is access to banking, low corporate tax, and strong IP protection. Are you looking at it for a tech venture, or more of a trading/services setup?"
-
-User: "I'm from India"
-BAD BOT: "Perfect! And which country do you want to expand to?"
-GOOD BOT: "India's a strong base. Many Indian entrepreneurs use Singapore as their first international hub because of proximity and banking ease. Are you considering Singapore for that reason, or looking at other markets?"
-
-User: "I need this done in 2 weeks"
-BAD BOT: "Got it. Let me get your email so we can follow up."
-GOOD BOT: "2 weeks is tight but doable for Singapore. We've done similar timelines. The fastest path is to have your corporate structure decided and docs ready. Are you set on the company name and shareholding structure, or do you need guidance on that first?"
-
-BUSINESS EXPERTISE:
-You know:
-- 47+ jurisdiction-specific incorporation, tax, banking rules
-- Timeline expectations for each jurisdiction
-- Cost structures and hidden fees
-- Common pitfalls and best practices
-- Compliance calendars and deadlines
-- Optimal structures for different business types (startup, trading, export, tech, etc.)
-- Banking relationships and restrictions by jurisdiction
-- Tax optimization strategies
-- Residency pathways
-- FEMA and ODI regulations (for Indian clients)
-
-Lead this expertise into conversations naturally. Don't make up specifics, but guide users with what you know.
-
-CONTACT INFO (only when earned):
-When user is ready: "Let me connect you with our Singapore specialist who can move fast on your timeline. You can reach the team at sales@complyglobally.com or +1 (302) 214-1717."
-
-NOT after every answer.`;
+━━━ KNOWLEDGE BASE ━━━
+${KNOWLEDGE_BASE}`;
 
 // ─────────────────────────────────────────────
-// MONGODB & CACHING
+// MONGODB
 // ─────────────────────────────────────────────
-let db, sessionsCol, leadsCol, activeStateCol, analyticsCol, memoryCol;
+let db, sessionsCol, activeStateCol, memoryCol;
 
 async function connectMongo() {
   if (!MONGODB_URI) {
@@ -2163,15 +2152,13 @@ async function connectMongo() {
     await client.connect();
     db             = client.db('complybot');
     sessionsCol    = db.collection('sessions');
-    leadsCol       = db.collection('leads');
     activeStateCol = db.collection('activeStates');
-    analyticsCol   = db.collection('analytics');
     memoryCol      = db.collection('memory');
 
     await Promise.all([
       sessionsCol.createIndex({ phone: 1 }, { unique: true }),
       activeStateCol.createIndex({ phone: 1 }, { unique: true }),
-      memoryCol.createIndex({ phone: 1 }),
+      memoryCol.createIndex({ phone: 1 }, { unique: true }),
     ]);
 
     console.log('✅  MongoDB connected');
@@ -2180,75 +2167,69 @@ async function connectMongo() {
   }
 }
 
+// ─────────────────────────────────────────────
+// IN-MEMORY CACHE (30-min TTL)
+// ─────────────────────────────────────────────
 const SESSION_TTL = 30 * 60 * 1000;
-const sessionCache = new Map();
+const sessionCache     = new Map();
 const activeStateCache = new Map();
+const memoryCache      = new Map();
 
-function cacheSet(map, key, value) {
-  map.set(key, { value, ts: Date.now() });
-}
-
+function cacheSet(map, key, value) { map.set(key, { value, ts: Date.now() }); }
 function cacheGet(map, key) {
-  const entry = map.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.ts > SESSION_TTL) { map.delete(key); return null; }
-  return entry.value;
+  const e = map.get(key);
+  if (!e) return null;
+  if (Date.now() - e.ts > SESSION_TTL) { map.delete(key); return null; }
+  return e.value;
 }
 
 // ─────────────────────────────────────────────
-// SESSION MANAGEMENT
+// SESSION  (conversation history + lead data)
 // ─────────────────────────────────────────────
 function freshSession(phone) {
   return {
     phone,
-    history: [],
-    leadData: { phone },
-    leadCollected: false,
+    history: [],         // [{role, content}] — trimmed to last 20
+    leadData: { phone }, // validated entities only
     createdAt: new Date(),
     lastActive: new Date(),
-    engagementLevel: 'new',  // new | exploring | serious | escalated
   };
 }
 
 async function getSession(phone) {
   const cached = cacheGet(sessionCache, phone);
   if (cached) return cached;
-
-  let session = null;
-  if (sessionsCol) session = await sessionsCol.findOne({ phone });
-  if (!session) session = freshSession(phone);
-
-  session.history = session.history || [];
-  session.leadData = session.leadData || { phone };
-  session.engagementLevel = session.engagementLevel || 'new';
-
-  cacheSet(sessionCache, phone, session);
-  return session;
+  let s = sessionsCol ? await sessionsCol.findOne({ phone }) : null;
+  if (!s) s = freshSession(phone);
+  s.history  = s.history  || [];
+  s.leadData = s.leadData || { phone };
+  cacheSet(sessionCache, phone, s);
+  return s;
 }
 
-async function saveSession(session) {
-  session.lastActive = new Date();
-  cacheSet(sessionCache, session.phone, session);
+async function saveSession(s) {
+  s.lastActive = new Date();
+  // Keep only last 20 messages to control token usage
+  if (s.history.length > 20) s.history = s.history.slice(-20);
+  cacheSet(sessionCache, s.phone, s);
   if (sessionsCol) {
-    const { _id, ...doc } = session;
-    await sessionsCol.replaceOne({ phone: session.phone }, doc, { upsert: true });
+    const { _id, ...doc } = s;
+    await sessionsCol.replaceOne({ phone: s.phone }, doc, { upsert: true });
   }
 }
 
 // ─────────────────────────────────────────────
-// ACTIVE STATE — Conversational Context
+// ACTIVE STATE  (conversation flow metadata)
 // ─────────────────────────────────────────────
 function freshActiveState(phone) {
   return {
     phone,
-    conversationPhase: 'greeting',  // greeting | exploring | deepening | escalating | human_mode
+    phase: 'new',               // new | onboarding | advisory | escalating | human_mode
     topicsDiscussed: [],
-    currentMainTopic: null,
-    lastBotMessage: '',
+    lastMenu: null,             // { options: ['q1','q2','q3','q4'], context: 'Canada taxation' }
     humanMode: false,
     humanModeAt: null,
-    pendingHumanHandoff: false,
-    awaitingHandoffExtraInfo: false,
+    pendingHandoff: false,      // waiting for extra info before sending email
     handoffEmailSent: false,
     lastActive: new Date(),
   };
@@ -2257,200 +2238,292 @@ function freshActiveState(phone) {
 async function getActiveState(phone) {
   const cached = cacheGet(activeStateCache, phone);
   if (cached) return cached;
-
-  let state = null;
-  if (activeStateCol) state = await activeStateCol.findOne({ phone });
-  if (!state) state = freshActiveState(phone);
-
-  state.topicsDiscussed = state.topicsDiscussed || [];
-  state.conversationPhase = state.conversationPhase || 'greeting';
-
-  cacheSet(activeStateCache, phone, state);
-  return state;
+  let s = activeStateCol ? await activeStateCol.findOne({ phone }) : null;
+  if (!s) s = freshActiveState(phone);
+  s.topicsDiscussed = s.topicsDiscussed || [];
+  cacheSet(activeStateCache, phone, s);
+  return s;
 }
 
-async function saveActiveState(state) {
-  state.lastActive = new Date();
-  cacheSet(activeStateCache, state.phone, state);
+async function saveActiveState(s) {
+  s.lastActive = new Date();
+  cacheSet(activeStateCache, s.phone, s);
   if (activeStateCol) {
-    const { _id, ...doc } = state;
-    await activeStateCol.replaceOne({ phone: state.phone }, doc, { upsert: true });
+    const { _id, ...doc } = s;
+    await activeStateCol.replaceOne({ phone: s.phone }, doc, { upsert: true });
   }
 }
 
 // ─────────────────────────────────────────────
-// ENTITY MEMORY
+// VALIDATED MEMORY  (locked entities — name, country, etc.)
 // ─────────────────────────────────────────────
-async function getEntityMemory(phone) {
-  if (!memoryCol) return {};
-  try {
-    const doc = await memoryCol.findOne({ phone });
-    return doc?.entities || {};
-  } catch {
-    return {};
+function freshMemory(phone) {
+  return { phone, name: null, targetCountry: null, currentCountry: null, serviceNeeded: null, updatedAt: new Date() };
+}
+
+async function getMemory(phone) {
+  const cached = cacheGet(memoryCache, phone);
+  if (cached) return cached;
+  let m = memoryCol ? await memoryCol.findOne({ phone }) : null;
+  if (!m) m = freshMemory(phone);
+  cacheSet(memoryCache, phone, m);
+  return m;
+}
+
+async function saveMemory(m) {
+  m.updatedAt = new Date();
+  cacheSet(memoryCache, m.phone, m);
+  if (memoryCol) {
+    const { _id, ...doc } = m;
+    await memoryCol.replaceOne({ phone: m.phone }, doc, { upsert: true });
   }
 }
 
-async function updateEntityMemory(phone, newEntities) {
-  if (!memoryCol) return;
-  try {
-    await memoryCol.updateOne(
-      { phone },
-      { $set: { entities: newEntities, updatedAt: new Date() } },
-      { upsert: true }
-    );
-  } catch (err) {
-    console.error('❌  Entity memory update failed:', err.message);
-  }
-}
-
 // ─────────────────────────────────────────────
-// LEAD DATA EXTRACTION
+// NAME EXTRACTION — STRICT, PRODUCTION-GRADE
 // ─────────────────────────────────────────────
-const EMAIL_RE = /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/;
 
-const COUNTRY_KEYWORDS = {
-  uae: 'UAE', dubai: 'UAE', abu: 'UAE',
-  usa: 'USA', america: 'USA', 'united states': 'USA',
-  uk: 'UK', singapore: 'Singapore', sg: 'Singapore',
-  india: 'India', indian: 'India',
-  canada: 'Canada', australia: 'Australia',
-  germany: 'Germany', netherlands: 'Netherlands',
-  mauritius: 'Mauritius', malta: 'Malta',
-  hongkong: 'Hong Kong', 'hong kong': 'Hong Kong',
-};
+// Blacklisted words that should never be treated as names
+const NAME_BLACKLIST = new Set([
+  'hi','hello','hey','okay','ok','yes','no','sure','thanks','thank','please',
+  'tell','about','how','what','where','when','why','which','who','can','could',
+  'would','should','need','want','like','just','also','even','still','now',
+  'india','usa','uae','uk','singapore','canada','dubai','delhi','mumbai','bangalore',
+  'expanding','expand','incorporate','incorporating','business','company','startup',
+  'help','advice','information','details','guide','looking','trying','planning',
+  'more','some','any','all','this','that','these','those','with','from','into',
+  'about','the','and','but','for','not','are','is','was','will','been','have',
+  'we','us','my','me','i','it','he','she','they','them','our','your','their',
+  'good','great','fine','well','much','many','very','quite','really',
+  'complyglobally','comply','globally','setup','setting','service','services',
+  'incorporation','registration','taxation','banking','fema','odi','compliance',
+]);
 
-const SERVICE_KEYWORDS = {
-  incorporat: 'Incorporation',
-  register: 'Incorporation',
-  banking: 'Banking',
-  bank: 'Banking',
-  tax: 'Tax',
-  fema: 'FEMA/ODI',
-  odi: 'FEMA/ODI',
-  residency: 'Residency',
-  visa: 'Residency',
-  compliance: 'Compliance',
-};
+// High-confidence introduction patterns only
+const NAME_PATTERNS = [
+  /(?:my name is|i am|i'm|this is|call me|they call me)\s+([A-Z][a-zA-Z'-]{1,30}(?:\s+[A-Z][a-zA-Z'-]{1,30})?)/i,
+  /^([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20}){0,2})\s*(?:here|speaking|this side)?\.?\s*$/,
+];
 
-function extractLeadData(session, rawMsg) {
-  const msg = rawMsg.toLowerCase();
-  const lead = session.leadData;
+/**
+ * Attempts to extract a confirmed name from a user message.
+ * Returns null if not confident — never guesses.
+ */
+function extractName(rawMsg) {
+  const trimmed = rawMsg.trim();
 
-  // Email
-  const emailMatch = rawMsg.match(EMAIL_RE);
-  if (emailMatch && !lead.email) lead.email = emailMatch[0];
+  // Must be reasonably short for a name-bearing message
+  if (trimmed.length > 80) return null;
 
-  // Name detection — only if clear name-like text
-  if (!lead.name && rawMsg.length < 50 && /^[A-Z][a-z]+ [A-Z][a-z]+/.test(rawMsg)) {
-    const nameMatch = rawMsg.match(/^([A-Za-z][A-Za-z\s'-]{2,40}?)(?:[,.]|$)/);
-    if (nameMatch && nameMatch[1].length > 2) lead.name = nameMatch[1].trim();
-  }
+  // Contains question marks or multiple sentences → likely a query, not a name
+  if (trimmed.includes('?') || (trimmed.match(/\./g) || []).length > 1) return null;
 
-  // Countries
-  for (const [kw, country] of Object.entries(COUNTRY_KEYWORDS)) {
-    if (msg.includes(kw)) {
-      if (!lead.targetCountry && /expand|move|incorporate|setup|going to|looking at/.test(msg)) {
-        lead.targetCountry = country;
-      } else if (!lead.currentCountry && !lead.targetCountry) {
-        lead.currentCountry = country;
-      }
+  // Contains keywords that indicate it's a business query
+  const lower = trimmed.toLowerCase();
+  const queryWords = ['tell me','about','how','what','expand','incorporate','setup','looking','need','want','tax','bank','fema','odi'];
+  if (queryWords.some(w => lower.includes(w))) return null;
+
+  for (const pattern of NAME_PATTERNS) {
+    const match = trimmed.match(pattern);
+    if (match) {
+      const candidate = match[1].trim();
+      const words = candidate.split(/\s+/);
+      // Validate each word
+      const valid = words.every(w =>
+        w.length >= 2 &&
+        w.length <= 25 &&
+        !NAME_BLACKLIST.has(w.toLowerCase()) &&
+        /^[A-Za-z'-]+$/.test(w)
+      );
+      if (valid && words.length <= 3) return candidate;
     }
   }
 
-  // Services
-  for (const [kw, service] of Object.entries(SERVICE_KEYWORDS)) {
-    if (msg.includes(kw) && !lead.serviceNeeded) {
-      lead.serviceNeeded = service;
-      break;
-    }
-  }
-
-  session.leadData = lead;
-}
-
-// ─────────────────────────────────────────────
-// TOPIC TRACKING
-// ─────────────────────────────────────────────
-function inferTopic(msg) {
-  const lower = msg.toLowerCase();
-  if (/banking|bank account|account opening/.test(lower)) return 'Banking';
-  if (/incorporat|register|company|setup/.test(lower)) return 'Incorporation';
-  if (/tax|gst|vat|optimization|compliance/.test(lower)) return 'Tax';
-  if (/fema|odi|remittance|outbound/.test(lower)) return 'FEMA/ODI';
-  if (/residency|visa|immigration|citizenship/.test(lower)) return 'Residency';
-  if (/cost|fee|price|budget|investment/.test(lower)) return 'Costs';
-  if (/timeline|how long|duration|urgent|asap/.test(lower)) return 'Timeline';
-  if (/document|require|need|qualification/.test(lower)) return 'Documentation';
   return null;
 }
 
 // ─────────────────────────────────────────────
-// INTENT INTERPRETATION
+// ENTITY EXTRACTION (country, service, email)
 // ─────────────────────────────────────────────
-function interpretUserIntent(rawMsg, activeState) {
+const COUNTRY_MAP = {
+  uae: 'UAE', dubai: 'UAE', 'abu dhabi': 'UAE', sharjah: 'UAE',
+  usa: 'USA', 'united states': 'USA', america: 'USA',
+  uk: 'UK', 'united kingdom': 'UK', britain: 'UK', england: 'UK',
+  singapore: 'Singapore',
+  india: 'India',
+  canada: 'Canada',
+  australia: 'Australia',
+  germany: 'Germany',
+  netherlands: 'Netherlands',
+  mauritius: 'Mauritius',
+  'hong kong': 'Hong Kong',
+  philippines: 'Philippines',
+  thailand: 'Thailand',
+  indonesia: 'Indonesia',
+  vietnam: 'Vietnam',
+  estonia: 'Estonia',
+  italy: 'Italy',
+};
+
+const SERVICE_MAP = {
+  incorporat: 'Incorporation', register: 'Incorporation', 'set up': 'Incorporation',
+  bank: 'Banking', banking: 'Banking',
+  tax: 'Taxation',
+  fema: 'FEMA/ODI', odi: 'FEMA/ODI', remittance: 'FEMA/ODI',
+  residency: 'Residency', visa: 'Residency', immigrat: 'Residency',
+  compliance: 'Compliance',
+  'raise fund': 'Fundraising', fundrais: 'Fundraising', vc: 'Fundraising', investor: 'Fundraising',
+};
+
+const EMAIL_RE = /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/;
+
+function extractEntities(rawMsg, existingMemory) {
   const lower = rawMsg.toLowerCase();
+  const updates = {};
 
-  // Quick yes/no
-  if (/^(yes|yeah|yep|sure|ok|correct|right|go ahead)$/i.test(lower)) {
-    return { intent: 'confirm' };
-  }
-  if (/^(no|nope|nah|not really|none)$/i.test(lower)) {
-    return { intent: 'decline' };
-  }
+  // Email
+  const emailMatch = rawMsg.match(EMAIL_RE);
+  if (emailMatch && !existingMemory.email) updates.email = emailMatch[0];
 
-  // Corrections
-  if (/\b(actually|wait|sorry|i meant|i mean|forget that|never mind)\b/.test(lower)) {
-    return { intent: 'correction' };
-  }
-
-  // Human request
-  const humanTriggers = ['human', 'agent', 'speak to', 'talk to', 'call', 'connect', 'manager', 'expert', 'team'];
-  if (humanTriggers.some(t => lower.includes(t))) {
-    return { intent: 'human_request' };
+  // Country (only update if not already set or if context clearly indicates new target)
+  if (!existingMemory.targetCountry) {
+    for (const [kw, country] of Object.entries(COUNTRY_MAP)) {
+      if (lower.includes(kw)) {
+        // Only assign as target if context suggests expansion intent
+        const expandIntent = /expand|incorporat|setup|set up|open|register|move|launch|start|going to|looking at|considering/i.test(lower);
+        if (expandIntent) { updates.targetCountry = country; break; }
+      }
+    }
   }
 
-  return { intent: 'query' };
+  // Current country (India context without expansion)
+  if (!existingMemory.currentCountry) {
+    if (/\b(indian|from india|based in india|india-based)\b/i.test(lower)) {
+      updates.currentCountry = 'India';
+    }
+  }
+
+  // Service
+  if (!existingMemory.serviceNeeded) {
+    for (const [kw, service] of Object.entries(SERVICE_MAP)) {
+      if (lower.includes(kw)) { updates.serviceNeeded = service; break; }
+    }
+  }
+
+  return updates;
 }
 
 // ─────────────────────────────────────────────
-// SYSTEM PROMPT BUILDER — MINIMAL
+// TOPIC TRACKER
 // ─────────────────────────────────────────────
-function buildSystemPrompt(session, activeState) {
-  let prompt = BASE_SYSTEM_PROMPT;
+const TOPIC_PATTERNS = [
+  [/bank|account opening/i,           'Banking'],
+  [/incorporat|register|company|setup/i, 'Incorporation'],
+  [/\btax\b|gst|vat|withholding/i,    'Taxation'],
+  [/fema|odi|outward|remittance/i,    'FEMA/ODI'],
+  [/residency|visa|immigrat/i,        'Residency'],
+  [/cost|fee|price|budget/i,          'Costs'],
+  [/timeline|how long|urgent|asap/i,  'Timeline'],
+  [/document|require/i,               'Documentation'],
+  [/fundrais|vc|investor|raise/i,     'Fundraising'],
+  [/compliance|deadline|penalt/i,     'Compliance'],
+];
 
-  // Add known customer context (super brief)
-  const lead = session.leadData;
-  const context = [];
-  if (lead.name) context.push(`Name: ${lead.name}`);
-  if (lead.targetCountry) context.push(`Exploring: ${lead.targetCountry}`);
-  if (lead.currentCountry) context.push(`Based in: ${lead.currentCountry}`);
-  if (lead.serviceNeeded) context.push(`Interest: ${lead.serviceNeeded}`);
+function inferTopic(msg) {
+  for (const [re, topic] of TOPIC_PATTERNS) {
+    if (re.test(msg)) return topic;
+  }
+  return null;
+}
 
-  if (context.length > 0) {
-    prompt += `\n\n[CUSTOMER: ${context.join(' | ')}]`;
+// ─────────────────────────────────────────────
+// INTENT DETECTION
+// ─────────────────────────────────────────────
+function detectIntent(msg) {
+  const lower = msg.toLowerCase().trim();
+
+  // Human handoff
+  if (/\b(human|agent|speak to|talk to|call|connect me|manager|expert|your team|real person|someone from your)\b/.test(lower)) {
+    return 'human_request';
   }
 
-  // Add conversation phase
-  prompt += `\n[PHASE: ${activeState.conversationPhase}]`;
+  // Numbered menu selection (1-4 only, various phrasings)
+  const numMatch = lower.match(/\b(?:option\s*|question\s*|no\.?\s*|#\s*)?([1-4])\b/);
+  if (numMatch && lower.length < 30) {
+    return { type: 'menu_select', num: parseInt(numMatch[1]) };
+  }
 
-  // Add topics discussed
+  // Out-of-range number (5-9)
+  const invalidNum = lower.match(/\b(?:option\s*|question\s*)?([5-9]|10|\d{2,})\b/);
+  if (invalidNum && lower.length < 20) {
+    return 'invalid_menu_select';
+  }
+
+  return 'query';
+}
+
+// ─────────────────────────────────────────────
+// CONTEXT BUILDER — Minimal, targeted
+// ─────────────────────────────────────────────
+function buildContextBlock(memory, activeState) {
+  const parts = [];
+
+  if (memory.name)           parts.push(`Customer name: ${memory.name}`);
+  if (memory.targetCountry)  parts.push(`Target market: ${memory.targetCountry}`);
+  if (memory.currentCountry) parts.push(`Based in: ${memory.currentCountry}`);
+  if (memory.serviceNeeded)  parts.push(`Main interest: ${memory.serviceNeeded}`);
+
   if (activeState.topicsDiscussed.length > 0) {
-    prompt += `\n[DISCUSSED: ${activeState.topicsDiscussed.join(', ')}]`;
+    parts.push(`Topics discussed: ${activeState.topicsDiscussed.slice(-5).join(', ')}`);
   }
 
-  return prompt;
+  if (activeState.lastMenu) {
+    const m = activeState.lastMenu;
+    parts.push(`Last menu shown (${m.context}):\n1. ${m.options[0]}\n2. ${m.options[1]}\n3. ${m.options[2]}\n4. ${m.options[3] || ''}`);
+  }
+
+  const phase = activeState.phase;
+  parts.push(`Conversation phase: ${phase}`);
+
+  return parts.length > 0 ? `\n\n[CONTEXT]\n${parts.join('\n')}` : '';
 }
 
 // ─────────────────────────────────────────────
-// CLAUDE API CALL
+// PARSE MENU FROM CLAUDE REPLY
+// Extracts the 4 options Claude just generated so we can store them
 // ─────────────────────────────────────────────
-async function getClaudeReply(session, activeState, userMessage) {
-  session.history.push({ role: 'user', content: userMessage });
+function parseMenuFromReply(reply) {
+  // Look for numbered items 1️⃣ through 4️⃣ or plain 1. 2. 3. 4.
+  const emojiPattern = /[1-4]️⃣\s*(.+)/g;
+  const plainPattern = /^[1-4][.)]\s*(.+)/gm;
 
-  // Only last 6 messages for speed
-  const trimmedHistory = session.history.slice(-6);
-  const systemPrompt = buildSystemPrompt(session, activeState);
+  let options = [];
+  let m;
+
+  while ((m = emojiPattern.exec(reply)) !== null) options.push(m[1].trim());
+  if (options.length < 3) {
+    options = [];
+    while ((m = plainPattern.exec(reply)) !== null) options.push(m[1].trim());
+  }
+
+  if (options.length >= 3) {
+    return options.slice(0, 4);
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────
+// CLAUDE API CALL — optimized for speed + quality
+// ─────────────────────────────────────────────
+async function callClaude(session, activeState, memory, userMessage, injectedSystemExtra) {
+  // Build a slim, targeted system prompt
+  const contextBlock = buildContextBlock(memory, activeState);
+  const systemPrompt = CORE_SYSTEM_PROMPT + contextBlock + (injectedSystemExtra || '');
+
+  // Only send last 8 messages to Claude (enough context, minimal tokens)
+  const trimmedHistory = session.history.slice(-8);
+
+  const messages = [...trimmedHistory, { role: 'user', content: userMessage }];
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -2462,33 +2535,28 @@ async function getClaudeReply(session, activeState, userMessage) {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 600,
+        max_tokens: 700,
         system: systemPrompt,
-        messages: trimmedHistory,
+        messages,
       }),
     });
 
     const data = await response.json();
+
     if (!response.ok) {
-      console.error('❌  Claude API error:', data);
-      return 'I apologize for the connectivity issue. Feel free to reach out again in a moment.';
+      console.error('❌  Claude API error:', JSON.stringify(data));
+      return null;
     }
 
-    const reply = (data.content || [])
+    return (data.content || [])
       .filter(b => b.type === 'text')
       .map(b => b.text)
       .join('\n')
-      .trim();
+      .trim() || null;
 
-    if (!reply) return 'I was unable to process that. Could you rephrase your question?';
-
-    session.history.push({ role: 'assistant', content: reply });
-    if (session.history.length > 30) session.history = session.history.slice(-30);
-
-    return reply;
   } catch (err) {
     console.error('❌  Claude request failed:', err.message);
-    return "I'm experiencing a connectivity issue. Please try again shortly."
+    return null;
   }
 }
 
@@ -2497,22 +2565,17 @@ async function getClaudeReply(session, activeState, userMessage) {
 // ─────────────────────────────────────────────
 function parsePhone(rawPhone) {
   const digits = String(rawPhone).replace(/\D/g, '');
-  if (/^91[6-9]\d{9}$/.test(digits)) return { countryCode: '+91', phoneNumber: digits.slice(2) };
-  if (/^1[2-9]\d{9}$/.test(digits)) return { countryCode: '+1', phoneNumber: digits.slice(1) };
-  if (/^971\d{9}$/.test(digits)) return { countryCode: '+971', phoneNumber: digits.slice(3) };
+  if (/^91[6-9]\d{9}$/.test(digits))  return { countryCode: '+91',  phoneNumber: digits.slice(2) };
+  if (/^1[2-9]\d{9}$/.test(digits))   return { countryCode: '+1',   phoneNumber: digits.slice(1) };
+  if (/^971\d{9}$/.test(digits))      return { countryCode: '+971', phoneNumber: digits.slice(3) };
   return { countryCode: '+91', phoneNumber: digits };
 }
 
 async function sendWhatsAppMessage(phone, text) {
-  console.log(`📤  Sending to ${phone}: ${text.substring(0, 100)}…`);
-
-  if (!INTERAKT_API_KEY) {
-    console.warn('⚠️  INTERAKT_API_KEY not set');
-    return;
-  }
+  console.log(`📤  [${phone}] ${text.substring(0, 120)}…`);
+  if (!INTERAKT_API_KEY) { console.warn('⚠️  INTERAKT_API_KEY not set'); return; }
 
   const { countryCode, phoneNumber } = parsePhone(phone);
-
   try {
     const res = await fetch('https://api.interakt.ai/v1/public/message/', {
       method: 'POST',
@@ -2521,208 +2584,329 @@ async function sendWhatsAppMessage(phone, text) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        countryCode,
-        phoneNumber,
+        countryCode, phoneNumber,
         callbackData: 'bot_reply',
         type: 'Text',
         data: { message: text },
       }),
     });
     if (res.ok) console.log('✅  Message sent');
-    else console.error(`❌  Interakt error: ${res.status}`);
+    else console.error(`❌  Interakt ${res.status}: ${await res.text()}`);
   } catch (err) {
     console.error('❌  Send error:', err.message);
   }
 }
 
 // ─────────────────────────────────────────────
-// HUMAN HANDOFF
+// STRUCTURED HANDOFF EMAIL
 // ─────────────────────────────────────────────
-async function initiateHumanHandoff(phone, session, activeState) {
-  activeState.pendingHumanHandoff = true;
-  activeState.awaitingHandoffExtraInfo = true;
-
-  const msg = `I'll get you connected with our specialist team right away.\n\nIs there anything specific you'd like them to know when they reach out?`;
-
-  await sendWhatsAppMessage(phone, msg);
-  session.history.push({ role: 'assistant', content: msg });
-  activeState.lastBotMessage = msg;
-  activeState.conversationPhase = 'escalating';
-
-  await Promise.all([saveSession(session), saveActiveState(activeState)]);
-}
-
-async function sendHandoffEmail(phone, leadData, history) {
+async function sendHandoffEmail(phone, memory, session, extraInfo) {
   if (!RESEND_API_KEY || !NOTIFY_EMAIL) return;
 
-  const chatPreview = history.slice(-6)
-    .map(m => `${m.role === 'user' ? 'Customer' : 'Advisor'}: ${m.content}`)
+  // Build ONLY from validated structured data — no hallucination risk
+  const name          = memory.name           || 'Not provided';
+  const targetCountry = memory.targetCountry  || 'Not specified';
+  const currentCountry= memory.currentCountry || 'Not specified';
+  const service       = memory.serviceNeeded  || 'Not specified';
+  const email         = memory.email          || 'Not provided';
+  const topics        = session.leadData?.topicsDiscussed || [];
+
+  // Last 6 turns of conversation — raw, no summarisation by LLM
+  const chatLog = session.history.slice(-8)
+    .map(m => `${m.role === 'user' ? '👤 Customer' : '🤖 Advisor'}: ${m.content}`)
     .join('\n\n');
 
-  const subject = `New Consultation Request — ${leadData.name || phone}`;
+  const subject = `New Consultation Request — ${name} (${phone})`;
+
   const html = `
-    <div style="font-family:sans-serif;max-width:600px">
-      <h2>New Consultation Request</h2>
-      <p><strong>Phone:</strong> +${phone}</p>
-      ${leadData.name ? `<p><strong>Name:</strong> ${leadData.name}</p>` : ''}
-      ${leadData.targetCountry ? `<p><strong>Exploring:</strong> ${leadData.targetCountry}</p>` : ''}
-      ${leadData.serviceNeeded ? `<p><strong>Service:</strong> ${leadData.serviceNeeded}</p>` : ''}
-      <h3>Conversation:</h3>
-      <pre style="background:#f5f5f5;padding:12px;border-radius:4px">${chatPreview}</pre>
-      <p><a href="https://app.interakt.ai">Open Interakt</a></p>
-    </div>`;
+<div style="font-family:Arial,sans-serif;max-width:640px;color:#222">
+  <h2 style="color:#1a365d">New Consultation Request — Comply Globally</h2>
+  <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
+    <tr><td style="padding:6px 12px;background:#f0f4f8;font-weight:bold;width:180px">Phone</td><td style="padding:6px 12px">+${phone}</td></tr>
+    <tr><td style="padding:6px 12px;background:#e8f0fe;font-weight:bold">Name</td><td style="padding:6px 12px">${name}</td></tr>
+    <tr><td style="padding:6px 12px;background:#f0f4f8;font-weight:bold">Email</td><td style="padding:6px 12px">${email}</td></tr>
+    <tr><td style="padding:6px 12px;background:#e8f0fe;font-weight:bold">Target Market</td><td style="padding:6px 12px">${targetCountry}</td></tr>
+    <tr><td style="padding:6px 12px;background:#f0f4f8;font-weight:bold">Based In</td><td style="padding:6px 12px">${currentCountry}</td></tr>
+    <tr><td style="padding:6px 12px;background:#e8f0fe;font-weight:bold">Service Interest</td><td style="padding:6px 12px">${service}</td></tr>
+    ${extraInfo ? `<tr><td style="padding:6px 12px;background:#fff3cd;font-weight:bold">Extra Info</td><td style="padding:6px 12px">${extraInfo}</td></tr>` : ''}
+  </table>
+
+  <h3 style="color:#1a365d">Recent Conversation</h3>
+  <pre style="background:#f8f9fa;padding:16px;border-radius:6px;font-size:13px;white-space:pre-wrap;border-left:4px solid #4299e1">${chatLog}</pre>
+
+  <div style="margin-top:24px;padding:16px;background:#e6ffed;border-radius:6px">
+    <h4 style="margin:0 0 8px">Quick Actions</h4>
+    <p style="margin:4px 0">🔗 <a href="https://app.interakt.ai">Open Interakt to respond on WhatsApp</a></p>
+    <p style="margin:4px 0">📞 Call back: +${phone}</p>
+    ${email !== 'Not provided' ? `<p style="margin:4px 0">📧 Email: ${email}</p>` : ''}
+  </div>
+</div>`;
 
   try {
-    await fetch('https://api.resend.com/emails', {
+    const r = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ from: FROM_EMAIL, to: [NOTIFY_EMAIL], subject, html }),
     });
-    console.log('✅  Handoff email sent');
+    if (r.ok) console.log('✅  Handoff email sent');
+    else console.error(`❌  Resend error: ${r.status} ${await r.text()}`);
   } catch (err) {
-    console.error('❌  Email error:', err.message);
+    console.error('❌  Email send failed:', err.message);
   }
 }
 
 // ─────────────────────────────────────────────
-// WEBHOOK — MAIN BOT LOGIC
+// MAIN WEBHOOK
 // ─────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200);
+  res.sendStatus(200); // Always ack immediately
 
   try {
     const body = req.body;
     if (body.type !== 'message_received') return;
 
-    const phone = (body.data?.customer?.phone_number || '').replace(/\D/g, '');
+    const phone  = (body.data?.customer?.phone_number || '').replace(/\D/g, '');
     const rawMsg = (body.data?.message?.message || '').trim();
     if (!phone || !rawMsg) return;
 
     console.log(`\n📩  [${phone}] "${rawMsg}"`);
 
-    const isNewUser = sessionsCol ? !(await sessionsCol.findOne({ phone })) : false;
-    const [session, activeState] = await Promise.all([
+    // Load all state in parallel
+    const isFirstTime = sessionsCol ? !(await sessionsCol.findOne({ phone })) : false;
+    const [session, activeState, memory] = await Promise.all([
       getSession(phone),
       getActiveState(phone),
+      getMemory(phone),
     ]);
 
-    // ═══════════════════════════════════════════════════════════════
-    // NEW USER — Warm, premium greeting
-    // ═══════════════════════════════════════════════════════════════
-    if (isNewUser) {
-      const greeting = `Hi there! 👋\n\nI'm here to help you navigate global business expansion.\n\nWhether you're incorporating in Singapore, optimizing taxes in the UAE, or exploring international banking — I can guide you through the strategy and process.\n\nWhat's on your mind right now?`;
+    // ════════════════════════════════════
+    // FIRST-TIME USER
+    // ════════════════════════════════════
+    if (isFirstTime) {
+      const greeting = `Hi there! 👋 Welcome to Comply Globally.\n\nI'm your international business expansion advisor. Whether you're looking to incorporate overseas, set up banking, navigate taxes, or understand FEMA compliance — I've got you covered across 47+ jurisdictions.\n\nBefore we dive in — who am I speaking with?`;
 
       await sendWhatsAppMessage(phone, greeting);
       session.history.push({ role: 'assistant', content: greeting });
-      activeState.conversationPhase = 'greeting';
-      activeState.lastBotMessage = greeting;
+      activeState.phase = 'onboarding';
 
-      await Promise.all([saveSession(session), saveActiveState(activeState)]);
-      console.log('🆕  New user greeting sent');
+      await Promise.all([saveSession(session), saveActiveState(activeState), saveMemory(memory)]);
       return;
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // HUMAN MODE — Suppress auto-replies
-    // ═══════════════════════════════════════════════════════════════
+    // ════════════════════════════════════
+    // HUMAN MODE CHECK
+    // ════════════════════════════════════
     if (activeState.humanMode) {
       const elapsed = Date.now() - new Date(activeState.humanModeAt || 0).getTime();
-      if (elapsed >= HUMAN_TIMEOUT_MS) {
-        console.log(`⏰  Auto-resuming bot for ${phone}`);
-        activeState.humanMode = false;
-        activeState.humanModeAt = null;
-        activeState.handoffEmailSent = false;
-        activeState.conversationPhase = 'exploring';
-        await saveActiveState(activeState);
-      } else {
-        console.log(`🧑  Human mode active — suppressing auto-reply`);
+      if (elapsed < HUMAN_TIMEOUT_MS) {
+        console.log(`🧑  Human mode active for ${phone} — suppressing bot`);
+        return;
+      }
+      // Timeout expired — resume bot
+      console.log(`⏰  Human mode expired for ${phone} — resuming bot`);
+      activeState.humanMode = false;
+      activeState.humanModeAt = null;
+      activeState.phase = 'advisory';
+    }
+
+    // ════════════════════════════════════
+    // HANDOFF: AWAITING EXTRA INFO
+    // ════════════════════════════════════
+    if (activeState.pendingHandoff) {
+      const isNegative = /^(no|nope|nothing|n\/a|nah|not really|skip)$/i.test(rawMsg.trim());
+      const extraInfo  = isNegative ? null : rawMsg;
+
+      const confirmMsg = `Perfect — our team will be in touch with you shortly. Looking forward to getting you the right help! 🙌`;
+
+      await sendWhatsAppMessage(phone, confirmMsg);
+
+      // Record in history
+      session.history.push({ role: 'user', content: rawMsg });
+      session.history.push({ role: 'assistant', content: confirmMsg });
+
+      // Update state
+      activeState.pendingHandoff    = false;
+      activeState.handoffEmailSent  = true;
+      activeState.humanMode         = true;
+      activeState.humanModeAt       = new Date();
+      activeState.phase             = 'human_mode';
+
+      // Send structured email
+      await sendHandoffEmail(phone, memory, session, extraInfo);
+      await Promise.all([saveSession(session), saveActiveState(activeState)]);
+      return;
+    }
+
+    // ════════════════════════════════════
+    // INTENT DETECTION
+    // ════════════════════════════════════
+    const intent = detectIntent(rawMsg);
+
+    // ─── Human handoff request ───
+    if (intent === 'human_request') {
+      console.log(`🙋  Human handoff requested by ${phone}`);
+
+      const handoffMsg = `Of course! I'll get our specialist team connected with you right away. 😊\n\n📞 You can also reach us directly:\n• Email: sales@complyglobally.com\n• Phone: +1 (302) 214-1717 | +91 99999 81613\n\nIs there any additional information or context you'd like to share before they reach out?`;
+
+      await sendWhatsAppMessage(phone, handoffMsg);
+      session.history.push({ role: 'user', content: rawMsg });
+      session.history.push({ role: 'assistant', content: handoffMsg });
+
+      activeState.pendingHandoff = true;
+      activeState.phase = 'escalating';
+
+      await Promise.all([saveSession(session), saveActiveState(activeState)]);
+      return;
+    }
+
+    // ─── Invalid menu number ───
+    if (intent === 'invalid_menu_select') {
+      const invalidMsg = activeState.lastMenu
+        ? `I had options 1 through 4 on that — did you mean one of those? Or feel free to ask anything directly!`
+        : `I'm not sure what you're referring to — feel free to ask your question directly!`;
+
+      await sendWhatsAppMessage(phone, invalidMsg);
+      session.history.push({ role: 'user', content: rawMsg });
+      session.history.push({ role: 'assistant', content: invalidMsg });
+      await Promise.all([saveSession(session), saveActiveState(activeState)]);
+      return;
+    }
+
+    // ─── Valid menu selection ───
+    if (intent?.type === 'menu_select' && activeState.lastMenu) {
+      const num  = intent.num;
+      const opts = activeState.lastMenu.options;
+      const selected = opts[num - 1];
+
+      if (selected) {
+        console.log(`📋  Menu selection ${num}: "${selected}"`);
+        // Inject which option was chosen so Claude answers it directly
+        const menuExtra = `\n\n[USER SELECTED OPTION ${num} FROM LAST MENU: "${selected}" — Answer this question directly and thoroughly from the knowledge base. You may offer new follow-up options after answering.]`;
+
+        const reply = await callClaude(session, activeState, memory, selected, menuExtra);
+        if (!reply) {
+          await sendWhatsAppMessage(phone, `I'm having a brief connectivity issue. Please try again in a moment.`);
+          return;
+        }
+
+        await sendWhatsAppMessage(phone, reply);
+        session.history.push({ role: 'user', content: rawMsg });
+        session.history.push({ role: 'assistant', content: reply });
+
+        // Update stored menu if Claude provided a new one
+        const newMenu = parseMenuFromReply(reply);
+        if (newMenu) {
+          activeState.lastMenu = { options: newMenu, context: selected, ts: Date.now() };
+        } else {
+          activeState.lastMenu = null; // consumed
+        }
+
+        await Promise.all([saveSession(session), saveActiveState(activeState)]);
         return;
       }
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // HANDOFF EXTRA INFO
-    // ═══════════════════════════════════════════════════════════════
-    if (activeState.pendingHumanHandoff && activeState.awaitingHandoffExtraInfo) {
-      const isNegative = /^(no|nope|nothing|n\/a)$/i.test(rawMsg.trim());
-      session.leadData.additionalInfo = isNegative ? 'None provided' : rawMsg;
+    // ════════════════════════════════════
+    // ENTITY EXTRACTION
+    // ════════════════════════════════════
 
-      extractLeadData(session, rawMsg);
-
-      const confirmMsg = `Perfect. Our team will reach out shortly.\n\nYou can also contact them directly at sales@complyglobally.com or +1 (302) 214-1717.`;
-
-      await sendWhatsAppMessage(phone, confirmMsg);
-      session.history.push({ role: 'user', content: rawMsg });
-      session.history.push({ role: 'assistant', content: confirmMsg });
-
-      activeState.humanMode = true;
-      activeState.humanModeAt = new Date();
-      activeState.pendingHumanHandoff = false;
-      activeState.awaitingHandoffExtraInfo = false;
-      activeState.handoffEmailSent = true;
-      activeState.conversationPhase = 'human_mode';
-      activeState.lastBotMessage = confirmMsg;
-
-      await sendHandoffEmail(phone, session.leadData, session.history);
-      await Promise.all([saveSession(session), saveActiveState(activeState)]);
-      return;
+    // Name — strict rules only
+    if (!memory.name) {
+      const extractedName = extractName(rawMsg);
+      if (extractedName) {
+        memory.name = extractedName;
+        console.log(`✅  Name locked: ${extractedName}`);
+      }
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // INTERPRET USER INTENT
-    // ═══════════════════════════════════════════════════════════════
-    const intent = interpretUserIntent(rawMsg, activeState);
-
-    // HUMAN REQUEST
-    if (intent.intent === 'human_request') {
-      console.log(`🙋  Human requested`);
-      session.history.push({ role: 'user', content: rawMsg });
-      await initiateHumanHandoff(phone, session, activeState);
-      return;
+    // Other entities
+    const entityUpdates = extractEntities(rawMsg, memory);
+    Object.assign(memory, entityUpdates);
+    if (Object.keys(entityUpdates).length > 0) {
+      console.log(`📝  Entity updates:`, entityUpdates);
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // EXTRACT DATA & TRACK TOPICS
-    // ═══════════════════════════════════════════════════════════════
-    extractLeadData(session, rawMsg);
-
+    // Topic tracking
     const topic = inferTopic(rawMsg);
     if (topic && !activeState.topicsDiscussed.includes(topic)) {
       activeState.topicsDiscussed.push(topic);
-      activeState.currentMainTopic = topic;
     }
 
-    // Update engagement level based on conversation
-    if (session.history.length > 5) session.engagementLevel = 'exploring';
-    if (session.history.length > 10 && session.leadData.targetCountry) session.engagementLevel = 'deepening';
-    if (intent.intent === 'human_request') session.engagementLevel = 'escalated';
-
-    // Update conversation phase
-    if (activeState.conversationPhase === 'greeting' && rawMsg.length > 10) {
-      activeState.conversationPhase = 'exploring';
+    // Phase progression
+    if (activeState.phase === 'onboarding' && memory.name && memory.targetCountry) {
+      activeState.phase = 'advisory';
+    } else if (activeState.phase === 'onboarding' && memory.name) {
+      // Have name, move forward but still gather country
+      activeState.phase = 'onboarding'; // stays until we have country too
+    } else if (activeState.phase === 'new') {
+      activeState.phase = 'onboarding';
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // GET CLAUDE REPLY
-    // ═══════════════════════════════════════════════════════════════
-    const reply = await getClaudeReply(session, activeState, rawMsg);
+    // ════════════════════════════════════
+    // RETURNING USER GREETING
+    // ════════════════════════════════════
+    // Detect if this is effectively a "hello/hi" re-engagement from a known user
+    const isGreeting = /^(hi|hey|hello|good morning|good evening|good afternoon|hola|sup|yo)\b/i.test(rawMsg.trim()) && rawMsg.trim().length < 30;
+
+    if (isGreeting && session.history.length > 2) {
+      // Build a personalised returning-user greeting from memory
+      const nameGreet = memory.name ? `, ${memory.name}` : '';
+      const topicRef  = activeState.topicsDiscussed.length > 0
+        ? ` Last time we were diving into ${activeState.topicsDiscussed.slice(-2).join(' and ')} — want to pick up there, or is something new on your mind?`
+        : ` What are you working on today?`;
+
+      const returningGreet = `Hey${nameGreet}! Great to have you back. 😊${topicRef}`;
+      await sendWhatsAppMessage(phone, returningGreet);
+      session.history.push({ role: 'user', content: rawMsg });
+      session.history.push({ role: 'assistant', content: returningGreet });
+      await Promise.all([saveSession(session), saveActiveState(activeState), saveMemory(memory)]);
+      return;
+    }
+
+    // ════════════════════════════════════
+    // STANDARD CLAUDE REPLY
+    // ════════════════════════════════════
+
+    // Build phase-specific instruction injection
+    let phaseExtra = '';
+    if (activeState.phase === 'onboarding') {
+      if (!memory.name) {
+        phaseExtra = '\n\n[PHASE INSTRUCTION: You do not yet have the user\'s name. If not obtained this message, ask warmly at the end.]';
+      } else if (!memory.targetCountry) {
+        phaseExtra = `\n\n[PHASE INSTRUCTION: You have the name (${memory.name}) but not the target country. If not obtained this message, ask which market they\'re looking to expand to.]`;
+      }
+    }
+
+    const reply = await callClaude(session, activeState, memory, rawMsg, phaseExtra);
+
+    if (!reply) {
+      await sendWhatsAppMessage(phone, `I'm experiencing a brief connectivity issue. Please try again in a moment!`);
+      return;
+    }
 
     await sendWhatsAppMessage(phone, reply);
-    activeState.lastBotMessage = reply;
 
-    // ═══════════════════════════════════════════════════════════════
-    // SAVE STATE
-    // ═══════════════════════════════════════════════════════════════
-    await Promise.all([saveSession(session), saveActiveState(activeState)]);
+    // Update history
+    session.history.push({ role: 'user', content: rawMsg });
+    session.history.push({ role: 'assistant', content: reply });
 
-    // Update entity memory
-    if (session.leadData.name || session.leadData.targetCountry) {
-      const entities = await getEntityMemory(phone);
-      if (session.leadData.name) entities.name = session.leadData.name;
-      if (session.leadData.targetCountry) entities.targetCountry = session.leadData.targetCountry;
-      if (session.leadData.serviceNeeded) entities.serviceNeeded = session.leadData.serviceNeeded;
-      await updateEntityMemory(phone, entities);
+    // Parse and store any menu Claude generated in this reply
+    const newMenu = parseMenuFromReply(reply);
+    if (newMenu) {
+      activeState.lastMenu = {
+        options: newMenu,
+        context: topic || rawMsg.substring(0, 50),
+        ts: Date.now(),
+      };
+      console.log(`📋  Menu stored: ${newMenu.length} options`);
     }
+
+    // Persist everything
+    await Promise.all([
+      saveSession(session),
+      saveActiveState(activeState),
+      saveMemory(memory),
+    ]);
 
   } catch (err) {
     console.error('❌  Webhook error:', err.message, err.stack);
@@ -2730,16 +2914,44 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// CONTROL ENDPOINTS
+// ADMIN / CONTROL ENDPOINTS
 // ─────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-app.post('/reset-all/:phone', async (req, res) => {
+// Full reset for a phone number (dev/test use)
+app.post('/reset/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
-  if (sessionsCol) await sessionsCol.deleteOne({ phone });
+  sessionCache.delete(phone);
+  activeStateCache.delete(phone);
+  memoryCache.delete(phone);
+  if (sessionsCol)    await sessionsCol.deleteOne({ phone });
   if (activeStateCol) await activeStateCol.deleteOne({ phone });
-  res.json({ success: true, message: `Reset for ${phone}` });
+  if (memoryCol)      await memoryCol.deleteOne({ phone });
+  console.log(`🗑️  Full reset for ${phone}`);
+  res.json({ success: true, message: `Reset complete for ${phone}` });
+});
+
+// Release human mode (agent done — bot resumes)
+app.post('/release-human/:phone', async (req, res) => {
+  const phone = req.params.phone.replace(/\D/g, '');
+  const state = await getActiveState(phone);
+  state.humanMode    = false;
+  state.humanModeAt  = null;
+  state.phase        = 'advisory';
+  await saveActiveState(state);
+  res.json({ success: true, message: `Human mode released for ${phone}` });
+});
+
+// View current memory for a phone (debug)
+app.get('/memory/:phone', async (req, res) => {
+  const phone = req.params.phone.replace(/\D/g, '');
+  const [session, activeState, memory] = await Promise.all([
+    getSession(phone),
+    getActiveState(phone),
+    getMemory(phone),
+  ]);
+  res.json({ memory, activeState: { phase: activeState.phase, topicsDiscussed: activeState.topicsDiscussed, lastMenu: activeState.lastMenu, humanMode: activeState.humanMode }, historyLength: session.history.length });
 });
 
 // ─────────────────────────────────────────────
@@ -2749,9 +2961,12 @@ const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🚀  Server running on port ${PORT} — Conversational Edition`);
-    console.log(`📡  POST /webhook — WhatsApp receiver`);
-    console.log(`❤️   GET  /health — health check`);
-    console.log(`🗑️   POST /reset-all/:phone — full reset\n`);
+    console.log(`\n🚀  ComplyGlobally Bot — Production Edition`);
+    console.log(`📡  Listening on port ${PORT}`);
+    console.log(`📮  POST /webhook`);
+    console.log(`❤️   GET  /health`);
+    console.log(`🗑️   POST /reset/:phone`);
+    console.log(`🔓  POST /release-human/:phone`);
+    console.log(`🔍  GET  /memory/:phone\n`);
   });
 });
