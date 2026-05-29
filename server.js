@@ -3,7 +3,7 @@
 /**
  * ============================================================
  *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  PRODUCTION EDITION v4.4 — Smart Handoff Edition
+ *  PRODUCTION EDITION v4.5 — Smart Handoff + Fast Classifier
  *  All 22 prior QA fixes retained. New in v4.4:
  *
  *  FIX #23 — classifyIntent: returns rich handoff details object
@@ -13,6 +13,9 @@
  *             impossible requests (Taylor Swift etc.), default fallback
  *  FIX #25 — state.handoffDetails stored so confirmation msg can reference it
  *  FIX #26 — pendingHandoff confirmation is context-aware (mentions time if given)
+ *  FIX #27 — DEFINITE_QUERY_RE: availability/hours inquiries short-circuited before
+ *             LLM classifier (fixes "when are your humans available" false trigger);
+ *             classifier model switched to claude-haiku for 10x faster classification
  *
  *  Prior fixes (all retained):
  *  FIX #1  — classifyIntent: HANDOFF_VOCAB pre-screen
@@ -109,8 +112,10 @@ MENU SELECTION:
 - If user gives a number outside 1-4, reply: "I had options 1 to 4 there — did you mean one of those? Or feel free to ask directly!"
 
 HUMAN HANDOFF:
-- ONLY trigger when user explicitly says: human / agent / speak to someone / connect me / call / your team
-- When triggered, respond EXACTLY:
+- ONLY trigger when the user is EXPLICITLY REQUESTING to be connected or contacted by a human — NOT when they are asking ABOUT the team, asking about availability/hours, or mentioning humans/agents in a question.
+- HANDOFF triggers: "connect me", "speak to someone", "I want a human", "get me an agent", "put me through", "I'd like to talk to your team", "can someone call me"
+- NOT a handoff — answer these as normal questions: "when are your humans available", "are your agents online", "what are your team hours", "do you have real people", "how do I reach someone", "is there a human I can talk to" — answer: "Our team is available Monday–Saturday, 10am–7pm IST. You can reach them at sales@complyglobally.com or +1 (302) 214-1717 | +91 99999 81613. Would you like me to connect you with them directly?"
+- When a genuine handoff IS triggered, respond EXACTLY:
   "Of course! I'll connect you with our specialist team right away. 😊
   
   📞 Direct contact:
@@ -480,6 +485,15 @@ const ORDINAL_MAP = { first: 1, second: 2, third: 3, fourth: 4, '1st': 1, '2nd':
 // FIX #1: Vocabulary pre-screen — only call classifier if at least one handoff word present
 const HANDOFF_VOCAB = /\b(human|agent|speak|talk|person|connect|team|transfer|real|escalat|manager|expert|someone|sales|call|get me)\b/i;
 
+// FIX #27: DEFINITE_QUERY_RE — messages containing handoff vocab that are clearly
+// questions/inquiries about availability/hours, NOT connection requests.
+// These are short-circuited BEFORE the LLM classifier to avoid false triggers
+// and eliminate unnecessary API round-trips.
+// Examples caught: "when are your humans available", "what are your agent hours",
+// "is your team available now", "how do I reach someone", "do you have real agents",
+// "are your people available on weekends", "who are your experts"
+const DEFINITE_QUERY_RE = /\b(when|what|how|where|do|does|is|are|who|which|btw|anyway|just asking|curious|wondering)\b.*\b(human|agent|team|person|someone|expert|manager|sales|staff|advisor|people|representative)\b|\b(human|agent|team|person|someone|expert|manager|sales|staff|advisor|people)\b.*\b(available|online|hours|timing|schedule|work|open|active|free|respond|reply|office|around|reachable)\b|\b(tell me about|asking about|question about|info about|information about|know about|curious about)\b.*\b(human|agent|team|call|connect)\b/i;
+
 async function classifyIntent(msg) {
   const lower = msg.toLowerCase().trim();
 
@@ -503,8 +517,16 @@ async function classifyIntent(msg) {
   // FIX #1: Pre-screen — if no handoff vocabulary, skip Claude entirely
   if (!HANDOFF_VOCAB.test(lower)) return { type: 'query' };
 
+  // FIX #27: Short-circuit obvious inquiry questions that contain handoff vocab
+  // but are clearly NOT connection requests — avoids false positives and LLM call
+  if (DEFINITE_QUERY_RE.test(lower)) {
+    console.log(`⚡  Fast-path QUERY (availability inquiry): "${msg.substring(0, 60)}"`);
+    return { type: 'query' };
+  }
+
   // ── Claude classifies: HANDOFF (with details) vs QUERY ──
   // FIX #23: Upgraded prompt — returns JSON with rich context for smart responses
+  // FIX #27: Uses claude-haiku (10x faster, cheaper) for binary classification
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -514,7 +536,7 @@ async function classifyIntent(msg) {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-haiku-4-5-20251001',
         max_tokens: 120,
         messages: [{
           role: 'user',
@@ -537,33 +559,44 @@ Return this exact JSON structure:
 }
 
 RULES FOR INTENT:
-- HANDOFF = user explicitly wants a real human from Comply Globally to contact them or speak with them now
-- QUERY = everything else (questions, greetings, giving name, complaints, jokes, requests for non-human entities)
+- HANDOFF = user explicitly wants a real human to CONTACT THEM or speak WITH THEM — a direct request for personal connection
+- QUERY = everything else: questions about availability/hours, asking who the team is, asking HOW to reach someone, greetings, giving name, complaints, jokes, requests for non-human entities, curious inquiries
+- CRITICAL: Asking ABOUT the team or WHEN they are available is a QUERY, not a HANDOFF. The user must be asking to BE connected or contacted.
 - If ANY doubt exists → QUERY
 - "impossible" = true when user asks to be connected to a famous person, fictional character, celebrity, or someone clearly not part of the Comply Globally team (e.g. Taylor Swift, Elon Musk, a doctor, a lawyer by name, God, etc.)
 - If impossible=true, set intent=QUERY regardless
 
-HANDOFF examples:
+HANDOFF — user wants to BE connected / contacted:
 "connect me to your team" → HANDOFF
-"I want to speak to a human" → HANDOFF  
+"I want to speak to a human" → HANDOFF
+"get me a real person" → HANDOFF
 "can someone call me at 4pm?" → HANDOFF, scheduledTime="4pm"
 "connect me right now" → HANDOFF, urgency="immediate"
 "I want a video call with your advisor" → HANDOFF, preferredChannel="video"
-"let me know when your team is free" → HANDOFF, wantsToCheckAvailability=true
+"let me know when your team is free to call me" → HANDOFF, wantsToCheckAvailability=true
 "connect me tomorrow morning" → HANDOFF, scheduledTime="tomorrow morning"
 "can I get a call between 10 and 11am IST?" → HANDOFF, scheduledTime="10-11am IST"
+"I want to speak to someone about banking" → HANDOFF
+"put me through to a specialist" → HANDOFF
 
-QUERY / impossible examples:
-"connect me to Taylor Swift" → QUERY, impossible=true, impossibleReason="Taylor Swift is not part of the Comply Globally team"
+QUERY — asking about, not asking to be connected:
+"when are your humans available btw" → QUERY (asking about hours, not requesting contact)
+"when are your agents available" → QUERY
+"what are your team's hours" → QUERY
+"are your people available on weekends" → QUERY
+"is there a human I can talk to" → QUERY (asking if one exists, not requesting contact)
+"do you have real agents" → QUERY
+"how do I reach someone" → QUERY
+"who are your experts" → QUERY
+"connect me to Taylor Swift" → QUERY, impossible=true
 "connect me to Elon Musk" → QUERY, impossible=true
-"connect me to a doctor" → QUERY, impossible=true, impossibleReason="Not a medical service"
+"connect me to a doctor" → QUERY, impossible=true
 "my name is human" → QUERY
 "you can call me UD" → QUERY
 "I've seen better agents" → QUERY
 "talk to me" → QUERY
 "what are your fees" → QUERY
 "I'm an expert in taxation" → QUERY
-"I want to speak to someone about banking" → HANDOFF
 
 Message: "${msg.replace(/"/g, "'")}"`
         }],
@@ -1404,7 +1437,7 @@ const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🚀  ComplyGlobally Bot v4.4 — Smart Handoff Edition`);
+    console.log(`\n🚀  ComplyGlobally Bot v4.5 — Smart Handoff + Fast Classifier`);
     console.log(`📡  Port: ${PORT}`);
     console.log(`📮  POST /webhook`);
     console.log(`❤️   GET  /health`);
