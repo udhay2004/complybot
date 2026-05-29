@@ -507,18 +507,86 @@ async function callClaude(session, state, mem, userMessage, kbSection, phaseHint
 // ─────────────────────────────────────────────
 // WHATSAPP SENDER
 // ─────────────────────────────────────────────
-function parsePhone(raw) {
+function parsePhone(raw, knownCC) {
   const d = String(raw).replace(/\D/g, '');
-  if (/^91[6-9]\d{9}$/.test(d))  return { countryCode: '+91',  phoneNumber: d.slice(2) };
-  if (/^1[2-9]\d{9}$/.test(d))   return { countryCode: '+1',   phoneNumber: d.slice(1) };
-  if (/^971\d{9}$/.test(d))      return { countryCode: '+971', phoneNumber: d.slice(3) };
-  return { countryCode: '+91', phoneNumber: d };
+
+  // If Interakt already gave us the country code separately — use it directly
+  if (knownCC) {
+    const cc = String(knownCC).replace(/\D/g, '');
+    // Strip the country code from the number if it's already prefixed
+    const local = d.startsWith(cc) ? d.slice(cc.length) : d;
+    return { countryCode: '+' + cc, phoneNumber: local };
+  }
+
+  // ── Patterns: longer country codes checked first to avoid false matches ──
+  const patterns = [
+    // 3-digit codes
+    [/^971(\d{7,9})$/,   '+971'],  // UAE
+    [/^966(\d{9})$/,     '+966'],  // Saudi Arabia
+    [/^974(\d{8})$/,     '+974'],  // Qatar
+    [/^973(\d{8})$/,     '+973'],  // Bahrain
+    [/^968(\d{8})$/,     '+968'],  // Oman
+    [/^965(\d{8})$/,     '+965'],  // Kuwait
+    [/^234(\d{10})$/,    '+234'],  // Nigeria
+    [/^254(\d{9})$/,     '+254'],  // Kenya
+    [/^855(\d{8,9})$/,   '+855'],  // Cambodia
+    [/^856(\d{9,10})$/,  '+856'],  // Laos
+    [/^852(\d{8})$/,     '+852'],  // Hong Kong
+    [/^853(\d{8})$/,     '+853'],  // Macau
+    // 2-digit codes
+    [/^91([6-9]\d{9})$/, '+91'],   // India
+    [/^44(\d{10})$/,     '+44'],   // UK
+    [/^61(\d{9})$/,      '+61'],   // Australia
+    [/^64(\d{8,9})$/,    '+64'],   // New Zealand
+    [/^49(\d{10,11})$/,  '+49'],   // Germany
+    [/^33(\d{9})$/,      '+33'],   // France
+    [/^39(\d{9,10})$/,   '+39'],   // Italy
+    [/^34(\d{9})$/,      '+34'],   // Spain
+    [/^31(\d{9})$/,      '+31'],   // Netherlands
+    [/^32(\d{9})$/,      '+32'],   // Belgium
+    [/^46(\d{9})$/,      '+46'],   // Sweden
+    [/^47(\d{8})$/,      '+47'],   // Norway
+    [/^45(\d{8})$/,      '+45'],   // Denmark
+    [/^65(\d{8})$/,      '+65'],   // Singapore
+    [/^60(\d{9,10})$/,   '+60'],   // Malaysia
+    [/^66(\d{9})$/,      '+66'],   // Thailand
+    [/^62(\d{8,12})$/,   '+62'],   // Indonesia
+    [/^84(\d{9,10})$/,   '+84'],   // Vietnam
+    [/^63(\d{10})$/,     '+63'],   // Philippines
+    [/^92(\d{10})$/,     '+92'],   // Pakistan
+    [/^94(\d{9})$/,      '+94'],   // Sri Lanka
+    [/^95(\d{7,9})$/,    '+95'],   // Myanmar
+    [/^81(\d{10})$/,     '+81'],   // Japan
+    [/^82(\d{9,10})$/,   '+82'],   // South Korea
+    [/^86(\d{11})$/,     '+86'],   // China
+    [/^27(\d{9})$/,      '+27'],   // South Africa
+    [/^20(\d{10})$/,     '+20'],   // Egypt
+    [/^55(\d{10,11})$/,  '+55'],   // Brazil
+    [/^52(\d{10})$/,     '+52'],   // Mexico
+    [/^54(\d{10})$/,     '+54'],   // Argentina
+    [/^57(\d{10})$/,     '+57'],   // Colombia
+    [/^51(\d{9})$/,      '+51'],   // Peru
+    [/^56(\d{9})$/,      '+56'],   // Chile
+    // 1-digit code — USA/Canada (check last, most ambiguous)
+    [/^1([2-9]\d{9})$/,  '+1'],    // USA & Canada (with country code prefix)
+    [/^([2-9]\d{9})$/,    '+1'],    // USA & Canada (bare 10-digit, Interakt strips leading 1)
+  ];
+
+  for (const [regex, cc] of patterns) {
+    const m = d.match(regex);
+    if (m) return { countryCode: cc, phoneNumber: m[1] };
+  }
+
+  // No match — log it and pass the raw digits; Interakt will reject cleanly
+  console.warn(`⚠️  parsePhone: unrecognised format "${d}" — sending as-is`);
+  return { countryCode: '', phoneNumber: d };
 }
 
-async function send(phone, text) {
+async function send(phone, text, knownCC) {
   console.log(`📤  [${phone}] ${text.substring(0, 100)}…`);
   if (!INTERAKT_API_KEY) { console.warn('⚠️  No INTERAKT_API_KEY'); return; }
-  const { countryCode, phoneNumber } = parsePhone(phone);
+  const { countryCode, phoneNumber } = parsePhone(phone, knownCC);
+  console.log(`📞  Sending → countryCode="${countryCode}" phoneNumber="${phoneNumber}"`);
   try {
     const r = await fetch('https://api.interakt.ai/v1/public/message/', {
       method: 'POST',
@@ -526,7 +594,10 @@ async function send(phone, text) {
       body: JSON.stringify({ countryCode, phoneNumber, callbackData: 'bot_reply', type: 'Text', data: { message: text } }),
     });
     if (r.ok) console.log('✅  Sent');
-    else console.error(`❌  Interakt ${r.status}`);
+    else {
+      const errBody = await r.text().catch(() => '');
+      console.error(`❌  Interakt ${r.status}: ${errBody}`);
+    }
   } catch (err) {
     console.error('❌  Send failed:', err.message);
   }
@@ -604,7 +675,8 @@ app.post('/webhook', async (req, res) => {
     const body   = req.body;
     if (body.type !== 'message_received') return;
 
-    const phone  = (body.data?.customer?.phone_number || '').replace(/\D/g, '');
+    const phone     = (body.data?.customer?.phone_number || '').replace(/\D/g, '');
+    const incomingCC = (body.data?.customer?.country_code   || '').replace(/\D/g, '');
     const rawMsg = (body.data?.message?.message || '').trim();
     if (!phone || !rawMsg) return;
 
@@ -621,7 +693,7 @@ app.post('/webhook', async (req, res) => {
     // ══════════════════════════════════════════════
     if (isFirstTime) {
       const msg = `Hi there! 👋 Welcome to Comply Globally.\n\nI'm your international business expansion advisor — here to help you navigate incorporation, banking, tax, and compliance across 47+ jurisdictions.\n\nBefore we dive in — who am I speaking with?`;
-      await send(phone, msg);
+      await send(phone, msg, incomingCC);
       session.history.push({ role: 'assistant', content: msg });
       state.phase = 'onboarding';
       await Promise.all([saveSession(session), saveState(state), saveMemory(mem)]);
@@ -651,7 +723,7 @@ app.post('/webhook', async (req, res) => {
       const extraInfo  = isNegative ? null : rawMsg;
 
       const confirmMsg = `Perfect — our team will be in touch with you shortly! 🙌`;
-      await send(phone, confirmMsg);
+      await send(phone, confirmMsg, incomingCC);
 
       session.history.push({ role: 'user', content: rawMsg });
       session.history.push({ role: 'assistant', content: confirmMsg });
@@ -698,7 +770,7 @@ app.post('/webhook', async (req, res) => {
     // ── 5a. Human handoff request ──
     if (intent.type === 'human_request') {
       const msg = `Of course! I'll connect you with our specialist team right away. 😊\n\n📞 Direct contact:\n• Email: sales@complyglobally.com\n• Phone: +1 (302) 214-1717 | +91 99999 81613\n\nIs there any additional context you'd like to share before they reach out?`;
-      await send(phone, msg);
+      await send(phone, msg, incomingCC);
       session.history.push({ role: 'user', content: rawMsg });
       session.history.push({ role: 'assistant', content: msg });
       state.pendingHandoff = true;
@@ -713,7 +785,7 @@ app.post('/webhook', async (req, res) => {
       const msg = state.lastMenu
         ? `I had options 1 to 4 there — did you mean one of those? 😊 Or go ahead and ask directly!`
         : `Just ask me anything directly and I'll help you out!`;
-      await send(phone, msg);
+      await send(phone, msg, incomingCC);
       session.history.push({ role: 'user', content: rawMsg });
       session.history.push({ role: 'assistant', content: msg });
       await Promise.all([saveSession(session), saveState(state)]);
@@ -734,15 +806,15 @@ app.post('/webhook', async (req, res) => {
         const { reply, rateLimited, waitSec } = await callClaude(session, state, mem, selected, kbSection, menuHint);
 
         if (rateLimited) {
-          await send(phone, rateLimitResponse(waitSec || 60));
+          await send(phone, rateLimitResponse(waitSec || 60), incomingCC);
           return;
         }
         if (!reply) {
-          await send(phone, `I hit a brief snag there. Please try again in a moment!`);
+          await send(phone, `I hit a brief snag there. Please try again in a moment!`, incomingCC);
           return;
         }
 
-        await send(phone, reply);
+        await send(phone, reply, incomingCC);
         session.history.push({ role: 'user', content: rawMsg });
         session.history.push({ role: 'assistant', content: reply });
 
@@ -765,7 +837,7 @@ app.post('/webhook', async (req, res) => {
         ? ` Last time we were discussing ${state.topicsDiscussed.slice(-2).join(' and ')} — want to pick up there, or something new on your mind?`
         : ` What are you working on today?`;
       const msg = `Hey${nameGreet}! Great to have you back. 😊${topicRef}`;
-      await send(phone, msg);
+      await send(phone, msg, incomingCC);
       session.history.push({ role: 'user', content: rawMsg });
       session.history.push({ role: 'assistant', content: msg });
       await Promise.all([saveSession(session), saveState(state), saveMemory(mem)]);
@@ -791,15 +863,15 @@ app.post('/webhook', async (req, res) => {
     const { reply, rateLimited, waitSec } = await callClaude(session, state, mem, rawMsg, kbSection, phaseHint);
 
     if (rateLimited) {
-      await send(phone, rateLimitResponse(waitSec || 60));
+      await send(phone, rateLimitResponse(waitSec || 60), incomingCC);
       return;
     }
     if (!reply) {
-      await send(phone, `I hit a brief connectivity issue. Please try your question again — I don't want you to miss out on this!`);
+      await send(phone, `I hit a brief connectivity issue. Please try your question again — I don't want you to miss out on this!`, incomingCC);
       return;
     }
 
-    await send(phone, reply);
+    await send(phone, reply, incomingCC);
     session.history.push({ role: 'user', content: rawMsg });
     session.history.push({ role: 'assistant', content: reply });
 
