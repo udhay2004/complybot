@@ -3,8 +3,9 @@
 /**
  * ============================================================
  *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  PRODUCTION EDITION v4.0
+ *  PRODUCTION EDITION v4.1
  *  Token-Efficient | Menu-Deterministic | Rate-Limit-Safe
+ *  KB: BM25 semantic retrieval via kbRetrieval.js + kb.json
  * ============================================================
  */
 
@@ -13,6 +14,9 @@ const path            = require('path');
 const fetch           = require('node-fetch');
 const { MongoClient } = require('mongodb');
 require('dotenv').config();
+
+// ── CHANGE 1: KB retrieval — replaces old selectKBSections ──
+const { retrieveKBChunks } = require('./kbRetrieval');
 
 const app = express();
 app.use(express.json());
@@ -39,115 +43,10 @@ const HUMAN_TIMEOUT_MS  = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000', 10
 [['INTERAKT_API_KEY', INTERAKT_API_KEY], ['ANTHROPIC_API_KEY', ANTHROPIC_API_KEY], ['MONGODB_URI', MONGODB_URI]]
   .forEach(([k, v]) => v ? console.log(`✅  ENV loaded:  ${k}`) : console.error(`❌  ENV MISSING: ${k}`));
 
-// ─────────────────────────────────────────────
-// KNOWLEDGE BASE — SELECTIVE RETRIEVAL
-//
-// ⚠️  DO NOT embed KNOWLEDGE_BASE in ADVISOR_SYSTEM_PROMPT.
-//     It is injected per-request only for the relevant jurisdiction(s).
-//     This is the #1 fix for rate limit / token overuse.
-//
-// HOW TO ADD YOUR KNOWLEDGE BASE:
-//   1. Keep each jurisdiction as a separate string in KB_SECTIONS below.
-//   2. Each key maps to a lowercase keyword array used for routing.
-//   3. The router (selectKBSections) picks only the relevant 1-2 sections
-//      per request — never the whole thing at once.
-//
-// EXAMPLE STRUCTURE (paste your content in each string):
-//
-// const KB_SECTIONS = {
-//   usa: {
-//     keywords: ['usa','united states','america','delaware','wyoming','llc','c-corp'],
-//     content: `...your USA knowledge base text...`
-//   },
-//   fema: {
-//     keywords: ['fema','odi','rbi','apr','fla','form oi','lrs','outward remittance'],
-//     content: `...your FEMA/ODI knowledge base text...`
-//   },
-//   // ... etc
-// };
-// ─────────────────────────────────────────────
-
-const KB_SECTIONS = {
-  usa: {
-    keywords: ['usa','united states','america','delaware','wyoming','nevada','florida','texas','new mexico','llc','c-corp','s-corp','form 5472','ein','fincen','boi','mercury','relay'],
-    content: `[PASTE USA KNOWLEDGE BASE HERE]`
-  },
-  fema: {
-    keywords: ['fema','odi','rbi','apr','fla return','form oi','lrs','outward remittance','round-trip','flip','uin','ad bank','authorised dealer','compounding','lsf'],
-    content: `[PASTE FEMA/ODI KNOWLEDGE BASE HERE]`
-  },
-  canada: {
-    keywords: ['canada','toronto','vancouver','calgary','ontario','cra','gst','hst','cbca','obca','cusma','cptpp','ceta','pei','asc'],
-    content: `[PASTE CANADA KNOWLEDGE BASE HERE]`
-  },
-  uk: {
-    keywords: ['uk','united kingdom','britain','england','companies house','hmrc','vat','ltd','paye','corporation tax','visa uk','skilled worker','innovator','eccta'],
-    content: `[PASTE UK KNOWLEDGE BASE HERE]`
-  },
-  singapore: {
-    keywords: ['singapore','pte ltd','acra','iras','gst singapore','cpf','ep','employment pass','entrepass','mom','one pass','pdpa','siac'],
-    content: `[PASTE SINGAPORE KNOWLEDGE BASE HERE]`
-  },
-  uae: {
-    keywords: ['uae','dubai','abu dhabi','sharjah','dmcc','jafza','difc','adgm','freezone','free zone','mainland','trade licence','emara','corporate tax uae','vat uae','golden visa','green visa'],
-    content: `[PASTE UAE KNOWLEDGE BASE HERE]`
-  },
-  philippines: {
-    keywords: ['philippines','manila','cebu','sec philippines','bir','peza','boi philippines','create act','ith','scit','sss','philhealth','pag-ibig','9g visa'],
-    content: `[PASTE PHILIPPINES KNOWLEDGE BASE HERE]`
-  },
-  thailand: {
-    keywords: ['thailand','bangkok','eec','boi thailand','dbd','fba','foreign business act','vat thailand','cit thailand','work permit thailand','smart visa','ltr visa','dbiz regist'],
-    content: `[PASTE THAILAND KNOWLEDGE BASE HERE]`
-  },
-  estonia: {
-    keywords: ['estonia','tallinn','e-residency','eresidency','ou','oü','osauhing','e-resident','xolo','1office','enty','eu company','sepa','eu vat oss'],
-    content: `[PASTE ESTONIA KNOWLEDGE BASE HERE]`
-  },
-  italy: {
-    keywords: ['italy','milan','rome','srl','spa','agenzia delle entrate','ires','irap','registro imprese','inps','ccnl','golden power italy','startup visa italy'],
-    content: `[PASTE ITALY KNOWLEDGE BASE HERE]`
-  },
-  vietnam: {
-    keywords: ['vietnam','ho chi minh','hanoi','llc vietnam','firc','vat vietnam','cit vietnam','work permit vietnam','pdp vietnam','binh duong','dong nai','bac ninh'],
-    content: `[PASTE VIETNAM KNOWLEDGE BASE HERE]`
-  },
-  indonesia: {
-    keywords: ['indonesia','jakarta','bali','batam','pt pma','kbli','oss','rba','coretax','npwp','vat indonesia','cit indonesia','bpjs','rptka','itas','dhi','dhie'],
-    content: `[PASTE INDONESIA KNOWLEDGE BASE HERE]`
-  },
-  general: {
-    keywords: ['document','passport','aadhar','pan card','business plan','required','checklist','contact','pricing','quote','fee','cost'],
-    content: `[PASTE DOCUMENTS REQUIRED + CONTACT & PRICING SECTION HERE]`
-  },
-};
-
-/**
- * Selects the 1–2 most relevant KB sections for a given user message.
- * Returns a compact string to inject into the system prompt.
- * If no match: returns empty string (no KB injected — keeps tokens low).
- */
-function selectKBSections(userMessage) {
-  const lower = userMessage.toLowerCase();
-  const scored = [];
-
-  for (const [key, section] of Object.entries(KB_SECTIONS)) {
-    let score = 0;
-    for (const kw of section.keywords) {
-      if (lower.includes(kw)) score++;
-    }
-    if (score > 0) scored.push({ key, score, content: section.content });
-  }
-
-  // Sort by relevance, take top 2
-  scored.sort((a, b) => b.score - a.score);
-  const top = scored.slice(0, 2);
-
-  if (top.length === 0) return '';
-
-  return '\n\n[KNOWLEDGE BASE — RELEVANT SECTIONS]\n' +
-    top.map(s => s.content).join('\n\n---\n\n');
-}
+// ── CHANGE 2: KB_SECTIONS and selectKBSections() removed ─────
+// KB is now loaded from kb.json and retrieved via kbRetrieval.js
+// To update the KB: edit build-kb.js → node build-kb.js → commit kb.json
+// ─────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────
 // ADVISOR SYSTEM PROMPT — STATIC BASE
@@ -271,12 +170,7 @@ function newState(phone) {
     phone,
     phase: 'new',           // new | onboarding | advisory | escalating | human_mode
     topicsDiscussed: [],
-    // ── DETERMINISTIC MENU ENGINE ──────────────────────────────────
-    // lastMenu is the ONLY source of truth for active menu options.
-    // It is set deterministically by parseMenuFromReply() — never by LLM memory.
-    // It persists until: user selects a valid option, topic changes clearly, or new menu replaces it.
     lastMenu: null,         // { id, options: string[4], context: string, createdAt: number }
-    // ────────────────────────────────────────────────────────────────
     humanMode: false,
     humanModeAt: null,
     pendingHandoff: false,
@@ -345,10 +239,8 @@ function extractName(msg) {
   if (t.length > 80) return null;
   if (t.includes('?')) return null;
   const lower = t.toLowerCase();
-  // Reject if message contains business/query keywords
   if (/tell me|about|how|what|expand|incorporat|setup|looking|need|want|tax|bank|fema|odi|visa|compli|register|market|country|jurisdict/.test(lower)) return null;
 
-  // Try explicit introduction pattern first
   const intro = t.match(NAME_INTRO_RE);
   if (intro) {
     const candidate = intro[1].trim();
@@ -358,7 +250,6 @@ function extractName(msg) {
     }
   }
 
-  // Try standalone name (short message that looks like just a name)
   const standalone = t.match(NAME_STANDALONE_RE);
   if (standalone) {
     const candidate = standalone[1].trim();
@@ -457,7 +348,6 @@ function inferTopic(msg) {
 // ─────────────────────────────────────────────
 const HUMAN_RE = /\b(human|agent|speak to|talk to|real person|connect me|your team|manager|expert|someone from|call me|get me)\b/i;
 
-// Ordinal word → number
 const ORDINAL_MAP = { first: 1, second: 2, third: 3, fourth: 4, '1st': 1, '2nd': 2, '3rd': 3, '4th': 4 };
 
 function detectIntent(msg) {
@@ -465,21 +355,17 @@ function detectIntent(msg) {
 
   if (HUMAN_RE.test(lower)) return { type: 'human_request' };
 
-  // Ordinal words: "third one", "the second", "fourth option"
   for (const [word, num] of Object.entries(ORDINAL_MAP)) {
     if (lower.includes(word)) return { type: 'menu_select', num };
   }
 
-  // "last option" → 4
   if (/\blast\b/.test(lower) && lower.length < 25) return { type: 'menu_select', num: 4 };
 
-  // Numeric selection: "3", "option 3", "question 3", "#3"
   const numMatch = lower.match(/(?:^|\b)(?:option\s*|question\s*|no\.?\s*|#\s*)?([1-4])(?:\b|$)/);
   if (numMatch && lower.replace(/\D/g, '').length <= 2 && lower.length < 35) {
     return { type: 'menu_select', num: parseInt(numMatch[1]) };
   }
 
-  // Out-of-range number
   const badNum = lower.match(/(?:^|\b)(?:option\s*|question\s*)?([5-9]|1[0-9])(?:\b|$)/);
   if (badNum && lower.length < 20) return { type: 'invalid_menu' };
 
@@ -493,13 +379,9 @@ const GREETING_RE = /^(hi|hey|hello|good morning|good evening|good afternoon|hol
 
 // ─────────────────────────────────────────────
 // DETERMINISTIC MENU PARSER
-// Parses options from Claude's reply and stores them.
-// Supports: 1️⃣ text, 1. text, 1) text
 // ─────────────────────────────────────────────
 function parseMenuFromReply(reply) {
-  // Emoji number: 1️⃣  2️⃣  3️⃣  4️⃣
   const emojiRE = /[1-4]️⃣\s*(.+?)(?=\n[1-4]️⃣|\n*$)/g;
-  // Plain: 1. text or 1) text
   const plainRE = /^([1-4])[.)]\s*(.+)/gm;
 
   let opts = [];
@@ -513,7 +395,6 @@ function parseMenuFromReply(reply) {
   }
 
   if (opts.length >= 3) {
-    // Pad to 4 if only 3
     while (opts.length < 4) opts.push(opts[opts.length - 1]);
     return opts.slice(0, 4);
   }
@@ -522,7 +403,6 @@ function parseMenuFromReply(reply) {
 
 // ─────────────────────────────────────────────
 // CONTEXT BLOCK — compact, per-request injection
-// This is what Claude sees about the user each call — keep it tiny.
 // ─────────────────────────────────────────────
 function buildContextBlock(mem, state) {
   const lines = [];
@@ -533,7 +413,6 @@ function buildContextBlock(mem, state) {
   if (state.topicsDiscussed.length > 0) lines.push(`Topics: ${state.topicsDiscussed.slice(-4).join(', ')}`);
   if (state.phase)        lines.push(`Phase: ${state.phase}`);
 
-  // Active menu — critical for menu continuity
   if (state.lastMenu) {
     const m = state.lastMenu;
     lines.push(`\n[ACTIVE MENU — context: "${m.context}"]\n1. ${m.options[0]}\n2. ${m.options[1]}\n3. ${m.options[2]}\n4. ${m.options[3]}`);
@@ -543,16 +422,14 @@ function buildContextBlock(mem, state) {
 }
 
 // ─────────────────────────────────────────────
-// TOKEN ESTIMATOR — rough character-based estimate
-// Prevents accidental oversized requests
+// TOKEN ESTIMATOR
 // ─────────────────────────────────────────────
 function estimateTokens(text) {
-  // ~4 chars per token on average
   return Math.ceil((text || '').length / 4);
 }
 
 // ─────────────────────────────────────────────
-// RATE LIMIT STATE — per-process, resets with server
+// RATE LIMIT STATE
 // ─────────────────────────────────────────────
 let _rateLimitUntil = 0;
 let _rateLimitRetryAfter = 0;
@@ -561,7 +438,6 @@ let _rateLimitRetryAfter = 0;
 // CLAUDE API CALL — token-safe, rate-limit-aware
 // ─────────────────────────────────────────────
 async function callClaude(session, state, mem, userMessage, kbSection, phaseHint) {
-  // Check if we're in rate-limit backoff
   if (Date.now() < _rateLimitUntil) {
     const waitSec = Math.ceil((_rateLimitUntil - Date.now()) / 1000);
     console.warn(`⚠️  Rate limit active — ${waitSec}s remaining`);
@@ -571,16 +447,13 @@ async function callClaude(session, state, mem, userMessage, kbSection, phaseHint
   const contextBlock = buildContextBlock(mem, state);
   const systemPrompt = ADVISOR_SYSTEM_PROMPT + contextBlock + (phaseHint || '') + (kbSection || '');
 
-  // Use only last 6 history messages — 3 turns — enough for context, minimal tokens
   const history = session.history.slice(-6);
   const messages = [...history, { role: 'user', content: userMessage }];
 
-  // Rough token check — warn if approaching limits
   const estimatedInputTokens = estimateTokens(systemPrompt) + estimateTokens(JSON.stringify(messages));
   console.log(`📊  Est. input tokens: ~${estimatedInputTokens}`);
   if (estimatedInputTokens > 25000) {
     console.warn(`⚠️  Large prompt detected (${estimatedInputTokens} est. tokens) — trimming history further`);
-    // Emergency: trim to 4 messages
     messages.splice(0, Math.max(0, messages.length - 5));
   }
 
@@ -602,7 +475,6 @@ async function callClaude(session, state, mem, userMessage, kbSection, phaseHint
 
     const data = await response.json();
 
-    // ── Rate limit handling ──
     if (response.status === 429) {
       const retryAfter = parseInt(data?.error?.message?.match(/\d+/)?.[0] || '60');
       _rateLimitUntil = Date.now() + (retryAfter * 1000);
@@ -616,7 +488,6 @@ async function callClaude(session, state, mem, userMessage, kbSection, phaseHint
       return { reply: null, rateLimited: false };
     }
 
-    // Clear rate limit state on success
     _rateLimitUntil = 0;
 
     const reply = (data.content || [])
@@ -663,7 +534,6 @@ async function send(phone, text) {
 
 // ─────────────────────────────────────────────
 // STRUCTURED HANDOFF EMAIL
-// Built entirely from structured memory — zero LLM, zero hallucination risk.
 // ─────────────────────────────────────────────
 async function sendHandoffEmail(phone, mem, session, extraInfo) {
   if (!RESEND_API_KEY || !NOTIFY_EMAIL) { console.warn('⚠️  Email not configured'); return; }
@@ -674,7 +544,6 @@ async function sendHandoffEmail(phone, mem, session, extraInfo) {
   const service  = mem.serviceNeeded  || 'Not specified';
   const email    = mem.email          || 'Not provided';
 
-  // Raw last 8 turns — no LLM summarisation
   const chatLog = session.history.slice(-8)
     .map(m => `${m.role === 'user' ? '👤 Customer' : '🤖 Advisor'}: ${m.content}`)
     .join('\n\n');
@@ -741,7 +610,6 @@ app.post('/webhook', async (req, res) => {
 
     console.log(`\n📩  [${phone}] "${rawMsg}"`);
 
-    // Detect first-time user before loading (avoids loading empty docs)
     const isFirstTime = sessionsCol ? !(await sessionsCol.findOne({ phone })) : !cGet('session', phone);
 
     const [session, state, mem] = await Promise.all([
@@ -793,7 +661,7 @@ app.post('/webhook', async (req, res) => {
       state.humanMode        = true;
       state.humanModeAt      = new Date();
       state.phase            = 'human_mode';
-      state.lastMenu         = null; // clear any active menu
+      state.lastMenu         = null;
 
       await sendHandoffEmail(phone, mem, session, extraInfo);
       await Promise.all([saveSession(session), saveState(state)]);
@@ -813,13 +681,11 @@ app.post('/webhook', async (req, res) => {
       console.log(`📝  Entities:`, entityUpdates);
     }
 
-    // Topic tracking
     const topic = inferTopic(rawMsg);
     if (topic && !state.topicsDiscussed.includes(topic)) {
       state.topicsDiscussed.push(topic);
     }
 
-    // Phase update
     if (state.phase === 'new' || state.phase === 'onboarding') {
       if (mem.name && mem.targetCountry) state.phase = 'advisory';
     }
@@ -844,7 +710,6 @@ app.post('/webhook', async (req, res) => {
 
     // ── 5b. Invalid menu number ──
     if (intent.type === 'invalid_menu') {
-      // KEEP lastMenu active — don't clear it
       const msg = state.lastMenu
         ? `I had options 1 to 4 there — did you mean one of those? 😊 Or go ahead and ask directly!`
         : `Just ask me anything directly and I'll help you out!`;
@@ -861,15 +726,15 @@ app.post('/webhook', async (req, res) => {
       const selected = state.lastMenu.options[num - 1];
       if (selected) {
         console.log(`📋  Menu ${num} selected: "${selected}"`);
-        // Select relevant KB section for this option
-        const kbSection = selectKBSections(selected);
+
+        // CHANGE 3: was selectKBSections(selected)
+        const kbSection = retrieveKBChunks(selected);
         const menuHint  = `\n\n[INSTRUCTION: The user selected option ${num}: "${selected}" from the active menu. Answer this question fully and accurately from the knowledge base. You may show new follow-up options after answering.]`;
 
         const { reply, rateLimited, waitSec } = await callClaude(session, state, mem, selected, kbSection, menuHint);
 
         if (rateLimited) {
           await send(phone, rateLimitResponse(waitSec || 60));
-          // Don't push to history — let them retry
           return;
         }
         if (!reply) {
@@ -881,7 +746,6 @@ app.post('/webhook', async (req, res) => {
         session.history.push({ role: 'user', content: rawMsg });
         session.history.push({ role: 'assistant', content: reply });
 
-        // Update or clear menu deterministically
         const newMenu = parseMenuFromReply(reply);
         state.lastMenu = newMenu
           ? { id: Date.now(), options: newMenu, context: selected, createdAt: Date.now() }
@@ -912,10 +776,9 @@ app.post('/webhook', async (req, res) => {
     // 7. STANDARD CLAUDE ADVISORY RESPONSE
     // ══════════════════════════════════════════════
 
-    // Select relevant KB sections (only what's needed for this query)
-    const kbSection = selectKBSections(rawMsg);
+    // CHANGE 4: was selectKBSections(rawMsg)
+    const kbSection = retrieveKBChunks(rawMsg);
 
-    // Phase-specific instruction hint
     let phaseHint = '';
     if (state.phase === 'onboarding' || state.phase === 'new') {
       if (!mem.name) {
@@ -940,15 +803,11 @@ app.post('/webhook', async (req, res) => {
     session.history.push({ role: 'user', content: rawMsg });
     session.history.push({ role: 'assistant', content: reply });
 
-    // Parse and store any menu Claude generated
     const newMenu = parseMenuFromReply(reply);
     if (newMenu) {
       state.lastMenu = { id: Date.now(), options: newMenu, context: topic || rawMsg.substring(0, 60), createdAt: Date.now() };
       console.log(`📋  Menu stored: [${newMenu.join(' | ')}]`);
     }
-    // Note: if no menu in reply, we intentionally KEEP the previous lastMenu active
-    // (don't clear it on unrelated short replies or interruptions)
-    // It only gets cleared when: new menu replaces it, valid selection made, or handoff triggered.
 
     await Promise.all([saveSession(session), saveState(state), saveMemory(mem)]);
 
@@ -969,7 +828,6 @@ app.get('/health', (req, res) => res.json({
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-// Full reset — dev/test only
 app.post('/reset/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   ['session','state','memory'].forEach(s => _cache[s].delete(phone));
@@ -982,7 +840,6 @@ app.post('/reset/:phone', async (req, res) => {
   res.json({ success: true });
 });
 
-// Release human mode (call after agent finishes)
 app.post('/release-human/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   const state = await getState(phone);
@@ -993,7 +850,6 @@ app.post('/release-human/:phone', async (req, res) => {
   res.json({ success: true, message: `Bot resumed for ${phone}` });
 });
 
-// Debug view
 app.get('/debug/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   const [session, state, mem] = await Promise.all([getSession(phone), getState(phone), getMemory(phone)]);
@@ -1012,7 +868,7 @@ const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🚀  ComplyGlobally Bot v4.0 — Token-Efficient Edition`);
+    console.log(`\n🚀  ComplyGlobally Bot v4.1 — BM25 KB Edition`);
     console.log(`📡  Port: ${PORT}`);
     console.log(`📮  POST /webhook`);
     console.log(`❤️   GET  /health`);
