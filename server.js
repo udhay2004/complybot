@@ -3,7 +3,7 @@
 /**
  * ============================================================
  *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  PRODUCTION EDITION v4.1
+ *  PRODUCTION EDITION v4.2
  *  Token-Efficient | Menu-Deterministic | Rate-Limit-Safe
  *  KB: BM25 semantic retrieval via kbRetrieval.js + kb.json
  * ============================================================
@@ -344,32 +344,91 @@ function inferTopic(msg) {
 }
 
 // ─────────────────────────────────────────────
-// INTENT DETECTION — deterministic, no LLM needed
+// INTENT CLASSIFICATION — Claude-powered
+// Replaces fragile regex. Handles all edge cases correctly.
+// Falls back to deterministic logic if API call fails.
 // ─────────────────────────────────────────────
-const HUMAN_RE = /\b(human|agent|speak to|talk to|real person|connect me|your team|manager|expert|someone from|call me|get me)\b/i;
-
 const ORDINAL_MAP = { first: 1, second: 2, third: 3, fourth: 4, '1st': 1, '2nd': 2, '3rd': 3, '4th': 4 };
 
-function detectIntent(msg) {
+async function classifyIntent(msg) {
+  // ── Step 1: Fast deterministic pre-checks (no LLM cost) ──
+
   const lower = msg.toLowerCase().trim();
 
-  if (HUMAN_RE.test(lower)) return { type: 'human_request' };
-
+  // Ordinal words → always menu
   for (const [word, num] of Object.entries(ORDINAL_MAP)) {
     if (lower.includes(word)) return { type: 'menu_select', num };
   }
 
+  // "last" as menu selection
   if (/\blast\b/.test(lower) && lower.length < 25) return { type: 'menu_select', num: 4 };
 
-  const numMatch = lower.match(/(?:^|\b)(?:option\s*|question\s*|no\.?\s*|#\s*)?([1-4])(?:\b|$)/);
+  // Pure number input → menu or invalid_menu (deterministic, safe)
+  const numMatch = lower.match(/(?:^|\b)(?:option\s*|question\s*|no\.?\s*|#\s*)?([1-9]|1[0-9])(?:\b|$)/);
   if (numMatch && lower.replace(/\D/g, '').length <= 2 && lower.length < 35) {
-    return { type: 'menu_select', num: parseInt(numMatch[1]) };
+    const num = parseInt(numMatch[1]);
+    if (num >= 1 && num <= 4) return { type: 'menu_select', num };
+    return { type: 'invalid_menu' };
   }
 
-  const badNum = lower.match(/(?:^|\b)(?:option\s*|question\s*)?([5-9]|1[0-9])(?:\b|$)/);
-  if (badNum && lower.length < 20) return { type: 'invalid_menu' };
+  // ── Step 2: Claude classifies human_request vs query ──
+  // Only reaches here for natural language messages
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 10,
+        messages: [{
+          role: 'user',
+          content: `You are classifying a WhatsApp message sent to a business chatbot.
 
-  return { type: 'query' };
+Reply with ONLY the word HANDOFF or QUERY. Nothing else. No punctuation.
+
+HANDOFF = the user is clearly and directly requesting to speak with a human sales agent, be contacted by the team, or be transferred to a real person. Must be an explicit request for human contact.
+
+QUERY = everything else — questions, greetings, giving their name, opinions, statements, complaints, casual remarks, nicknames, anything that is NOT a direct request for human contact.
+
+Key rule: If there is ANY doubt, reply QUERY.
+
+Examples:
+"connect me to your team" → HANDOFF
+"I want to speak to a human" → HANDOFF
+"can someone from your team call me" → HANDOFF
+"get me a real person" → HANDOFF
+"I'd like to talk to your sales team" → HANDOFF
+"my name is human" → QUERY
+"you can call me UD" → QUERY
+"I've seen better agents than you" → QUERY
+"talk to me" → QUERY
+"I'm an expert in taxation" → QUERY
+"I have seen better agents" → QUERY
+"what are your fees" → QUERY
+"hi there" → QUERY
+"udhay but you can call me ud" → QUERY
+
+Message: "${msg.replace(/"/g, "'")}"`
+        }],
+      }),
+    });
+
+    const data = await response.json();
+    const result = ((data.content?.[0]?.text) || '').trim().toUpperCase();
+    console.log(`🧠  Intent classify: "${msg.substring(0, 50)}" → ${result}`);
+
+    if (result === 'HANDOFF') return { type: 'human_request' };
+    return { type: 'query' };
+
+  } catch (err) {
+    // ── Fallback: if Claude call fails, default to query (safe default) ──
+    console.warn(`⚠️  classifyIntent API failed, defaulting to query: ${err.message}`);
+    return { type: 'query' };
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -763,9 +822,9 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ══════════════════════════════════════════════
-    // 5. INTENT ROUTING — deterministic, no LLM
+    // 5. INTENT ROUTING — Claude-powered classification
     // ══════════════════════════════════════════════
-    const intent = detectIntent(rawMsg);
+    const intent = await classifyIntent(rawMsg);
 
     // ── 5a. Human handoff request ──
     if (intent.type === 'human_request') {
@@ -799,7 +858,6 @@ app.post('/webhook', async (req, res) => {
       if (selected) {
         console.log(`📋  Menu ${num} selected: "${selected}"`);
 
-        // CHANGE 3: was selectKBSections(selected)
         const kbSection = retrieveKBChunks(selected);
         const menuHint  = `\n\n[INSTRUCTION: The user selected option ${num}: "${selected}" from the active menu. Answer this question fully and accurately from the knowledge base. You may show new follow-up options after answering.]`;
 
@@ -848,7 +906,6 @@ app.post('/webhook', async (req, res) => {
     // 7. STANDARD CLAUDE ADVISORY RESPONSE
     // ══════════════════════════════════════════════
 
-    // CHANGE 4: was selectKBSections(rawMsg)
     const kbSection = retrieveKBChunks(rawMsg);
 
     let phaseHint = '';
@@ -940,7 +997,7 @@ const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🚀  ComplyGlobally Bot v4.1 — BM25 KB Edition`);
+    console.log(`\n🚀  ComplyGlobally Bot v4.2 — Claude Intent Classification`);
     console.log(`📡  Port: ${PORT}`);
     console.log(`📮  POST /webhook`);
     console.log(`❤️   GET  /health`);
