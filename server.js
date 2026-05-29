@@ -3,29 +3,38 @@
 /**
  * ============================================================
  *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  PRODUCTION EDITION v4.3 — QA-Hardened
- *  22 production issues fixed. See CHANGELOG below.
+ *  PRODUCTION EDITION v4.4 — Smart Handoff Edition
+ *  All 22 prior QA fixes retained. New in v4.4:
  *
- *  FIX #1  — classifyIntent: HANDOFF_VOCAB pre-screen (no double LLM call on every msg)
- *  FIX #2  — classifyIntent: smart fallback — if vocab present + classifier fails → HANDOFF
- *  FIX #3  — extractName: country names rejected via ALL_COUNTRIES set
- *  FIX #4  — extractName: 'call me maybe' blocked; expanded ambiguous-word blacklist
- *  FIX #5  — pendingHandoff: short/single-word replies treated as no-extra-info
- *  FIX #6  — extractName: 'i am' and "i'm" removed from NAME_INTRO_RE (too ambiguous)
- *  FIX #7  — classifyIntent: number match anchored to full message (no false triggers)
+ *  FIX #23 — classifyIntent: returns rich handoff details object
+ *             (scheduledTime, preferredChannel, urgency, impossible, rawPreference)
+ *  FIX #24 — buildHandoffMessage(): context-aware handoff messages
+ *             handles: scheduled time, video call, urgency, "ask your team",
+ *             impossible requests (Taylor Swift etc.), default fallback
+ *  FIX #25 — state.handoffDetails stored so confirmation msg can reference it
+ *  FIX #26 — pendingHandoff confirmation is context-aware (mentions time if given)
+ *
+ *  Prior fixes (all retained):
+ *  FIX #1  — classifyIntent: HANDOFF_VOCAB pre-screen
+ *  FIX #2  — classifyIntent: smart fallback on classifier failure
+ *  FIX #3  — extractName: country names rejected
+ *  FIX #4  — extractName: expanded ambiguous-word blacklist
+ *  FIX #5  — pendingHandoff: short replies treated as no-extra-info
+ *  FIX #6  — extractName: 'i am' / "i'm" removed from NAME_INTRO_RE
+ *  FIX #7  — classifyIntent: number match anchored to full message
  *  FIX #8  — isFirstTime: atomic MongoDB insertOne with duplicate-key guard
  *  FIX #9  — extractEntities: negation detection before country extraction
  *  FIX #10 — humanMode expiry: bot resumption message sent to user
  *  FIX #11 — parseMenuFromReply: NFC normalize + robust emoji digit regex
- *  FIX #12 — ADVISOR_SYSTEM_PROMPT: prompt injection resistance instruction added
- *  FIX #13 — extractName: corporate suffix rejection ('calling','support','corp'…)
- *  FIX #14 — covered by FIX #7 (number anchor fix)
+ *  FIX #12 — ADVISOR_SYSTEM_PROMPT: prompt injection resistance added
+ *  FIX #13 — extractName: corporate suffix rejection
+ *  FIX #14 — covered by FIX #7
  *  FIX #15 — GREETING_RE handler: skips if phase is escalating or human_mode
  *  FIX #16 — extractEntities: email only captured with personal ownership context
- *  FIX #17 — menu_select with null lastMenu: explicit graceful handler added
- *  FIX #18 — saveSession: individual messages truncated at 800 chars before storage
- *  FIX #19 — sendHandoffEmail: short-history warning added to email log
- *  FIX #20 — emoji-only messages: detected and handled gracefully before pipeline
+ *  FIX #17 — menu_select with null lastMenu: graceful handler added
+ *  FIX #18 — saveSession: individual messages truncated at 800 chars
+ *  FIX #19 — sendHandoffEmail: short-history warning added
+ *  FIX #20 — emoji-only messages: detected and handled gracefully
  *  FIX #21 — topicsDiscussed: capped at 20 entries
  *  FIX #22 — GREETING_RE returning-user check: requires session age > 1 hour
  * ============================================================
@@ -190,6 +199,7 @@ function truncateMsg(text) {
 
 // ─────────────────────────────────────────────
 // ACTIVE STATE — conversation flow + deterministic menu engine
+// FIX #25: handoffDetails added to state for context-aware confirmation
 // ─────────────────────────────────────────────
 function newState(phone) {
   return {
@@ -201,6 +211,7 @@ function newState(phone) {
     humanModeAt: null,
     pendingHandoff: false,
     handoffEmailSent: false,
+    handoffDetails: null,   // FIX #25: stores rich handoff context for confirmation msg
     lastActive: new Date(),
   };
 }
@@ -210,6 +221,7 @@ async function getState(phone) {
   let s = activeStateCol ? await activeStateCol.findOne({ phone }) : null;
   if (!s) s = newState(phone);
   s.topicsDiscussed = s.topicsDiscussed || [];
+  s.handoffDetails  = s.handoffDetails  || null; // FIX #25: backwards compat
   cSet('state', phone, s);
   return s;
 }
@@ -461,7 +473,7 @@ function inferTopic(msg) {
 // FIX #1:  HANDOFF_VOCAB pre-screen — skip Claude call if no handoff vocab present
 // FIX #2:  Smart fallback — if vocab present + classifier fails → HANDOFF (safer)
 // FIX #7:  Number match anchored to full message (prevents false menu triggers)
-// FIX #14: Covered by FIX #7
+// FIX #23: Returns rich handoffDetails for context-aware responses
 // ─────────────────────────────────────────────
 const ORDINAL_MAP = { first: 1, second: 2, third: 3, fourth: 4, '1st': 1, '2nd': 2, '3rd': 3, '4th': 4 };
 
@@ -491,7 +503,8 @@ async function classifyIntent(msg) {
   // FIX #1: Pre-screen — if no handoff vocabulary, skip Claude entirely
   if (!HANDOFF_VOCAB.test(lower)) return { type: 'query' };
 
-  // ── Claude classifies: HANDOFF vs QUERY ──
+  // ── Claude classifies: HANDOFF (with details) vs QUERY ──
+  // FIX #23: Upgraded prompt — returns JSON with rich context for smart responses
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -502,36 +515,55 @@ async function classifyIntent(msg) {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 10,
+        max_tokens: 120,
         messages: [{
           role: 'user',
-          content: `You are classifying a WhatsApp message sent to a business chatbot.
+          content: `You are classifying a WhatsApp message sent to a business chatbot for Comply Globally, a company that helps businesses expand internationally.
 
-Reply with ONLY the word HANDOFF or QUERY. Nothing else. No punctuation.
+Reply with ONLY valid JSON. No explanation, no markdown, no extra text.
 
-HANDOFF = the user is clearly and directly requesting to speak with a human sales agent, be contacted by the team, or be transferred to a real person. Must be an explicit request for human contact.
+Decide if this is a genuine HANDOFF request (user wants to speak with a real human from the Comply Globally team) or a QUERY (everything else).
 
-QUERY = everything else — questions, greetings, giving their name, opinions, statements, complaints, casual remarks, nicknames, anything that is NOT a direct request for human contact.
+Return this exact JSON structure:
+{
+  "intent": "HANDOFF" or "QUERY",
+  "impossible": true/false,
+  "impossibleReason": "brief reason if impossible, else null",
+  "scheduledTime": "extracted time/date string if user mentions specific time, else null",
+  "urgency": "immediate" or "normal" or null,
+  "preferredChannel": "phone" or "video" or "email" or "whatsapp" or null,
+  "wantsToCheckAvailability": true/false,
+  "rawPreference": "brief summary of any timing/channel preference mentioned, else null"
+}
 
-Key rule: If there is ANY doubt, reply QUERY.
+RULES FOR INTENT:
+- HANDOFF = user explicitly wants a real human from Comply Globally to contact them or speak with them now
+- QUERY = everything else (questions, greetings, giving name, complaints, jokes, requests for non-human entities)
+- If ANY doubt exists → QUERY
+- "impossible" = true when user asks to be connected to a famous person, fictional character, celebrity, or someone clearly not part of the Comply Globally team (e.g. Taylor Swift, Elon Musk, a doctor, a lawyer by name, God, etc.)
+- If impossible=true, set intent=QUERY regardless
 
-Examples:
+HANDOFF examples:
 "connect me to your team" → HANDOFF
-"I want to speak to a human" → HANDOFF
-"can someone from your team call me" → HANDOFF
-"get me a real person" → HANDOFF
-"I'd like to talk to your sales team" → HANDOFF
+"I want to speak to a human" → HANDOFF  
+"can someone call me at 4pm?" → HANDOFF, scheduledTime="4pm"
+"connect me right now" → HANDOFF, urgency="immediate"
+"I want a video call with your advisor" → HANDOFF, preferredChannel="video"
+"let me know when your team is free" → HANDOFF, wantsToCheckAvailability=true
+"connect me tomorrow morning" → HANDOFF, scheduledTime="tomorrow morning"
+"can I get a call between 10 and 11am IST?" → HANDOFF, scheduledTime="10-11am IST"
+
+QUERY / impossible examples:
+"connect me to Taylor Swift" → QUERY, impossible=true, impossibleReason="Taylor Swift is not part of the Comply Globally team"
+"connect me to Elon Musk" → QUERY, impossible=true
+"connect me to a doctor" → QUERY, impossible=true, impossibleReason="Not a medical service"
 "my name is human" → QUERY
 "you can call me UD" → QUERY
-"I've seen better agents than you" → QUERY
+"I've seen better agents" → QUERY
 "talk to me" → QUERY
-"I'm an expert in taxation" → QUERY
-"I have seen better agents" → QUERY
 "what are your fees" → QUERY
-"hi there" → QUERY
-"udhay but you can call me ud" → QUERY
+"I'm an expert in taxation" → QUERY
 "I want to speak to someone about banking" → HANDOFF
-"let me speak to a person" → HANDOFF
 
 Message: "${msg.replace(/"/g, "'")}"`
         }],
@@ -539,18 +571,153 @@ Message: "${msg.replace(/"/g, "'")}"`
     });
 
     const data = await response.json();
-    const result = ((data.content?.[0]?.text) || '').trim().toUpperCase();
-    console.log(`🧠  Intent classify: "${msg.substring(0, 50)}" → ${result}`);
+    const rawText = ((data.content?.[0]?.text) || '').trim();
+    console.log(`🧠  Intent classify raw: "${msg.substring(0, 50)}" → ${rawText}`);
 
-    if (result === 'HANDOFF') return { type: 'human_request' };
+    // Parse the JSON response
+    let parsed;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      // JSON parse failed — fall through to safe defaults below
+      parsed = null;
+    }
+
+    if (parsed) {
+      // Impossible request — treat as QUERY but with context
+      if (parsed.impossible) {
+        console.log(`🚫  Impossible handoff: ${parsed.impossibleReason}`);
+        return {
+          type: 'query',
+          impossibleHandoff: true,
+          impossibleReason: parsed.impossibleReason || 'That person is not part of our team',
+        };
+      }
+
+      if (parsed.intent === 'HANDOFF') {
+        return {
+          type: 'human_request',
+          details: {
+            scheduledTime:           parsed.scheduledTime           || null,
+            urgency:                 parsed.urgency                 || 'normal',
+            preferredChannel:        parsed.preferredChannel        || null,
+            wantsToCheckAvailability: parsed.wantsToCheckAvailability || false,
+            rawPreference:           parsed.rawPreference           || null,
+          },
+        };
+      }
+
+      return { type: 'query' };
+    }
+
+    // JSON parse failed — use legacy text fallback
+    const fallbackText = rawText.toUpperCase();
+    if (fallbackText.includes('HANDOFF')) return { type: 'human_request', details: { urgency: 'normal' } };
     return { type: 'query' };
 
   } catch (err) {
     // FIX #2: If classifier fails AND handoff vocab was present → safer to trigger handoff
     console.error(`❌  classifyIntent failed: ${err.message}`);
     console.warn(`⚠️  Classifier failed with handoff vocab present — triggering handoff as safe default`);
-    return { type: 'human_request' };
+    return { type: 'human_request', details: { urgency: 'normal' } };
   }
+}
+
+// ─────────────────────────────────────────────
+// FIX #24: SMART HANDOFF MESSAGE BUILDER
+// Generates context-aware message based on what the user actually asked for
+// ─────────────────────────────────────────────
+function buildHandoffMessage(details, mem) {
+  const name = mem && mem.name ? `${mem.name}` : null;
+  const nameGreet = name ? `${name}, ` : '';
+  const d = details || {};
+
+  // ── Video call request ──
+  if (d.preferredChannel === 'video') {
+    return `Of course, ${nameGreet}I'd love to set that up! Our team connects via phone or WhatsApp call — we don't currently offer video consultations, but a phone call works just as well for covering everything in detail. 😊
+
+📞 You can reach them directly:
+• Email: sales@complyglobally.com
+• Phone: +1 (302) 214-1717 | +91 99999 81613
+
+They're available Monday–Saturday, 10am–7pm IST. Is there a preferred time for them to call you, or any context you'd like me to pass along?`;
+  }
+
+  // ── User wants to know when team is free / check availability ──
+  if (d.wantsToCheckAvailability) {
+    return `Absolutely! Our team is typically available Monday–Saturday, 10am–7pm IST. 🕙
+
+I'll flag your request and they'll reach out to confirm a suitable slot. If you have a preferred window, let me know and I'll include that too!
+
+📞 Or if you'd rather reach them directly:
+• Email: sales@complyglobally.com
+• Phone: +1 (302) 214-1717 | +91 99999 81613
+
+Is there any context about what you'd like to discuss that I can pass along?`;
+  }
+
+  // ── Immediate / urgent request ──
+  if (d.urgency === 'immediate') {
+    return `Got it — I'll flag this as urgent right away! 🚀
+
+📞 For the fastest response, you can reach the team directly:
+• Phone: +1 (302) 214-1717 | +91 99999 81613
+• Email: sales@complyglobally.com
+
+They're available 10am–7pm IST (Monday–Saturday). I'll also notify them to get back to you as soon as possible. Is there any additional context you'd like me to pass along?`;
+  }
+
+  // ── Specific time requested ──
+  if (d.scheduledTime) {
+    return `Perfect! I'll let our team know you'd like to connect around ${d.scheduledTime}. 🙌
+
+📋 Just so you know, our team is available Monday–Saturday, 10am–7pm IST — so if that time falls within those hours, they'll make it work. If not, they'll suggest the closest available slot.
+
+📞 Or reach them directly:
+• Email: sales@complyglobally.com
+• Phone: +1 (302) 214-1717 | +91 99999 81613
+
+Is there any additional context you'd like me to pass along before they reach out?`;
+  }
+
+  // ── Email preferred ──
+  if (d.preferredChannel === 'email') {
+    return `Of course! I'll have our team follow up with you over email. 😊
+
+📧 You can also reach them directly at: sales@complyglobally.com
+📞 Or by phone: +1 (302) 214-1717 | +91 99999 81613
+
+They're available Monday–Saturday, 10am–7pm IST. Could you share your email address, or any other context you'd like them to have?`;
+  }
+
+  // ── Default handoff (phone/general) ──
+  return `Of course! I'll connect you with our specialist team right away. 😊
+
+📞 Direct contact:
+• Email: sales@complyglobally.com
+• Phone: +1 (302) 214-1717 | +91 99999 81613
+
+They're available Monday–Saturday, 10am–7pm IST. Is there any additional context you'd like to share before they reach out?`;
+}
+
+// ─────────────────────────────────────────────
+// FIX #26: SMART HANDOFF CONFIRMATION BUILDER
+// Confirmation after user replies to the "any extra context?" question
+// ─────────────────────────────────────────────
+function buildHandoffConfirmation(details) {
+  const d = details || {};
+
+  if (d.urgency === 'immediate') {
+    return `Our team has been notified and will get back to you as soon as possible! 🚀`;
+  }
+  if (d.scheduledTime) {
+    return `Our team has been notified and will aim to connect with you around ${d.scheduledTime}! 🙌`;
+  }
+  if (d.wantsToCheckAvailability) {
+    return `Our team has been notified and will confirm a suitable time with you shortly! 🙌`;
+  }
+  // Default
+  return `Our team will be in touch with you shortly! 🙌`;
 }
 
 // ─────────────────────────────────────────────
@@ -786,7 +953,7 @@ async function send(phone, text, knownCC) {
 // STRUCTURED HANDOFF EMAIL
 // FIX #19: Short-history warning added to chat log
 // ─────────────────────────────────────────────
-async function sendHandoffEmail(phone, mem, session, extraInfo) {
+async function sendHandoffEmail(phone, mem, session, extraInfo, handoffDetails) {
   if (!RESEND_API_KEY || !NOTIFY_EMAIL) { console.warn('⚠️  Email not configured'); return; }
 
   const name    = mem.name           || 'Not provided';
@@ -794,6 +961,16 @@ async function sendHandoffEmail(phone, mem, session, extraInfo) {
   const based   = mem.currentCountry || 'Not specified';
   const service = mem.serviceNeeded  || 'Not specified';
   const email   = mem.email          || 'Not provided';
+
+  // Build handoff preference summary for email
+  const d = handoffDetails || {};
+  const prefParts = [];
+  if (d.scheduledTime)           prefParts.push(`Requested time: ${d.scheduledTime}`);
+  if (d.urgency === 'immediate') prefParts.push(`Urgency: ASAP / immediate`);
+  if (d.preferredChannel)        prefParts.push(`Preferred channel: ${d.preferredChannel}`);
+  if (d.wantsToCheckAvailability) prefParts.push(`Wants team to suggest available time`);
+  if (d.rawPreference)           prefParts.push(`Raw preference: "${d.rawPreference}"`);
+  const prefSummary = prefParts.length ? prefParts.join(' | ') : 'No specific preference';
 
   // FIX #19: Warn in the email if conversation history is very short
   const recentHistory = session.history.slice(-8);
@@ -810,10 +987,11 @@ async function sendHandoffEmail(phone, mem, session, extraInfo) {
   <table style="width:100%;border-collapse:collapse;margin:16px 0">
     <tr style="background:#f0f4f8"><td style="padding:8px 12px;font-weight:bold;width:160px">Phone</td><td style="padding:8px 12px">+${phone}</td></tr>
     <tr style="background:#fff">    <td style="padding:8px 12px;font-weight:bold">Name</td><td style="padding:8px 12px">${name}</td></tr>
-    <tr style="background:#f0f4f8"><td style="padding:8px 12px;font-weight:bold">Email</td><td style="padding:8px 12px">${email}</td></tr>
-    <tr style="background:#fff">    <td style="padding:8px 12px;font-weight:bold">Target Market</td><td style="padding:8px 12px">${target}</td></tr>
-    <tr style="background:#f0f4f8"><td style="padding:8px 12px;font-weight:bold">Based In</td><td style="padding:8px 12px">${based}</td></tr>
-    <tr style="background:#fff">    <td style="padding:8px 12px;font-weight:bold">Service</td><td style="padding:8px 12px">${service}</td></tr>
+    <tr style="background:#fff8e1"><td style="padding:8px 12px;font-weight:bold">Email</td><td style="padding:8px 12px">${email}</td></tr>
+    <tr style="background:#f0f4f8"><td style="padding:8px 12px;font-weight:bold">Target Market</td><td style="padding:8px 12px">${target}</td></tr>
+    <tr style="background:#fff">    <td style="padding:8px 12px;font-weight:bold">Based In</td><td style="padding:8px 12px">${based}</td></tr>
+    <tr style="background:#f0f4f8"><td style="padding:8px 12px;font-weight:bold">Service</td><td style="padding:8px 12px">${service}</td></tr>
+    <tr style="background:#e6f4ff"><td style="padding:8px 12px;font-weight:bold">Contact Preference</td><td style="padding:8px 12px">${prefSummary}</td></tr>
     ${extraInfo ? `<tr style="background:#fff8e1"><td style="padding:8px 12px;font-weight:bold">Extra Info</td><td style="padding:8px 12px">${extraInfo}</td></tr>` : ''}
   </table>
   <h3 style="color:#1a365d">Conversation Log</h3>
@@ -923,10 +1101,11 @@ app.post('/webhook', async (req, res) => {
       }
       // FIX #10: Timeout expired — notify user that bot is resuming
       console.log(`⏰  Human mode expired — resuming bot for ${phone}`);
-      state.humanMode   = false;
-      state.humanModeAt = null;
-      state.phase       = 'advisory';
-      const resumeMsg   = `Hi again! 👋 It looks like our team conversation has wrapped up. I'm back and ready to help with any further questions you have.`;
+      state.humanMode    = false;
+      state.humanModeAt  = null;
+      state.phase        = 'advisory';
+      state.handoffDetails = null;
+      const resumeMsg    = `Hi again! 👋 It looks like our team conversation has wrapped up. I'm back and ready to help with any further questions you have.`;
       await send(phone, resumeMsg, incomingCC);
       session.history.push({ role: 'assistant', content: resumeMsg });
       await Promise.all([saveSession(session), saveState(state)]);
@@ -935,7 +1114,8 @@ app.post('/webhook', async (req, res) => {
 
     // ══════════════════════════════════════════════
     // 3. PENDING HANDOFF — collect extra info then send email
-    // FIX #5: Short single-word replies (not email) treated as no-extra-info
+    // FIX #5:  Short single-word replies (not email) treated as no-extra-info
+    // FIX #26: Confirmation message is context-aware (uses stored handoffDetails)
     // ══════════════════════════════════════════════
     if (state.pendingHandoff) {
       const isNegative    = /^(no|nope|nothing|n\/a|nah|not really|skip|none)$/i.test(rawMsg.trim());
@@ -945,20 +1125,23 @@ app.post('/webhook', async (req, res) => {
       const isTooShort    = wordCount < 3 && !containsEmail;
       const extraInfo     = (isNegative || isTooShort) ? null : rawMsg;
 
-      const confirmMsg = `Our team will be in touch with you shortly! 🙌`;
+      // FIX #26: Use stored handoffDetails for context-aware confirmation
+      const confirmMsg = buildHandoffConfirmation(state.handoffDetails);
       await send(phone, confirmMsg, incomingCC);
 
       session.history.push({ role: 'user', content: truncateMsg(rawMsg) });
       session.history.push({ role: 'assistant', content: confirmMsg });
 
+      const savedDetails   = state.handoffDetails; // capture before clearing
       state.pendingHandoff   = false;
       state.handoffEmailSent = true;
       state.humanMode        = true;
       state.humanModeAt      = new Date();
       state.phase            = 'human_mode';
       state.lastMenu         = null;
+      state.handoffDetails   = null;
 
-      await sendHandoffEmail(phone, mem, session, extraInfo);
+      await sendHandoffEmail(phone, mem, session, extraInfo, savedDetails);
       await Promise.all([saveSession(session), saveState(state)]);
       return;
     }
@@ -1008,20 +1191,45 @@ app.post('/webhook', async (req, res) => {
     // ══════════════════════════════════════════════
     const intent = await classifyIntent(rawMsg);
 
-    // ── 5a. Human handoff request ──
+    // ── 5a. Impossible handoff (Taylor Swift, Elon Musk, etc.) ──
+    // FIX #23: Impossible requests get a polite redirect, don't trigger real handoff
+    if (intent.impossibleHandoff) {
+      const reason = intent.impossibleReason || '';
+      let impossibleMsg;
+      if (/celebrity|artist|musician|singer|actor/i.test(reason)) {
+        impossibleMsg = `Ha, I wish! 😄 Unfortunately I can only connect you with the Comply Globally specialist team. Would you like me to do that instead?`;
+      } else if (/not a medical|not a legal|doctor|lawyer/i.test(reason)) {
+        impossibleMsg = `That's a bit outside my reach! I can connect you with our business expansion specialists though — would that help?`;
+      } else {
+        impossibleMsg = `I'm afraid I can't make that connection — but I can put you in touch with our specialist team at Comply Globally. Would you like me to do that?`;
+      }
+      await send(phone, impossibleMsg, incomingCC);
+      session.history.push({ role: 'user', content: rawMsg });
+      session.history.push({ role: 'assistant', content: impossibleMsg });
+      await Promise.all([saveSession(session), saveState(state), saveMemory(mem)]);
+      return;
+    }
+
+    // ── 5b. Human handoff request ──
+    // FIX #24: Context-aware handoff message based on what user actually asked for
     if (intent.type === 'human_request') {
-      const msg = `Of course! I'll connect you with our specialist team right away. 😊\n\n📞 Direct contact:\n• Email: sales@complyglobally.com\n• Phone: +1 (302) 214-1717 | +91 99999 81613\n\nIs there any additional context you'd like to share before they reach out?`;
+      const details = intent.details || { urgency: 'normal' };
+      const msg = buildHandoffMessage(details, mem);
+
       await send(phone, msg, incomingCC);
       session.history.push({ role: 'user', content: truncateMsg(rawMsg) });
       session.history.push({ role: 'assistant', content: msg });
-      state.pendingHandoff = true;
-      state.phase          = 'escalating';
-      state.lastMenu       = null;
+
+      state.pendingHandoff  = true;
+      state.phase           = 'escalating';
+      state.lastMenu        = null;
+      state.handoffDetails  = details; // FIX #25: store for confirmation msg later
+
       await Promise.all([saveSession(session), saveState(state)]);
       return;
     }
 
-    // ── 5b. Invalid menu number ──
+    // ── 5c. Invalid menu number ──
     if (intent.type === 'invalid_menu') {
       const msg = state.lastMenu
         ? `I had options 1 to 4 there — did you mean one of those? 😊 Or go ahead and ask directly!`
@@ -1043,7 +1251,7 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // ── 5c. Valid menu selection ──
+    // ── 5d. Valid menu selection ──
     if (intent.type === 'menu_select' && state.lastMenu) {
       const num      = intent.num;
       const selected = state.lastMenu.options[num - 1];
@@ -1170,9 +1378,10 @@ app.post('/reset/:phone', async (req, res) => {
 app.post('/release-human/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   const state = await getState(phone);
-  state.humanMode   = false;
-  state.humanModeAt = null;
-  state.phase       = 'advisory';
+  state.humanMode    = false;
+  state.humanModeAt  = null;
+  state.phase        = 'advisory';
+  state.handoffDetails = null;
   await saveState(state);
   res.json({ success: true, message: `Bot resumed for ${phone}` });
 });
@@ -1182,7 +1391,7 @@ app.get('/debug/:phone', async (req, res) => {
   const [session, state, mem] = await Promise.all([getSession(phone), getState(phone), getMemory(phone)]);
   res.json({
     memory: { name: mem.name, targetCountry: mem.targetCountry, currentCountry: mem.currentCountry, serviceNeeded: mem.serviceNeeded, email: mem.email },
-    state:  { phase: state.phase, topicsDiscussed: state.topicsDiscussed, humanMode: state.humanMode, lastMenu: state.lastMenu },
+    state:  { phase: state.phase, topicsDiscussed: state.topicsDiscussed, humanMode: state.humanMode, lastMenu: state.lastMenu, handoffDetails: state.handoffDetails },
     historyLength: session.history.length,
     lastMessages: session.history.slice(-4),
   });
@@ -1195,7 +1404,7 @@ const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🚀  ComplyGlobally Bot v4.3 — QA-Hardened Production Edition`);
+    console.log(`\n🚀  ComplyGlobally Bot v4.4 — Smart Handoff Edition`);
     console.log(`📡  Port: ${PORT}`);
     console.log(`📮  POST /webhook`);
     console.log(`❤️   GET  /health`);
