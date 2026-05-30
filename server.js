@@ -3,7 +3,7 @@
 /**
  * ============================================================
  *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  PRODUCTION EDITION v4.6 — MongoDB Context Fix
+ *  PRODUCTION EDITION v4.7 — MongoDB Index Fix
  *  All 22 prior QA fixes retained. New in v4.4:
  *
  *  FIX #23 — classifyIntent: returns rich handoff details object
@@ -25,6 +25,9 @@
  *             primary cause of "forgets after 3-4 conversations" symptom
  *  FIX #31 — /health shows MongoDB connected/error status; new /mongo-check endpoint
  *             for deep DB diagnostics (counts, latest user, connection verification)
+ *  FIX #32 — CRITICAL: drop-and-recreate phone_1 index on startup to fix the
+ *             "existing index has the same name" error that was crashing MongoDB
+ *             connection on every Render restart and forcing memory-only mode
  *
  *  Prior fixes (all retained):
  *  FIX #1  — classifyIntent: HANDOFF_VOCAB pre-screen
@@ -172,11 +175,15 @@ async function connectMongo() {
     sessionsCol    = db.collection('sessions');
     activeStateCol = db.collection('activeStates');
     memoryCol      = db.collection('memory');
-    await Promise.all([
-      sessionsCol.createIndex({ phone: 1 }, { unique: true }),
-      activeStateCol.createIndex({ phone: 1 }, { unique: true }),
-      memoryCol.createIndex({ phone: 1 }, { unique: true }),
-    ]);
+    // FIX #32: Drop-and-recreate the phone_1 index on each collection.
+    // Root cause of "MongoDB failed" on every restart: an older version of the code
+    // created phone_1 WITHOUT unique:true. Now we try to create it WITH unique:true —
+    // MongoDB rejects this because you can't change index options in-place.
+    // Fix: drop the old index first (ignoring "index not found" errors), then recreate.
+    for (const col of [sessionsCol, activeStateCol, memoryCol]) {
+      try { await col.dropIndex('phone_1'); } catch (_) { /* ok if it didn't exist */ }
+      await col.createIndex({ phone: 1 }, { unique: true });
+    }
     mongoOk = true;
     mongoError = null;
     console.log('✅  MongoDB connected and verified (ping ok)');
@@ -1559,7 +1566,7 @@ const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🚀  ComplyGlobally Bot v4.6 — MongoDB Context Fix`);
+    console.log(`\n🚀  ComplyGlobally Bot v4.7 — MongoDB Index Fix`);
     console.log(`📡  Port: ${PORT}`);
     console.log(`📮  POST /webhook`);
     console.log(`❤️   GET  /health`);
