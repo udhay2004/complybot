@@ -3,7 +3,7 @@
 /**
  * ============================================================
  *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  PRODUCTION EDITION v4.7 — MongoDB Index Fix
+ *  PRODUCTION EDITION v4.8 — Name Memory Fix
  *  All 22 prior QA fixes retained. New in v4.4:
  *
  *  FIX #23 — classifyIntent: returns rich handoff details object
@@ -431,6 +431,13 @@ const NAME_BLACKLIST = new Set([
   'first','second','third','fourth','last','next','previous','other','another',
   'calling','support','team','corp','ltd','inc','llc','pvt','telecom','bank',
   'group','global','solutions','services','systems','technologies','tech',
+  // FIX #34: pop culture / brand false positives
+  'helloween','metallica','nirvana','adidas','nike','google','apple','amazon',
+  'punjabi','gujarati','marathi','bengali','tamil','telugu','kannada','malayali',
+  'indian','american','british','canadian','australian','german','french','chinese',
+  'monday','tuesday','wednesday','thursday','friday','saturday','sunday',
+  'january','february','march','april','june','july','august','september',
+  'october','november','december','yesterday','today','tomorrow',
 ]);
 
 // FIX #6: Removed 'i am' and "i'm" — too easily match action sentences
@@ -449,6 +456,9 @@ function extractName(msg) {
 
   // Guard: business/action intent in message → not a name introduction
   if (/tell me|about|how|what|expand|incorporat|setup|looking|need|want|tax|bank|fema|odi|visa|compli|register|market|country|jurisdict/.test(lower)) return null;
+  // FIX #34: Guard against nationality statements being mistaken for name intros
+  // e.g. "I'm Punjabi", "I'm Indian", "I'm a Helloween fan"
+  if (/(punjabi|gujarati|marathi|bengali|tamil|telugu|sikh|hindu|muslim|christian|fan|lover|into|obsessed|huge)/i.test(lower)) return null;
 
   // FIX #13: Corporate suffix present → skip
   if (CORPORATE_SUFFIX_RE.test(t)) return null;
@@ -890,11 +900,15 @@ function parseMenuFromReply(reply) {
 // ─────────────────────────────────────────────
 function buildContextBlock(mem, state) {
   const lines = [];
-  if (mem.name)           lines.push(`Name: ${mem.name}`);
-  if (mem.targetCountry)  lines.push(`Target: ${mem.targetCountry}`);
-  if (mem.currentCountry) lines.push(`Based: ${mem.currentCountry}`);
+  // FIX #33: Name is injected as a MANDATORY instruction, not just a data line.
+  // This prevents Claude from saying "I don't have your name" when it does.
+  if (mem.name) {
+    lines.push(`MANDATORY: This user's name is "${mem.name}". You already know their name. If they ask "what's my name" or "do you remember me", tell them their name is ${mem.name}. Never say you don't have their name.`);
+  }
+  if (mem.targetCountry)  lines.push(`Target country: ${mem.targetCountry}`);
+  if (mem.currentCountry) lines.push(`Based in: ${mem.currentCountry}`);
   if (mem.serviceNeeded)  lines.push(`Interest: ${mem.serviceNeeded}`);
-  if (state.topicsDiscussed.length > 0) lines.push(`Topics: ${state.topicsDiscussed.slice(-4).join(', ')}`);
+  if (state.topicsDiscussed.length > 0) lines.push(`Topics discussed: ${state.topicsDiscussed.slice(-4).join(', ')}`);
   if (state.phase)        lines.push(`Phase: ${state.phase}`);
 
   if (state.lastMenu) {
@@ -902,7 +916,7 @@ function buildContextBlock(mem, state) {
     lines.push(`\n[ACTIVE MENU — context: "${mn.context}"]\n1. ${mn.options[0]}\n2. ${mn.options[1]}\n3. ${mn.options[2]}\n4. ${mn.options[3]}`);
   }
 
-  return lines.length ? `\n\n[USER CONTEXT]\n${lines.join('\n')}` : '';
+  return lines.length ? `\n\n[USER CONTEXT — treat this as ground truth, it overrides anything in chat history]\n${lines.join('\n')}` : '';
 }
 
 // ─────────────────────────────────────────────
@@ -1441,6 +1455,51 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ══════════════════════════════════════════════
+    // FIX #33: DETERMINISTIC MEMORY RECALL
+    // Intercept name/country/context questions BEFORE Claude
+    // so poisoned history cannot override known facts from MongoDB.
+    // ══════════════════════════════════════════════
+    const isNameQuestion    = /what[''\u2019s ]*s? ?my name|yk my name|you know my name|tell me my name|do you (?:know|remember) my name/i.test(rawMsg);
+    const isCountryQuestion = /which country|what country|where am i expand|which market|what market/i.test(rawMsg);
+    const isContextQuestion = /what do you know about me|what have we discussed|do you remember (?:me|our|what)|what did (?:we|i) (?:talk|discuss|say)/i.test(rawMsg);
+
+    if (isNameQuestion && mem.name) {
+      const nameReply = 'Your name is ' + mem.name + '! \u{1F60A}';
+      await send(phone, nameReply, incomingCC);
+      session.history.push({ role: 'user', content: rawMsg });
+      session.history.push({ role: 'assistant', content: nameReply });
+      await Promise.all([saveSession(session), saveState(state), saveMemory(mem)]);
+      return;
+    }
+
+    if (isCountryQuestion && (mem.targetCountry || mem.currentCountry)) {
+      const c = mem.targetCountry || mem.currentCountry;
+      const countryReply = "You're looking at expanding to " + c + '! \u{1F30D}';
+      await send(phone, countryReply, incomingCC);
+      session.history.push({ role: 'user', content: rawMsg });
+      session.history.push({ role: 'assistant', content: countryReply });
+      await Promise.all([saveSession(session), saveState(state), saveMemory(mem)]);
+      return;
+    }
+
+    if (isContextQuestion) {
+      const parts = [];
+      if (mem.name)           parts.push('your name is ' + mem.name);
+      if (mem.targetCountry)  parts.push("you're exploring " + mem.targetCountry);
+      if (mem.currentCountry) parts.push("you're based in " + mem.currentCountry);
+      if (mem.serviceNeeded)  parts.push("you're interested in " + mem.serviceNeeded);
+      if (state.topicsDiscussed.length > 0) parts.push("we've discussed " + state.topicsDiscussed.slice(-3).join(', '));
+      const contextReply = parts.length
+        ? 'Here\u2019s what I have: ' + parts.join(', ') + '. Anything you\u2019d like to update or dive into?'
+        : "I don\u2019t have much saved about you yet \u2014 what would you like me to know?";
+      await send(phone, contextReply, incomingCC);
+      session.history.push({ role: 'user', content: rawMsg });
+      session.history.push({ role: 'assistant', content: contextReply });
+      await Promise.all([saveSession(session), saveState(state), saveMemory(mem)]);
+      return;
+    }
+
+    // ══════════════════════════════════════════════
     // 7. STANDARD CLAUDE ADVISORY RESPONSE
     // ══════════════════════════════════════════════
     const kbSection = retrieveKBChunks(rawMsg);
@@ -1525,6 +1584,23 @@ app.get('/mongo-check', async (req, res) => {
   }
 });
 
+// Admin: manually patch a user's memory (fix wrong name, country etc.)
+// Usage: POST /memory/919998877665  body: { "name": "Montu", "targetCountry": "Singapore" }
+app.post('/memory/:phone', async (req, res) => {
+  const phone = req.params.phone.replace(/D/g, '');
+  const updates = req.body || {};
+  const allowed = ['name','targetCountry','currentCountry','serviceNeeded','email'];
+  const filtered = {};
+  for (const k of allowed) { if (updates[k] !== undefined) filtered[k] = updates[k]; }
+  if (!Object.keys(filtered).length) return res.json({ error: 'No valid fields. Allowed: ' + allowed.join(', ') });
+  const mem = await getMemory(phone);
+  Object.assign(mem, filtered);
+  await saveMemory(mem);
+  _cache['memory'].delete(phone); // bust cache so next message picks up fresh
+  console.log(`✏️  Memory patched for ${phone}:`, filtered);
+  res.json({ success: true, updated: filtered, memory: mem });
+});
+
 app.post('/reset/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   ['session','state','memory'].forEach(s => _cache[s].delete(phone));
@@ -1566,12 +1642,13 @@ const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🚀  ComplyGlobally Bot v4.7 — MongoDB Index Fix`);
+    console.log(`\n🚀  ComplyGlobally Bot v4.8 — Name Memory Fix`);
     console.log(`📡  Port: ${PORT}`);
     console.log(`📮  POST /webhook`);
     console.log(`❤️   GET  /health`);
     console.log(`🗑️   POST /reset/:phone`);
     console.log(`🔓  POST /release-human/:phone`);
+    console.log(`✏️   POST /memory/:phone (patch name/country/email)`);
     console.log(`🔍  GET  /debug/:phone\n`);
   });
 });
