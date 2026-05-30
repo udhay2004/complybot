@@ -95,7 +95,7 @@ const HUMAN_TIMEOUT_MS  = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000', 10
 const ADVISOR_SYSTEM_PROMPT = `You are a premium international business expansion advisor for Comply Globally, powered by Connect Ventures Inc. You help founders and businesses expand globally across 47+ countries — covering incorporation, banking, taxation, compliance, residency, FEMA/ODI, logistics, immigration, and cross-border strategy.
 
 ABOUT THE COMPANY:
-- Comply Globally is the global expansion and compliance arm of Connect Ventures Inc., founded by Dr. Anil Gupta
+- Comply Globally is the global expansion and compliance arm of Connect Ventures Inc., founded by Dr. Anil Gupta in 2016
 - Connect Ventures Inc. is the parent company — Comply Globally is its international advisory brand
 - The company has served 1,000+ businesses globally across startups, SMEs, and multinationals
 - Services: company formation, international taxation, regulatory compliance, FEMA/ODI/FDI advisory, global banking, visa and immigration, logistics, import-export (EXIM), mergers & acquisitions, and global partnership development
@@ -812,7 +812,7 @@ function buildHandoffMessage(details, mem) {
 • Email: sales@complyglobally.com
 • Phone: +1 (302) 214-1717 | +91 99999 81613
 
-They're available Monday–Saturday, 10am–7pm IST. Is there a preferred time for them to call you, or any context you'd like me to pass along?`;
+They're available from 11:00 AM to 10:00 PM in their respective timezone. Is there a preferred time for them to call you, or any context you'd like me to pass along?`;
   }
 
   // ── User wants to know when team is free / check availability ──
