@@ -3,7 +3,7 @@
 /**
  * ============================================================
  *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  PRODUCTION EDITION v4.5 — Smart Handoff + Fast Classifier
+ *  PRODUCTION EDITION v4.6 — MongoDB Context Fix
  *  All 22 prior QA fixes retained. New in v4.4:
  *
  *  FIX #23 — classifyIntent: returns rich handoff details object
@@ -16,6 +16,15 @@
  *  FIX #27 — DEFINITE_QUERY_RE: availability/hours inquiries short-circuited before
  *             LLM classifier (fixes "when are your humans available" false trigger);
  *             classifier model switched to claude-haiku for 10x faster classification
+ *  FIX #28 — MongoDB: ping verification, reconnect on close, ensureMongo() helper,
+ *             explicit error logging on all save operations
+ *  FIX #29 — All getSession/getState/getMemory/isFirstTime now use ensureMongo()
+ *             instead of bare null-check — fixes context loss after Render restarts
+ *             and MongoDB late-connect scenarios
+ *  FIX #30 — callClaude history slice increased from 6 → 12 messages; this is the
+ *             primary cause of "forgets after 3-4 conversations" symptom
+ *  FIX #31 — /health shows MongoDB connected/error status; new /mongo-check endpoint
+ *             for deep DB diagnostics (counts, latest user, connection verification)
  *
  *  Prior fixes (all retained):
  *  FIX #1  — classifyIntent: HANDOFF_VOCAB pre-screen
@@ -139,12 +148,27 @@ RULES:
 // ─────────────────────────────────────────────
 let sessionsCol, activeStateCol, memoryCol;
 
+// FIX #28: mongoOk flag — lets /health and /mongo-status report real DB state
+let mongoOk = false;
+let mongoError = null;
+let mongoClient = null;
+
 async function connectMongo() {
-  if (!MONGODB_URI) { console.warn('⚠️  No MONGODB_URI — memory-only mode'); return; }
+  if (!MONGODB_URI) {
+    console.warn('⚠️  No MONGODB_URI — running in memory-only mode. Data will not persist across restarts.');
+    mongoError = 'No MONGODB_URI set';
+    return;
+  }
   try {
-    const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 10000 });
-    await client.connect();
-    const db    = client.db('complybot');
+    mongoClient = new MongoClient(MONGODB_URI, {
+      serverSelectionTimeoutMS: 10000,
+      connectTimeoutMS: 10000,
+      socketTimeoutMS: 30000,
+    });
+    await mongoClient.connect();
+    // FIX #28: Ping to verify the connection is actually live
+    await mongoClient.db('admin').command({ ping: 1 });
+    const db    = mongoClient.db('complybot');
     sessionsCol    = db.collection('sessions');
     activeStateCol = db.collection('activeStates');
     memoryCol      = db.collection('memory');
@@ -153,10 +177,39 @@ async function connectMongo() {
       activeStateCol.createIndex({ phone: 1 }, { unique: true }),
       memoryCol.createIndex({ phone: 1 }, { unique: true }),
     ]);
-    console.log('✅  MongoDB connected');
+    mongoOk = true;
+    mongoError = null;
+    console.log('✅  MongoDB connected and verified (ping ok)');
+
+    // FIX #28: Reconnect on unexpected disconnect
+    mongoClient.on('close', () => {
+      mongoOk = false;
+      mongoError = 'Connection closed unexpectedly';
+      console.error('❌  MongoDB connection closed — will attempt reconnect on next request');
+    });
+    mongoClient.on('error', (err) => {
+      mongoOk = false;
+      mongoError = err.message;
+      console.error('❌  MongoDB connection error:', err.message);
+    });
+
   } catch (err) {
+    mongoOk = false;
+    mongoError = err.message;
+    sessionsCol = null; activeStateCol = null; memoryCol = null;
     console.error('❌  MongoDB failed:', err.message);
+    console.error('⚠️  Running in memory-only mode — data will NOT persist across restarts');
+    console.error('⚠️  Check: 1) MONGODB_URI env var  2) Atlas IP whitelist (allow 0.0.0.0/0)  3) DB user password');
   }
+}
+
+// FIX #28: Lazy reconnect — if collections are null, try reconnecting before each operation
+async function ensureMongo() {
+  if (mongoOk && sessionsCol) return true;
+  if (!MONGODB_URI) return false;
+  console.log('🔄  Attempting MongoDB reconnect...');
+  await connectMongo();
+  return mongoOk;
 }
 
 // ─────────────────────────────────────────────
@@ -185,7 +238,11 @@ function newSession(phone) {
 async function getSession(phone) {
   const c = cGet('session', phone);
   if (c) return c;
-  let s = sessionsCol ? await sessionsCol.findOne({ phone }) : null;
+  let s = null;
+  if (await ensureMongo()) {
+    try { s = await sessionsCol.findOne({ phone }); }
+    catch (err) { console.error('❌  getSession DB error:', err.message); }
+  }
   if (!s) s = newSession(phone);
   s.history = s.history || [];
   cSet('session', phone, s);
@@ -195,7 +252,15 @@ async function saveSession(s) {
   s.lastActive = new Date();
   if (s.history.length > 16) s.history = s.history.slice(-16);
   cSet('session', s.phone, s);
-  if (sessionsCol) { const { _id, ...doc } = s; await sessionsCol.replaceOne({ phone: s.phone }, doc, { upsert: true }); }
+  // FIX #28: ensureMongo + explicit error logging so failures are never silent
+  if (await ensureMongo()) {
+    try {
+      const { _id, ...doc } = s;
+      await sessionsCol.replaceOne({ phone: s.phone }, doc, { upsert: true });
+    } catch (err) {
+      console.error('❌  saveSession DB error:', err.message);
+    }
+  }
 }
 
 // Helper — truncate a message string before storing in history
@@ -225,7 +290,11 @@ function newState(phone) {
 async function getState(phone) {
   const c = cGet('state', phone);
   if (c) return c;
-  let s = activeStateCol ? await activeStateCol.findOne({ phone }) : null;
+  let s = null;
+  if (await ensureMongo()) {
+    try { s = await activeStateCol.findOne({ phone }); }
+    catch (err) { console.error('❌  getState DB error:', err.message); }
+  }
   if (!s) s = newState(phone);
   s.topicsDiscussed = s.topicsDiscussed || [];
   s.handoffDetails  = s.handoffDetails  || null; // FIX #25: backwards compat
@@ -235,7 +304,15 @@ async function getState(phone) {
 async function saveState(s) {
   s.lastActive = new Date();
   cSet('state', s.phone, s);
-  if (activeStateCol) { const { _id, ...doc } = s; await activeStateCol.replaceOne({ phone: s.phone }, doc, { upsert: true }); }
+  // FIX #28: ensureMongo + explicit error logging
+  if (await ensureMongo()) {
+    try {
+      const { _id, ...doc } = s;
+      await activeStateCol.replaceOne({ phone: s.phone }, doc, { upsert: true });
+    } catch (err) {
+      console.error('❌  saveState DB error:', err.message);
+    }
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -247,7 +324,11 @@ function newMemory(phone) {
 async function getMemory(phone) {
   const c = cGet('memory', phone);
   if (c) return c;
-  let m = memoryCol ? await memoryCol.findOne({ phone }) : null;
+  let m = null;
+  if (await ensureMongo()) {
+    try { m = await memoryCol.findOne({ phone }); }
+    catch (err) { console.error('❌  getMemory DB error:', err.message); }
+  }
   if (!m) m = newMemory(phone);
   cSet('memory', phone, m);
   return m;
@@ -255,7 +336,15 @@ async function getMemory(phone) {
 async function saveMemory(m) {
   m.updatedAt = new Date();
   cSet('memory', m.phone, m);
-  if (memoryCol) { const { _id, ...doc } = m; await memoryCol.replaceOne({ phone: m.phone }, doc, { upsert: true }); }
+  // FIX #28: ensureMongo + explicit error logging
+  if (await ensureMongo()) {
+    try {
+      const { _id, ...doc } = m;
+      await memoryCol.replaceOne({ phone: m.phone }, doc, { upsert: true });
+    } catch (err) {
+      console.error('❌  saveMemory DB error:', err.message);
+    }
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -835,7 +924,7 @@ async function callClaude(session, state, mem, userMessage, kbSection, phaseHint
   const contextBlock = buildContextBlock(mem, state);
   const systemPrompt = ADVISOR_SYSTEM_PROMPT + contextBlock + (phaseHint || '') + (kbSection || '');
 
-  const history = session.history.slice(-6);
+  const history = session.history.slice(-12); // FIX #30: was -6, increased to keep more context
   const messages = [...history, { role: 'user', content: userMessage }];
 
   const estimatedInputTokens = estimateTokens(systemPrompt) + estimateTokens(JSON.stringify(messages));
@@ -1090,7 +1179,8 @@ app.post('/webhook', async (req, res) => {
     // Prevents race condition where two simultaneous messages both see isFirstTime=true
     // ══════════════════════════════════════════════
     let isFirstTime = false;
-    if (sessionsCol) {
+    // FIX #29: Use ensureMongo() so connection is verified/retried before isFirstTime check
+    if (await ensureMongo()) {
       try {
         await sessionsCol.insertOne({
           phone,
@@ -1104,7 +1194,7 @@ app.post('/webhook', async (req, res) => {
         isFirstTime = false;
       }
     } else {
-      // Memory-only mode fallback
+      // Memory-only mode fallback (no MongoDB)
       isFirstTime = !cGet('session', phone);
     }
 
@@ -1391,12 +1481,42 @@ app.post('/webhook', async (req, res) => {
 // ─────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
   status: 'ok',
-  uptime: process.uptime(),
+  uptime: Math.round(process.uptime()),
+  mongodb: {
+    connected: mongoOk,
+    error: mongoError || null,
+    // FIX #31: Shows MongoDB status so you can diagnose connection issues via browser
+    hint: !mongoOk ? 'Check MONGODB_URI env var and Atlas Network Access (allow 0.0.0.0/0)' : 'ok',
+  },
   rateLimitActive: Date.now() < _rateLimitUntil,
   rateLimitUntil: _rateLimitUntil > 0 ? new Date(_rateLimitUntil).toISOString() : null,
 }));
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+// FIX #31: Deep MongoDB diagnostic endpoint — visit in browser to verify DB is working
+app.get('/mongo-check', async (req, res) => {
+  if (!MONGODB_URI) return res.json({ status: 'error', reason: 'MONGODB_URI not set' });
+  try {
+    const ok = await ensureMongo();
+    if (!ok) return res.json({ status: 'error', reason: mongoError || 'Connection failed', hint: 'Check Atlas IP whitelist — add 0.0.0.0/0 for Render' });
+    // Count documents in each collection
+    const [sessions, states, memories] = await Promise.all([
+      sessionsCol.countDocuments(),
+      activeStateCol.countDocuments(),
+      memoryCol.countDocuments(),
+    ]);
+    // Read the most recently active session
+    const latest = await sessionsCol.findOne({}, { sort: { lastActive: -1 } });
+    res.json({
+      status: 'connected',
+      collections: { sessions, activeStates: states, memories },
+      latestUser: latest ? { phone: latest.phone, lastActive: latest.lastActive, historyLength: (latest.history||[]).length } : null,
+    });
+  } catch (err) {
+    res.json({ status: 'error', reason: err.message });
+  }
+});
 
 app.post('/reset/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
@@ -1439,7 +1559,7 @@ const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🚀  ComplyGlobally Bot v4.5 — Smart Handoff + Fast Classifier`);
+    console.log(`\n🚀  ComplyGlobally Bot v4.6 — MongoDB Context Fix`);
     console.log(`📡  Port: ${PORT}`);
     console.log(`📮  POST /webhook`);
     console.log(`❤️   GET  /health`);
