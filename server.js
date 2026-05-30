@@ -1576,8 +1576,7 @@ app.post('/webhook', async (req, res) => {
               content: `Summarise this business expansion conversation in 2-3 sentences. Focus on: what markets they're exploring, what services they need, any decisions made, key concerns raised. Be factual and concise. No bullet points.
 
 Conversation:
-${session.history.slice(-10).map(m => (m.role === 'user' ? 'User' : 'Advisor') + ': ' + m.content.substring(0, 200)).join('
-')}`,
+${session.history.slice(-10).map(m => (m.role === 'user' ? 'User' : 'Advisor') + ': ' + m.content.substring(0, 200)).join('\n')}`,
             }],
           }),
         });
