@@ -326,7 +326,18 @@ async function saveState(s) {
 // MEMORY — locked validated entities
 // ─────────────────────────────────────────────
 function newMemory(phone) {
-  return { phone, name: null, targetCountry: null, currentCountry: null, serviceNeeded: null, email: null, updatedAt: new Date() };
+  return {
+    phone,
+    name: null,
+    targetCountries: [],     // FIX #34: array — tracks ALL countries ever discussed
+    targetCountry: null,     // kept for backwards compat — mirrors targetCountries[0]
+    currentCountry: null,
+    servicesDiscussed: [],   // FIX #34: array — tracks ALL services ever discussed
+    serviceNeeded: null,     // kept for backwards compat — mirrors servicesDiscussed[0]
+    email: null,
+    conversationSummary: '', // FIX #34: rolling plain-English summary updated every 5 messages
+    updatedAt: new Date(),
+  };
 }
 async function getMemory(phone) {
   const c = cGet('memory', phone);
@@ -540,11 +551,16 @@ function extractEntities(msg, mem) {
     }
   }
 
-  // FIX #9: Only extract targetCountry if no negation in the same message
-  if (!mem.targetCountry && !NEGATION_RE.test(lower)) {
+  // FIX #34: Accumulate ALL target countries mentioned (not just the first)
+  if (!NEGATION_RE.test(lower)) {
     for (const [kw, country] of Object.entries(COUNTRY_MAP)) {
       if (lower.includes(kw) && EXPAND_INTENT_RE.test(lower)) {
-        updates.targetCountry = country; break;
+        const existing = mem.targetCountries || [];
+        if (!existing.includes(country)) {
+          updates.targetCountries = [...existing, country];
+          updates.targetCountry   = updates.targetCountries[0]; // backwards compat
+        }
+        break;
       }
     }
   }
@@ -553,9 +569,15 @@ function extractEntities(msg, mem) {
     updates.currentCountry = 'India';
   }
 
-  if (!mem.serviceNeeded) {
-    for (const [kw, svc] of Object.entries(SERVICE_MAP)) {
-      if (lower.includes(kw)) { updates.serviceNeeded = svc; break; }
+  // FIX #34: Accumulate ALL services discussed (not just the first)
+  for (const [kw, svc] of Object.entries(SERVICE_MAP)) {
+    if (lower.includes(kw)) {
+      const existing = mem.servicesDiscussed || [];
+      if (!existing.includes(svc)) {
+        updates.servicesDiscussed = [...existing, svc];
+        updates.serviceNeeded     = updates.servicesDiscussed[0]; // backwards compat
+      }
+      break;
     }
   }
   return updates;
@@ -900,16 +922,19 @@ function parseMenuFromReply(reply) {
 // ─────────────────────────────────────────────
 function buildContextBlock(mem, state) {
   const lines = [];
-  // FIX #33: Name is injected as a MANDATORY instruction, not just a data line.
-  // This prevents Claude from saying "I don't have your name" when it does.
+  // FIX #33/34: Name injected as MANDATORY — history cannot override it
   if (mem.name) {
-    lines.push(`MANDATORY: This user's name is "${mem.name}". You already know their name. If they ask "what's my name" or "do you remember me", tell them their name is ${mem.name}. Never say you don't have their name.`);
+    lines.push(`MANDATORY: This user's name is "${mem.name}". You already know their name. Never say you don't have it.`);
   }
-  if (mem.targetCountry)  lines.push(`Target country: ${mem.targetCountry}`);
-  if (mem.currentCountry) lines.push(`Based in: ${mem.currentCountry}`);
-  if (mem.serviceNeeded)  lines.push(`Interest: ${mem.serviceNeeded}`);
-  if (state.topicsDiscussed.length > 0) lines.push(`Topics discussed: ${state.topicsDiscussed.slice(-4).join(', ')}`);
-  if (state.phase)        lines.push(`Phase: ${state.phase}`);
+  // FIX #34: Show ALL countries and services ever discussed
+  const countries = (mem.targetCountries && mem.targetCountries.length) ? mem.targetCountries : (mem.targetCountry ? [mem.targetCountry] : []);
+  if (countries.length)       lines.push(`Markets discussed: ${countries.join(', ')}`);
+  if (mem.currentCountry)     lines.push(`Based in: ${mem.currentCountry}`);
+  const services = (mem.servicesDiscussed && mem.servicesDiscussed.length) ? mem.servicesDiscussed : (mem.serviceNeeded ? [mem.serviceNeeded] : []);
+  if (services.length)        lines.push(`Services discussed: ${services.join(', ')}`);
+  if (state.topicsDiscussed.length > 0) lines.push(`Topics covered: ${state.topicsDiscussed.join(', ')}`);
+  if (mem.conversationSummary) lines.push(`Previous conversation summary: ${mem.conversationSummary}`);
+  if (state.phase)             lines.push(`Phase: ${state.phase}`);
 
   if (state.lastMenu) {
     const mn = state.lastMenu;
@@ -1535,6 +1560,38 @@ app.post('/webhook', async (req, res) => {
       console.log(`📋  Menu stored: [${newMenu.join(' | ')}]`);
     }
 
+    // FIX #34: Rolling conversation summary — update every 5 user messages
+    // Gives Claude long-term memory of what was concluded, not just topic labels
+    const userMsgCount = session.history.filter(m => m.role === 'user').length;
+    if (userMsgCount > 0 && userMsgCount % 5 === 0) {
+      try {
+        const summaryResponse = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({
+            model: 'claude-haiku-4-5-20251001',
+            max_tokens: 150,
+            messages: [{
+              role: 'user',
+              content: `Summarise this business expansion conversation in 2-3 sentences. Focus on: what markets they're exploring, what services they need, any decisions made, key concerns raised. Be factual and concise. No bullet points.
+
+Conversation:
+${session.history.slice(-10).map(m => (m.role === 'user' ? 'User' : 'Advisor') + ': ' + m.content.substring(0, 200)).join('
+')}`,
+            }],
+          }),
+        });
+        const summaryData = await summaryResponse.json();
+        const summary = (summaryData.content?.[0]?.text || '').trim();
+        if (summary) {
+          mem.conversationSummary = summary;
+          console.log(`📝  Summary updated: ${summary.substring(0, 80)}...`);
+        }
+      } catch (err) {
+        console.error('❌  Summary generation failed:', err.message);
+      }
+    }
+
     await Promise.all([saveSession(session), saveState(state), saveMemory(mem)]);
 
   } catch (err) {
@@ -1599,6 +1656,24 @@ app.post('/memory/:phone', async (req, res) => {
   _cache['memory'].delete(phone); // bust cache so next message picks up fresh
   console.log(`✏️  Memory patched for ${phone}:`, filtered);
   res.json({ success: true, updated: filtered, memory: mem });
+});
+
+// FIX #34: Wipe ALL data from MongoDB — fresh start
+app.post('/reset-all', async (req, res) => {
+  const secret = req.query.secret;
+  if (secret !== 'comply2024') return res.status(403).json({ error: 'Forbidden — add ?secret=comply2024' });
+  ['session','state','memory'].forEach(s => _cache[s].clear());
+  try {
+    const [s, a, m] = await Promise.all([
+      sessionsCol    ? sessionsCol.deleteMany({})    : { deletedCount: 0 },
+      activeStateCol ? activeStateCol.deleteMany({}) : { deletedCount: 0 },
+      memoryCol      ? memoryCol.deleteMany({})      : { deletedCount: 0 },
+    ]);
+    console.log(`🗑️  FULL RESET: sessions=${s.deletedCount} states=${a.deletedCount} memories=${m.deletedCount}`);
+    res.json({ success: true, deleted: { sessions: s.deletedCount, states: a.deletedCount, memories: m.deletedCount } });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/reset/:phone', async (req, res) => {
