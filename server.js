@@ -3,31 +3,13 @@
 /**
  * ============================================================
  *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  PRODUCTION EDITION v4.8 — Name Memory Fix
- *  All 22 prior QA fixes retained. New in v4.4:
+ *  PRODUCTION EDITION v4.9 — FIX #35: First-message entity extraction
+ *  All 34 prior QA fixes retained. New in v4.9:
  *
- *  FIX #23 — classifyIntent: returns rich handoff details object
- *             (scheduledTime, preferredChannel, urgency, impossible, rawPreference)
- *  FIX #24 — buildHandoffMessage(): context-aware handoff messages
- *             handles: scheduled time, video call, urgency, "ask your team",
- *             impossible requests (Taylor Swift etc.), default fallback
- *  FIX #25 — state.handoffDetails stored so confirmation msg can reference it
- *  FIX #26 — pendingHandoff confirmation is context-aware (mentions time if given)
- *  FIX #27 — DEFINITE_QUERY_RE: availability/hours inquiries short-circuited before
- *             LLM classifier (fixes "when are your humans available" false trigger);
- *             classifier model switched to claude-haiku for 10x faster classification
- *  FIX #28 — MongoDB: ping verification, reconnect on close, ensureMongo() helper,
- *             explicit error logging on all save operations
- *  FIX #29 — All getSession/getState/getMemory/isFirstTime now use ensureMongo()
- *             instead of bare null-check — fixes context loss after Render restarts
- *             and MongoDB late-connect scenarios
- *  FIX #30 — callClaude history slice increased from 6 → 12 messages; this is the
- *             primary cause of "forgets after 3-4 conversations" symptom
- *  FIX #31 — /health shows MongoDB connected/error status; new /mongo-check endpoint
- *             for deep DB diagnostics (counts, latest user, connection verification)
- *  FIX #32 — CRITICAL: drop-and-recreate phone_1 index on startup to fix the
- *             "existing index has the same name" error that was crashing MongoDB
- *             connection on every Render restart and forcing memory-only mode
+ *  FIX #35 — First-message entity extraction
+ *             extractNameFirstMessage() handles 'im'/'i am', no 80-char limit
+ *             isFirstTime block now extracts name+country before responding
+ *             Personalised greeting based on what was detected in first message
  *
  *  Prior fixes (all retained):
  *  FIX #1  — classifyIntent: HANDOFF_VOCAB pre-screen
@@ -52,6 +34,19 @@
  *  FIX #20 — emoji-only messages: detected and handled gracefully
  *  FIX #21 — topicsDiscussed: capped at 20 entries
  *  FIX #22 — GREETING_RE returning-user check: requires session age > 1 hour
+ *  FIX #23 — classifyIntent: returns rich handoff details object
+ *  FIX #24 — buildHandoffMessage(): context-aware handoff messages
+ *  FIX #25 — state.handoffDetails stored so confirmation msg can reference it
+ *  FIX #26 — pendingHandoff confirmation is context-aware (mentions time if given)
+ *  FIX #27 — DEFINITE_QUERY_RE: availability/hours inquiries short-circuited before
+ *             LLM classifier; classifier model switched to claude-haiku
+ *  FIX #28 — MongoDB: ping verification, reconnect on close, ensureMongo() helper
+ *  FIX #29 — All getSession/getState/getMemory/isFirstTime now use ensureMongo()
+ *  FIX #30 — callClaude history slice increased from 6 → 12 messages
+ *  FIX #31 — /health shows MongoDB connected/error status; new /mongo-check endpoint
+ *  FIX #32 — CRITICAL: drop-and-recreate phone_1 index on startup
+ *  FIX #33 — Deterministic memory recall for name/country/context questions
+ *  FIX #34 — targetCountries/servicesDiscussed arrays; rolling conversation summary
  * ============================================================
  */
 
@@ -185,10 +180,6 @@ async function connectMongo() {
     activeStateCol = db.collection('activeStates');
     memoryCol      = db.collection('memory');
     // FIX #32: Drop-and-recreate the phone_1 index on each collection.
-    // Root cause of "MongoDB failed" on every restart: an older version of the code
-    // created phone_1 WITHOUT unique:true. Now we try to create it WITH unique:true —
-    // MongoDB rejects this because you can't change index options in-place.
-    // Fix: drop the old index first (ignoring "index not found" errors), then recreate.
     for (const col of [sessionsCol, activeStateCol, memoryCol]) {
       try { await col.dropIndex('phone_1'); } catch (_) { /* ok if it didn't exist */ }
       await col.createIndex({ phone: 1 }, { unique: true });
@@ -477,8 +468,7 @@ function extractName(msg) {
   // Guard: business/action intent in message → not a name introduction
   if (/tell me|about|how|what|expand|incorporat|setup|looking|need|want|tax|bank|fema|odi|visa|compli|register|market|country|jurisdict/.test(lower)) return null;
   // FIX #34: Guard against nationality statements being mistaken for name intros
-  // e.g. "I'm Punjabi", "I'm Indian", "I'm a Helloween fan"
-  if (/(punjabi|gujarati|marathi|bengali|tamil|telugu|sikh|hindu|muslim|christian|fan|lover|into|obsessed|huge)/i.test(lower)) return null;
+  if (/(punjabi|gujarati|marathi|bengali|tamil|telugu|sikh|hindu|muslim|christian|fan|lover|into|obsessed|huge)/i.test(lower)) return null;
 
   // FIX #13: Corporate suffix present → skip
   if (CORPORATE_SUFFIX_RE.test(t)) return null;
@@ -492,7 +482,6 @@ function extractName(msg) {
       words.every(w =>
         w.length >= 2 &&
         !NAME_BLACKLIST.has(w.toLowerCase()) &&
-        // FIX #3: reject if matches any country/city word
         !ALL_COUNTRY_WORDS.has(w.toLowerCase()) &&
         /^[A-Za-z'\-]+$/.test(w)
       )
@@ -511,7 +500,6 @@ function extractName(msg) {
       words.every(w =>
         w.length >= 2 &&
         !NAME_BLACKLIST.has(w.toLowerCase()) &&
-        // FIX #3: reject if matches any country/city word
         !ALL_COUNTRY_WORDS.has(w.toLowerCase()) &&
         /^[A-Za-z'\-]+$/.test(w)
       )
@@ -520,6 +508,34 @@ function extractName(msg) {
     }
   }
 
+  return null;
+}
+
+// ─────────────────────────────────────────────
+// FIX #35: FIRST-MESSAGE NAME EXTRACTOR
+// More permissive than extractName():
+// - Handles 'im' / 'i am' (intentionally removed from main extractName in FIX #6
+//   because they cause false positives in ongoing conversation, but safe on first msg)
+// - No 80-char limit (first messages are often long intros with name + intent)
+// - Single-word capture only to prevent false multi-word matches
+// ─────────────────────────────────────────────
+function extractNameFirstMessage(msg) {
+  const t = msg.trim();
+  if (t.includes('?')) return null;
+  if (CORPORATE_SUFFIX_RE.test(t)) return null;
+
+  // Matches: "im John", "i am Priya", "my name is Rahul", "this is Arjun", "you can call me Sneha"
+  const FIRST_MSG_RE = /(?:my name is|this is|i am|i'm|im|call me|you can call me)\s+([A-Za-z][a-zA-Z'\-]{1,20})/i;
+  const m = t.match(FIRST_MSG_RE);
+  if (m) {
+    const candidate = m[1].trim();
+    if (
+      candidate.length >= 2 &&
+      !NAME_BLACKLIST.has(candidate.toLowerCase()) &&
+      !ALL_COUNTRY_WORDS.has(candidate.toLowerCase()) &&
+      /^[A-Za-z'\-]+$/.test(candidate)
+    ) return candidate;
+  }
   return null;
 }
 
@@ -626,11 +642,6 @@ const HANDOFF_VOCAB = /\b(human|agent|speak|talk|person|connect|team|transfer|re
 
 // FIX #27: DEFINITE_QUERY_RE — messages containing handoff vocab that are clearly
 // questions/inquiries about availability/hours, NOT connection requests.
-// These are short-circuited BEFORE the LLM classifier to avoid false triggers
-// and eliminate unnecessary API round-trips.
-// Examples caught: "when are your humans available", "what are your agent hours",
-// "is your team available now", "how do I reach someone", "do you have real agents",
-// "are your people available on weekends", "who are your experts"
 const DEFINITE_QUERY_RE = /\b(when|what|how|where|do|does|is|are|who|which|btw|anyway|just asking|curious|wondering)\b.*\b(human|agent|team|person|someone|expert|manager|sales|staff|advisor|people|representative)\b|\b(human|agent|team|person|someone|expert|manager|sales|staff|advisor|people)\b.*\b(available|online|hours|timing|schedule|work|open|active|free|respond|reply|office|around|reachable)\b|\b(tell me about|asking about|question about|info about|information about|know about|curious about)\b.*\b(human|agent|team|call|connect)\b/i;
 
 async function classifyIntent(msg) {
@@ -645,7 +656,6 @@ async function classifyIntent(msg) {
   if (/\blast\b/.test(lower) && lower.length < 25) return { type: 'menu_select', num: 4 };
 
   // FIX #7: Anchor number match to full message — prevents '1' inside longer sentences
-  // Matches: "2", "option 2", "#3", but NOT "I have 1 question"
   const numMatch = lower.match(/^\s*(?:option\s*|question\s*|no\.?\s*|#\s*)?([1-9]|1[0-9])\s*$/);
   if (numMatch) {
     const num = parseInt(numMatch[1]);
@@ -657,7 +667,6 @@ async function classifyIntent(msg) {
   if (!HANDOFF_VOCAB.test(lower)) return { type: 'query' };
 
   // FIX #27: Short-circuit obvious inquiry questions that contain handoff vocab
-  // but are clearly NOT connection requests — avoids false positives and LLM call
   if (DEFINITE_QUERY_RE.test(lower)) {
     console.log(`⚡  Fast-path QUERY (availability inquiry): "${msg.substring(0, 60)}"`);
     return { type: 'query' };
@@ -751,7 +760,6 @@ Message: "${msg.replace(/"/g, "'")}"`
     try {
       parsed = JSON.parse(rawText);
     } catch {
-      // JSON parse failed — fall through to safe defaults below
       parsed = null;
     }
 
@@ -1259,12 +1267,43 @@ app.post('/webhook', async (req, res) => {
 
     // ══════════════════════════════════════════════
     // 1. FIRST-TIME USER
+    // FIX #35: Extract name + entities from first message BEFORE responding
+    // so "hi im john im from india looking at usa" gets name+country on first message
     // ══════════════════════════════════════════════
     if (isFirstTime) {
-      const msg = `Hi there! 👋 Welcome to Comply Globally.\n\nI'm your international business expansion advisor — here to help you navigate incorporation, banking, tax, and compliance across 47+ jurisdictions.\n\nBefore we dive in — who am I speaking with?`;
+      // Extract whatever we can from this first message
+      const firstName = extractNameFirstMessage(rawMsg);
+      if (firstName) {
+        mem.name = firstName;
+        console.log(`✅  Name from first message: ${firstName}`);
+      }
+      const firstEntities = extractEntities(rawMsg, mem);
+      if (Object.keys(firstEntities).length > 0) {
+        Object.assign(mem, firstEntities);
+        console.log(`📝  Entities from first message:`, firstEntities);
+      }
+
+      let msg;
+
+      if (mem.name && mem.targetCountry) {
+        // We have name AND country — skip onboarding, go straight to advisory
+        state.phase = 'advisory';
+        const kbSection = retrieveKBChunks(rawMsg);
+        const phaseHint = `\n\n[PHASE: First message. You already know their name (${mem.name}) and target market (${mem.targetCountry}). Greet them warmly by name, acknowledge their interest in ${mem.targetCountry}, and start giving advisory content immediately. Do NOT ask for name or country again.]`;
+        const { reply, rateLimited } = await callClaude(session, state, mem, rawMsg, kbSection, phaseHint);
+        msg = reply || `Hi ${mem.name}! 👋 Welcome to Comply Globally — great to meet you!\n\nExpanding to ${mem.targetCountry} is a smart move. Let me pull up what you need to know.`;
+      } else if (mem.name) {
+        // We have name but not country — ask for market
+        state.phase = 'onboarding';
+        msg = `Hi ${mem.name}! 👋 Welcome to Comply Globally.\n\nI'm your international business expansion advisor — here to help across incorporation, banking, tax, and compliance in 47+ jurisdictions.\n\nWhich market are you looking to expand into?`;
+      } else {
+        // No name detected — standard greeting, ask for name
+        state.phase = 'onboarding';
+        msg = `Hi there! 👋 Welcome to Comply Globally.\n\nI'm your international business expansion advisor — here to help you navigate incorporation, banking, tax, and compliance across 47+ jurisdictions.\n\nBefore we dive in — who am I speaking with?`;
+      }
+
       await send(phone, msg, incomingCC);
       session.history.push({ role: 'assistant', content: msg });
-      state.phase = 'onboarding';
       await Promise.all([saveSession(session), saveState(state), saveMemory(mem)]);
       return;
     }
@@ -1570,7 +1609,6 @@ app.post('/webhook', async (req, res) => {
     }
 
     // FIX #34: Rolling conversation summary — update every 5 user messages
-    // Gives Claude long-term memory of what was concluded, not just topic labels
     const userMsgCount = session.history.filter(m => m.role === 'user').length;
     if (userMsgCount > 0 && userMsgCount % 5 === 0) {
       try {
@@ -1616,7 +1654,6 @@ app.get('/health', (req, res) => res.json({
   mongodb: {
     connected: mongoOk,
     error: mongoError || null,
-    // FIX #31: Shows MongoDB status so you can diagnose connection issues via browser
     hint: !mongoOk ? 'Check MONGODB_URI env var and Atlas Network Access (allow 0.0.0.0/0)' : 'ok',
   },
   rateLimitActive: Date.now() < _rateLimitUntil,
@@ -1625,19 +1662,17 @@ app.get('/health', (req, res) => res.json({
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-// FIX #31: Deep MongoDB diagnostic endpoint — visit in browser to verify DB is working
+// FIX #31: Deep MongoDB diagnostic endpoint
 app.get('/mongo-check', async (req, res) => {
   if (!MONGODB_URI) return res.json({ status: 'error', reason: 'MONGODB_URI not set' });
   try {
     const ok = await ensureMongo();
     if (!ok) return res.json({ status: 'error', reason: mongoError || 'Connection failed', hint: 'Check Atlas IP whitelist — add 0.0.0.0/0 for Render' });
-    // Count documents in each collection
     const [sessions, states, memories] = await Promise.all([
       sessionsCol.countDocuments(),
       activeStateCol.countDocuments(),
       memoryCol.countDocuments(),
     ]);
-    // Read the most recently active session
     const latest = await sessionsCol.findOne({}, { sort: { lastActive: -1 } });
     res.json({
       status: 'connected',
@@ -1649,8 +1684,7 @@ app.get('/mongo-check', async (req, res) => {
   }
 });
 
-// Admin: manually patch a user's memory (fix wrong name, country etc.)
-// Usage: POST /memory/919998877665  body: { "name": "Montu", "targetCountry": "Singapore" }
+// Admin: manually patch a user's memory
 app.post('/memory/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/D/g, '');
   const updates = req.body || {};
@@ -1661,7 +1695,7 @@ app.post('/memory/:phone', async (req, res) => {
   const mem = await getMemory(phone);
   Object.assign(mem, filtered);
   await saveMemory(mem);
-  _cache['memory'].delete(phone); // bust cache so next message picks up fresh
+  _cache['memory'].delete(phone);
   console.log(`✏️  Memory patched for ${phone}:`, filtered);
   res.json({ success: true, updated: filtered, memory: mem });
 });
@@ -1725,7 +1759,7 @@ const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🚀  ComplyGlobally Bot v4.8 — Name Memory Fix`);
+    console.log(`\n🚀  ComplyGlobally Bot v4.9 — FIX #35: First-message entity extraction`);
     console.log(`📡  Port: ${PORT}`);
     console.log(`📮  POST /webhook`);
     console.log(`❤️   GET  /health`);
