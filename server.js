@@ -1751,7 +1751,57 @@ app.get('/debug/:phone', async (req, res) => {
     lastMessages: session.history.slice(-4),
   });
 });
+// ═══════════════════════════════════════════════════════════════
+// ADD THIS TO YOUR WHATSAPP index.js (complybot.onrender.com)
+// Paste anywhere BEFORE the app.listen() call at the bottom
+// ═══════════════════════════════════════════════════════════════
 
+app.get('/wa-leads', async (req, res) => {
+  if (!memoryCol) return res.json([]);
+  try {
+    const memories = await memoryCol
+      .find({})
+      .sort({ updatedAt: -1 })
+      .limit(500)
+      .toArray();
+
+    const leads = memories
+      .filter(m => m.email || m.phone || m.name)
+      .map(m => ({
+        phone:               m.phone                || null,
+        name:                m.name                 || null,
+        email:               m.email                || null,
+        currentCountry:      m.currentCountry       || null,
+        targetCountry:       m.targetCountry         || null,
+        targetCountries:     m.targetCountries       || [],
+        serviceNeeded:       m.serviceNeeded         || null,
+        servicesDiscussed:   m.servicesDiscussed     || [],
+        topicsDiscussed:     [],   // merged in below from activeStates
+        conversationSummary: m.conversationSummary   || '',
+        source:              'whatsapp',
+        createdAt:           m.updatedAt             || null,
+        lastUpdated:         m.updatedAt             || null,
+      }));
+
+    // Merge topicsDiscussed from activeStates collection
+    if (activeStateCol) {
+      const states   = await activeStateCol.find({}).toArray();
+      const stateMap = {};
+      states.forEach(s => { stateMap[s.phone] = s; });
+      leads.forEach(l => {
+        const s = l.phone ? stateMap[l.phone] : null;
+        if (s && Array.isArray(s.topicsDiscussed)) {
+          l.topicsDiscussed = s.topicsDiscussed;
+        }
+      });
+    }
+
+    res.json(leads);
+  } catch (err) {
+    console.error('❌ /wa-leads error:', err.message);
+    res.json([]);
+  }
+});
 // ─────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────
