@@ -1756,47 +1756,42 @@ app.get('/debug/:phone', async (req, res) => {
 // Paste anywhere BEFORE the app.listen() call at the bottom
 // ═══════════════════════════════════════════════════════════════
 
-app.get('/wa-leads', async (req, res) => {
-  const ready = await ensureMongo();
+app.get('/wa-leads', async function(req, res) {
+  var ready = await ensureMongo();
   if (!ready || !memoryCol) {
     console.warn('⚠️ /wa-leads: MongoDB not available');
     return res.json([]);
   }
   try {
-    const memories = await memoryCol
-      .find({})
-      .sort({ updatedAt: -1 })
-      .limit(500)
-      .toArray();
+    var memories = await memoryCol.find({}).sort({ updatedAt: -1 }).limit(500).toArray();
+    var leads = memories
+      .filter(function(m) { return m.email || m.phone || m.name; })
+      .map(function(m) {
+        return {
+          phone:               m.phone                || null,
+          name:                m.name                 || null,
+          email:               m.email                || null,
+          currentCountry:      m.currentCountry       || null,
+          targetCountry:       m.targetCountry        || null,
+          targetCountries:     m.targetCountries      || [],
+          serviceNeeded:       m.serviceNeeded        || null,
+          servicesDiscussed:   m.servicesDiscussed    || [],
+          topicsDiscussed:     [],
+          conversationSummary: m.conversationSummary  || '',
+          source:              'whatsapp',
+          createdAt:           m.updatedAt            || null,
+          lastUpdated:         m.updatedAt            || null,
+        };
+      });
 
-    const leads = memories
-      .filter(m => m.email || m.phone || m.name)
-      .map(m => ({
-        phone:               m.phone                || null,
-        name:                m.name                 || null,
-        email:               m.email                || null,
-        currentCountry:      m.currentCountry       || null,
-        targetCountry:       m.targetCountry         || null,
-        targetCountries:     m.targetCountries       || [],
-        serviceNeeded:       m.serviceNeeded         || null,
-        servicesDiscussed:   m.servicesDiscussed     || [],
-        topicsDiscussed:     [],   // merged in below from activeStates
-        conversationSummary: m.conversationSummary   || '',
-        source:              'whatsapp',
-        createdAt:           m.updatedAt             || null,
-        lastUpdated:         m.updatedAt             || null,
-      }));
-
-    // Merge topicsDiscussed from activeStates collection
+    // merge topicsDiscussed from activeStates
     if (activeStateCol) {
-      const states   = await activeStateCol.find({}).toArray();
-      const stateMap = {};
-      states.forEach(s => { stateMap[s.phone] = s; });
-      leads.forEach(l => {
-        const s = l.phone ? stateMap[l.phone] : null;
-        if (s && Array.isArray(s.topicsDiscussed)) {
-          l.topicsDiscussed = s.topicsDiscussed;
-        }
+      var states = await activeStateCol.find({}).toArray();
+      var stateMap = {};
+      states.forEach(function(s) { stateMap[s.phone] = s; });
+      leads.forEach(function(l) {
+        var s = l.phone ? stateMap[l.phone] : null;
+        if (s && Array.isArray(s.topicsDiscussed)) l.topicsDiscussed = s.topicsDiscussed;
       });
     }
 
