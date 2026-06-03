@@ -1757,7 +1757,11 @@ app.get('/debug/:phone', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 
 app.get('/wa-leads', async (req, res) => {
-  if (!memoryCol) return res.json([]);
+  const ready = await ensureMongo();
+  if (!ready || !memoryCol) {
+    console.warn('⚠️ /wa-leads: MongoDB not available');
+    return res.json([]);
+  }
   try {
     const memories = await memoryCol
       .find({})
