@@ -435,7 +435,7 @@ const NAME_BLACKLIST = new Set([
   // Brand / service
   'comply','globally','setup','setting','service','services','incorporation','registration',
   'taxation','banking','fema','odi','compliance','question','options','option',
-  // FIX #4: ambiguous words that pass character checks but are not names
+  // FIX #4: ambiguous words
   'maybe','perhaps','anyone','someone','nobody','whoever','whatever','whenever',
   'nothing','everything','something','anything','later','soon','ready','done',
   'cool','happy','sad','mad','busy','free','new','old','young','open','close',
@@ -449,6 +449,16 @@ const NAME_BLACKLIST = new Set([
   'monday','tuesday','wednesday','thursday','friday','saturday','sunday',
   'january','february','march','april','june','july','august','september',
   'october','november','december','yesterday','today','tomorrow',
+  // FIX A: common capitalized non-name words that slip through standalone regex
+  'interested','interesting','expansion','advisory','consultant','consulting',
+  'founder','director','manager','executive','partner','investor','advisor',
+  'startup','venture','limited','private','public','global','international',
+  'digital','technology','solutions','services','systems','software','platform',
+  'registered','incorporated','licensed','certified','accredited',
+  'regarding','concerning','question','request','inquiry','update','follow',
+  'welcome','greetings','morning','evening','afternoon','regards','sincerely',
+  'currently','previously','recently','immediately','directly','generally',
+  'basically','essentially','specifically','particularly','primarily','mainly',
 ]);
 
 // FIX #6: Removed 'i am' and "i'm" — too easily match action sentences
@@ -494,9 +504,13 @@ function extractName(msg) {
   if (standalone) {
     const candidate = standalone[1].trim();
     const words = candidate.split(/\s+/);
+    // FIX A: extra guard — single-word standalone must not look like a business/action word
+    const firstWordLower = words[0].toLowerCase();
+    const looksLikeAction = /(?:ing|tion|ment|ance|ence|ity|ive|ous|al|ary|ory|ery|ism|ist|ize|ise)$/i.test(firstWordLower);
     if (
       words.length >= 1 &&
       words.length <= 3 &&
+      !looksLikeAction &&
       words.every(w =>
         w.length >= 2 &&
         !NAME_BLACKLIST.has(w.toLowerCase()) &&
@@ -590,8 +604,40 @@ function extractEntities(msg, mem) {
     }
   }
 
-  if (!mem.currentCountry && /\b(indian|from india|based in india|india-based|indian founder|indian entrepreneur)\b/i.test(lower)) {
-    updates.currentCountry = 'India';
+  // FIX C: currentCountry detection — does NOT require expand intent
+  // Detects where the user is BASED, not where they want to expand
+  if (!mem.currentCountry) {
+    // Specific India patterns
+    if (/\b(indian|from india|based in india|india-based|indian founder|indian entrepreneur|i(?:'m| am) indian)\b/i.test(lower)) {
+      updates.currentCountry = 'India';
+    } else {
+      // Generic "based in / I'm in / from X" pattern for any country
+      const basedPatterns = [
+        /\bbased in\s+([a-z\s]{2,25}?)(?:\s*[,.]|$)/i,
+        /\bi(?:'m| am) (?:based |currently )?in\s+([a-z\s]{2,25}?)(?:\s*[,.]|$)/i,
+        /\bliving in\s+([a-z\s]{2,25}?)(?:\s*[,.]|$)/i,
+        /\bi(?:'m| am) from\s+([a-z\s]{2,25}?)(?:\s*[,.]|$)/i,
+        /\bfrom\s+([a-z\s]{2,25}?)(?:\s*[,.]|$)/i,
+        /\bcurrently in\s+([a-z\s]{2,25}?)(?:\s*[,.]|$)/i,
+      ];
+      for (const pat of basedPatterns) {
+        const m = lower.match(pat);
+        if (m) {
+          const place = m[1].trim().replace(/\s+/g, ' ');
+          // Check exact keyword match first
+          const mapped = COUNTRY_MAP[place];
+          if (mapped) { updates.currentCountry = mapped; break; }
+          // Check if any country keyword is contained in the phrase
+          for (const [kw, country] of Object.entries(COUNTRY_MAP)) {
+            if (place === kw || place.startsWith(kw + ' ') || place.endsWith(' ' + kw)) {
+              updates.currentCountry = country;
+              break;
+            }
+          }
+          if (updates.currentCountry) break;
+        }
+      }
+    }
   }
 
   // FIX #34: Accumulate ALL services discussed (not just the first)
@@ -1197,11 +1243,13 @@ async function sendHandoffEmail(phone, mem, session, extraInfo, handoffDetails) 
       headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ from: FROM_EMAIL, to: [NOTIFY_EMAIL], subject: `Consultation Request — ${name} (+${phone})`, html }),
     });
-    if (r.ok) console.log('✅  Handoff email sent');
-    else console.error(`❌  Email ${r.status}: ${await r.text()}`);
-  } catch (err) {
-    console.error('❌  Email failed:', err.message);
-  }
+    if (r.ok) {
+      console.log('✅  Handoff email sent to', NOTIFY_EMAIL);
+    } else {
+      const errBody = await r.text();
+      console.error(`❌  Email FAILED ${r.status}: ${errBody}`);
+      console.error(`❌  FROM: ${FROM_EMAIL} | TO: ${NOTIFY_EMAIL} | KEY_SET: ${!!RESEND_API_KEY}`);
+    }
 }
 
 // ─────────────────────────────────────────────
