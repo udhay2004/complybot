@@ -1250,8 +1250,10 @@ async function sendHandoffEmail(phone, mem, session, extraInfo, handoffDetails) 
       console.error(`❌  Email FAILED ${r.status}: ${errBody}`);
       console.error(`❌  FROM: ${FROM_EMAIL} | TO: ${NOTIFY_EMAIL} | KEY_SET: ${!!RESEND_API_KEY}`);
     }
+  } catch (err) {
+    console.error('❌  Email send error:', err.message);
+  }
 }
-
 // ─────────────────────────────────────────────
 // RATE LIMIT GRACEFUL RESPONSE
 // ─────────────────────────────────────────────
