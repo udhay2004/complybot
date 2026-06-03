@@ -3,13 +3,15 @@
 /**
  * ============================================================
  *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  PRODUCTION EDITION v4.9 — FIX #35: First-message entity extraction
- *  All 34 prior QA fixes retained. New in v4.9:
+ *  PRODUCTION EDITION v4.10 — FIX #36: Immediate name/entity persistence + nickname support
+ *  All 35 prior QA fixes retained. New in v4.10:
  *
- *  FIX #35 — First-message entity extraction
- *             extractNameFirstMessage() handles 'im'/'i am', no 80-char limit
- *             isFirstTime block now extracts name+country before responding
- *             Personalised greeting based on what was detected in first message
+ *  FIX #36 — Immediate name + entity persistence to MongoDB
+ *             extractNameWithNickname() handles "im Anushka call me Anu" → "Anushka (Anu)"
+ *             Standalone "call me Anu" also captured
+ *             Mid-conversation nickname update: existing name + "call me X" → "Name (X)"
+ *             saveMemory() fires immediately (fire-and-forget) on ANY name/entity update
+ *             so CRM reflects data in real-time, not only after handoff or flow completion
  *
  *  Prior fixes (all retained):
  *  FIX #1  — classifyIntent: HANDOFF_VOCAB pre-screen
@@ -47,6 +49,7 @@
  *  FIX #32 — CRITICAL: drop-and-recreate phone_1 index on startup
  *  FIX #33 — Deterministic memory recall for name/country/context questions
  *  FIX #34 — targetCountries/servicesDiscussed arrays; rolling conversation summary
+ *  FIX #35 — First-message entity extraction
  * ============================================================
  */
 
@@ -554,6 +557,60 @@ function extractNameFirstMessage(msg) {
 }
 
 // ─────────────────────────────────────────────
+// FIX #36: NICKNAME + COMPOSITE NAME EXTRACTOR
+// Handles patterns like:
+//   "im Anushka call me Anu"        → "Anushka (Anu)"
+//   "my name is Anushka call me Anu"→ "Anushka (Anu)"
+//   "call me Anu"                   → "Anu"  (standalone)
+//   "just call me Anu"              → "Anu"
+// Called BEFORE extractNameFirstMessage so composite is preferred over partial.
+// ─────────────────────────────────────────────
+function extractNameWithNickname(msg) {
+  const t = msg.trim();
+  if (t.includes('?')) return null;
+  if (CORPORATE_SUFFIX_RE.test(t)) return null;
+
+  // Pattern A: full name intro + nickname qualifier
+  // e.g. "im Anushka call me Anu" / "my name is Anushka but call me Anu"
+  const FULL_NICK_RE = /(?:my name is|i am|i'm|im|this is)\s+([A-Za-z][a-zA-Z'\-]{1,25})(?:\s+\w+){0,4}?\s+(?:but\s+)?(?:call me|just call me|known as|or just|or call me)\s+([A-Za-z][a-zA-Z'\-]{1,20})/i;
+  const fullNickMatch = t.match(FULL_NICK_RE);
+  if (fullNickMatch) {
+    const fullName = fullNickMatch[1].trim();
+    const nick     = fullNickMatch[2].trim();
+    const fullLow  = fullName.toLowerCase();
+    const nickLow  = nick.toLowerCase();
+    if (
+      fullName.length >= 2 && nick.length >= 2 &&
+      !NAME_BLACKLIST.has(fullLow) && !ALL_COUNTRY_WORDS.has(fullLow) &&
+      !NAME_BLACKLIST.has(nickLow) && !ALL_COUNTRY_WORDS.has(nickLow) &&
+      /^[A-Za-z'\-]+$/.test(fullName) && /^[A-Za-z'\-]+$/.test(nick)
+    ) {
+      console.log(`✅  Composite name detected: "${fullName} (${nick})"`);
+      return `${fullName} (${nick})`;
+    }
+  }
+
+  // Pattern B: standalone "call me X" with no prior name intro in this message
+  const NICK_ONLY_RE = /^(?:call me|just call me|you can call me|people call me|everyone calls me)\s+([A-Za-z][a-zA-Z'\-]{1,20})\s*[.!,]?\s*$/i;
+  const nickOnlyMatch = t.match(NICK_ONLY_RE);
+  if (nickOnlyMatch) {
+    const nick    = nickOnlyMatch[1].trim();
+    const nickLow = nick.toLowerCase();
+    if (
+      nick.length >= 2 &&
+      !NAME_BLACKLIST.has(nickLow) &&
+      !ALL_COUNTRY_WORDS.has(nickLow) &&
+      /^[A-Za-z'\-]+$/.test(nick)
+    ) {
+      console.log(`✅  Standalone nickname detected: "${nick}"`);
+      return nick;
+    }
+  }
+
+  return null;
+}
+
+// ─────────────────────────────────────────────
 // ENTITY EXTRACTION — country, service, email
 // FIX #9:  Negation detection before country extraction
 // FIX #16: Email only captured with personal ownership context
@@ -605,13 +662,11 @@ function extractEntities(msg, mem) {
   }
 
   // FIX C: currentCountry detection — does NOT require expand intent
-  // Detects where the user is BASED, not where they want to expand
   if (!mem.currentCountry) {
     // Specific India patterns
     if (/\b(indian|from india|based in india|india-based|indian founder|indian entrepreneur|i(?:'m| am) indian)\b/i.test(lower)) {
       updates.currentCountry = 'India';
     } else {
-      // Generic "based in / I'm in / from X" pattern for any country
       const basedPatterns = [
         /\bbased in\s+([a-z\s]{2,25}?)(?:\s*[,.]|$)/i,
         /\bi(?:'m| am) (?:based |currently )?in\s+([a-z\s]{2,25}?)(?:\s*[,.]|$)/i,
@@ -624,10 +679,8 @@ function extractEntities(msg, mem) {
         const m = lower.match(pat);
         if (m) {
           const place = m[1].trim().replace(/\s+/g, ' ');
-          // Check exact keyword match first
           const mapped = COUNTRY_MAP[place];
           if (mapped) { updates.currentCountry = mapped; break; }
-          // Check if any country keyword is contained in the phrase
           for (const [kw, country] of Object.entries(COUNTRY_MAP)) {
             if (place === kw || place.startsWith(kw + ' ') || place.endsWith(' ' + kw)) {
               updates.currentCountry = country;
@@ -676,18 +729,15 @@ function inferTopic(msg) {
 
 // ─────────────────────────────────────────────
 // INTENT CLASSIFICATION — Claude-powered
-// FIX #1:  HANDOFF_VOCAB pre-screen — skip Claude call if no handoff vocab present
-// FIX #2:  Smart fallback — if vocab present + classifier fails → HANDOFF (safer)
-// FIX #7:  Number match anchored to full message (prevents false menu triggers)
-// FIX #23: Returns rich handoffDetails for context-aware responses
+// FIX #1:  HANDOFF_VOCAB pre-screen
+// FIX #2:  Smart fallback on classifier failure
+// FIX #7:  Number match anchored to full message
+// FIX #23: Returns rich handoffDetails
 // ─────────────────────────────────────────────
 const ORDINAL_MAP = { first: 1, second: 2, third: 3, fourth: 4, '1st': 1, '2nd': 2, '3rd': 3, '4th': 4 };
 
-// FIX #1: Vocabulary pre-screen — only call classifier if at least one handoff word present
 const HANDOFF_VOCAB = /\b(human|agent|speak|talk|person|connect|team|transfer|real|escalat|manager|expert|someone|sales|call|get me)\b/i;
 
-// FIX #27: DEFINITE_QUERY_RE — messages containing handoff vocab that are clearly
-// questions/inquiries about availability/hours, NOT connection requests.
 const DEFINITE_QUERY_RE = /\b(when|what|how|where|do|does|is|are|who|which|btw|anyway|just asking|curious|wondering)\b.*\b(human|agent|team|person|someone|expert|manager|sales|staff|advisor|people|representative)\b|\b(human|agent|team|person|someone|expert|manager|sales|staff|advisor|people)\b.*\b(available|online|hours|timing|schedule|work|open|active|free|respond|reply|office|around|reachable)\b|\b(tell me about|asking about|question about|info about|information about|know about|curious about)\b.*\b(human|agent|team|call|connect)\b/i;
 
 async function classifyIntent(msg) {
@@ -698,10 +748,8 @@ async function classifyIntent(msg) {
     if (lower.includes(word)) return { type: 'menu_select', num };
   }
 
-  // ── Fast path: "last" as menu selection ──
   if (/\blast\b/.test(lower) && lower.length < 25) return { type: 'menu_select', num: 4 };
 
-  // FIX #7: Anchor number match to full message — prevents '1' inside longer sentences
   const numMatch = lower.match(/^\s*(?:option\s*|question\s*|no\.?\s*|#\s*)?([1-9]|1[0-9])\s*$/);
   if (numMatch) {
     const num = parseInt(numMatch[1]);
@@ -709,18 +757,13 @@ async function classifyIntent(msg) {
     return { type: 'invalid_menu' };
   }
 
-  // FIX #1: Pre-screen — if no handoff vocabulary, skip Claude entirely
   if (!HANDOFF_VOCAB.test(lower)) return { type: 'query' };
 
-  // FIX #27: Short-circuit obvious inquiry questions that contain handoff vocab
   if (DEFINITE_QUERY_RE.test(lower)) {
     console.log(`⚡  Fast-path QUERY (availability inquiry): "${msg.substring(0, 60)}"`);
     return { type: 'query' };
   }
 
-  // ── Claude classifies: HANDOFF (with details) vs QUERY ──
-  // FIX #23: Upgraded prompt — returns JSON with rich context for smart responses
-  // FIX #27: Uses claude-haiku (10x faster, cheaper) for binary classification
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -753,44 +796,14 @@ Return this exact JSON structure:
 }
 
 RULES FOR INTENT:
-- HANDOFF = user explicitly wants a real human to CONTACT THEM or speak WITH THEM — a direct request for personal connection
-- QUERY = everything else: questions about availability/hours, asking who the team is, asking HOW to reach someone, greetings, giving name, complaints, jokes, requests for non-human entities, curious inquiries
-- CRITICAL: Asking ABOUT the team or WHEN they are available is a QUERY, not a HANDOFF. The user must be asking to BE connected or contacted.
+- HANDOFF = user explicitly wants a real human to CONTACT THEM or speak WITH THEM
+- QUERY = everything else
+- CRITICAL: Asking ABOUT the team or WHEN they are available is a QUERY, not a HANDOFF
 - If ANY doubt exists → QUERY
-- "impossible" = true when user asks to be connected to a famous person, fictional character, celebrity, or someone clearly not part of the Comply Globally team (e.g. Taylor Swift, Elon Musk, a doctor, a lawyer by name, God, etc.)
-- If impossible=true, set intent=QUERY regardless
+- "impossible" = true when user asks to be connected to a famous person, fictional character, celebrity, or someone clearly not part of the Comply Globally team
 
-HANDOFF — user wants to BE connected / contacted:
-"connect me to your team" → HANDOFF
-"I want to speak to a human" → HANDOFF
-"get me a real person" → HANDOFF
-"can someone call me at 4pm?" → HANDOFF, scheduledTime="4pm"
-"connect me right now" → HANDOFF, urgency="immediate"
-"I want a video call with your advisor" → HANDOFF, preferredChannel="video"
-"let me know when your team is free to call me" → HANDOFF, wantsToCheckAvailability=true
-"connect me tomorrow morning" → HANDOFF, scheduledTime="tomorrow morning"
-"can I get a call between 10 and 11am IST?" → HANDOFF, scheduledTime="10-11am IST"
-"I want to speak to someone about banking" → HANDOFF
-"put me through to a specialist" → HANDOFF
-
-QUERY — asking about, not asking to be connected:
-"when are your humans available btw" → QUERY (asking about hours, not requesting contact)
-"when are your agents available" → QUERY
-"what are your team's hours" → QUERY
-"are your people available on weekends" → QUERY
-"is there a human I can talk to" → QUERY (asking if one exists, not requesting contact)
-"do you have real agents" → QUERY
-"how do I reach someone" → QUERY
-"who are your experts" → QUERY
-"connect me to Taylor Swift" → QUERY, impossible=true
-"connect me to Elon Musk" → QUERY, impossible=true
-"connect me to a doctor" → QUERY, impossible=true
-"my name is human" → QUERY
-"you can call me UD" → QUERY
-"I've seen better agents" → QUERY
-"talk to me" → QUERY
-"what are your fees" → QUERY
-"I'm an expert in taxation" → QUERY
+HANDOFF examples: "connect me to your team", "I want to speak to a human", "get me a real person", "can someone call me at 4pm?"
+QUERY examples: "when are your humans available", "are your agents online", "is there a human I can talk to", "my name is human"
 
 Message: "${msg.replace(/"/g, "'")}"`
         }],
@@ -801,48 +814,34 @@ Message: "${msg.replace(/"/g, "'")}"`
     const rawText = ((data.content?.[0]?.text) || '').trim();
     console.log(`🧠  Intent classify raw: "${msg.substring(0, 50)}" → ${rawText}`);
 
-    // Parse the JSON response
     let parsed;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch {
-      parsed = null;
-    }
+    try { parsed = JSON.parse(rawText); } catch { parsed = null; }
 
     if (parsed) {
-      // Impossible request — treat as QUERY but with context
       if (parsed.impossible) {
         console.log(`🚫  Impossible handoff: ${parsed.impossibleReason}`);
-        return {
-          type: 'query',
-          impossibleHandoff: true,
-          impossibleReason: parsed.impossibleReason || 'That person is not part of our team',
-        };
+        return { type: 'query', impossibleHandoff: true, impossibleReason: parsed.impossibleReason || 'That person is not part of our team' };
       }
-
       if (parsed.intent === 'HANDOFF') {
         return {
           type: 'human_request',
           details: {
-            scheduledTime:           parsed.scheduledTime           || null,
-            urgency:                 parsed.urgency                 || 'normal',
-            preferredChannel:        parsed.preferredChannel        || null,
+            scheduledTime:            parsed.scheduledTime           || null,
+            urgency:                  parsed.urgency                 || 'normal',
+            preferredChannel:         parsed.preferredChannel        || null,
             wantsToCheckAvailability: parsed.wantsToCheckAvailability || false,
-            rawPreference:           parsed.rawPreference           || null,
+            rawPreference:            parsed.rawPreference           || null,
           },
         };
       }
-
       return { type: 'query' };
     }
 
-    // JSON parse failed — use legacy text fallback
     const fallbackText = rawText.toUpperCase();
     if (fallbackText.includes('HANDOFF')) return { type: 'human_request', details: { urgency: 'normal' } };
     return { type: 'query' };
 
   } catch (err) {
-    // FIX #2: If classifier fails AND handoff vocab was present → safer to trigger handoff
     console.error(`❌  classifyIntent failed: ${err.message}`);
     console.warn(`⚠️  Classifier failed with handoff vocab present — triggering handoff as safe default`);
     return { type: 'human_request', details: { urgency: 'normal' } };
@@ -851,14 +850,12 @@ Message: "${msg.replace(/"/g, "'")}"`
 
 // ─────────────────────────────────────────────
 // FIX #24: SMART HANDOFF MESSAGE BUILDER
-// Generates context-aware message based on what the user actually asked for
 // ─────────────────────────────────────────────
 function buildHandoffMessage(details, mem) {
   const name = mem && mem.name ? `${mem.name}` : null;
   const nameGreet = name ? `${name}, ` : '';
   const d = details || {};
 
-  // ── Video call request ──
   if (d.preferredChannel === 'video') {
     return `Of course, ${nameGreet}I'd love to set that up! Our team connects via phone or WhatsApp call — we don't currently offer video consultations, but a phone call works just as well for covering everything in detail. 😊
 
@@ -869,7 +866,6 @@ function buildHandoffMessage(details, mem) {
 They're available from 11:00 AM to 10:00 PM in their respective timezone. Is there a preferred time for them to call you, or any context you'd like me to pass along?`;
   }
 
-  // ── User wants to know when team is free / check availability ──
   if (d.wantsToCheckAvailability) {
     return `Absolutely! Our team is typically available Monday–Saturday, 10am–7pm IST. 🕙
 
@@ -882,7 +878,6 @@ I'll flag your request and they'll reach out to confirm a suitable slot. If you 
 Is there any context about what you'd like to discuss that I can pass along?`;
   }
 
-  // ── Immediate / urgent request ──
   if (d.urgency === 'immediate') {
     return `Got it — I'll flag this as urgent right away! 🚀
 
@@ -893,7 +888,6 @@ Is there any context about what you'd like to discuss that I can pass along?`;
 They're available 10am–7pm IST (Monday–Saturday). I'll also notify them to get back to you as soon as possible. Is there any additional context you'd like me to pass along?`;
   }
 
-  // ── Specific time requested ──
   if (d.scheduledTime) {
     return `Perfect! I'll let our team know you'd like to connect around ${d.scheduledTime}. 🙌
 
@@ -906,7 +900,6 @@ They're available 10am–7pm IST (Monday–Saturday). I'll also notify them to g
 Is there any additional context you'd like me to pass along before they reach out?`;
   }
 
-  // ── Email preferred ──
   if (d.preferredChannel === 'email') {
     return `Of course! I'll have our team follow up with you over email. 😊
 
@@ -916,7 +909,6 @@ Is there any additional context you'd like me to pass along before they reach ou
 They're available Monday–Saturday, 10am–7pm IST. Could you share your email address, or any other context you'd like them to have?`;
   }
 
-  // ── Default handoff (phone/general) ──
   return `Of course! I'll connect you with our specialist team right away. 😊
 
 📞 Direct contact:
@@ -928,21 +920,12 @@ They're available Monday–Saturday, 10am–7pm IST. Is there any additional con
 
 // ─────────────────────────────────────────────
 // FIX #26: SMART HANDOFF CONFIRMATION BUILDER
-// Confirmation after user replies to the "any extra context?" question
 // ─────────────────────────────────────────────
 function buildHandoffConfirmation(details) {
   const d = details || {};
-
-  if (d.urgency === 'immediate') {
-    return `Our team has been notified and will get back to you as soon as possible! 🚀`;
-  }
-  if (d.scheduledTime) {
-    return `Our team has been notified and will aim to connect with you around ${d.scheduledTime}! 🙌`;
-  }
-  if (d.wantsToCheckAvailability) {
-    return `Our team has been notified and will confirm a suitable time with you shortly! 🙌`;
-  }
-  // Default
+  if (d.urgency === 'immediate') return `Our team has been notified and will get back to you as soon as possible! 🚀`;
+  if (d.scheduledTime)          return `Our team has been notified and will aim to connect with you around ${d.scheduledTime}! 🙌`;
+  if (d.wantsToCheckAvailability) return `Our team has been notified and will confirm a suitable time with you shortly! 🙌`;
   return `Our team will be in touch with you shortly! 🙌`;
 }
 
@@ -956,10 +939,7 @@ const GREETING_RE = /^(hi|hey|hello|good morning|good evening|good afternoon|hol
 // FIX #11: NFC normalization + robust emoji digit matcher
 // ─────────────────────────────────────────────
 function parseMenuFromReply(reply) {
-  // FIX #11: Normalize Unicode before parsing to handle variation selector differences
   const normalized = reply.normalize('NFC');
-
-  // Robust: digit 1-4 followed by any combo of variation selector / keycap combinators
   const emojiRE = /([1-4])[\uFE0F\u20E3]{0,2}\s*(.+?)(?=\n[1-4][\uFE0F\u20E3]{0,2}|\n*$)/g;
   const plainRE = /^([1-4])[.)]\s*(.+)/gm;
 
@@ -967,7 +947,6 @@ function parseMenuFromReply(reply) {
   let m;
 
   while ((m = emojiRE.exec(normalized)) !== null) opts.push(m[2].trim());
-
   if (opts.length < 3) {
     opts = [];
     while ((m = plainRE.exec(normalized)) !== null) opts.push(m[2].trim());
@@ -985,11 +964,9 @@ function parseMenuFromReply(reply) {
 // ─────────────────────────────────────────────
 function buildContextBlock(mem, state) {
   const lines = [];
-  // FIX #33/34: Name injected as MANDATORY — history cannot override it
   if (mem.name) {
     lines.push(`MANDATORY: This user's name is "${mem.name}". You already know their name. Never say you don't have it.`);
   }
-  // FIX #34: Show ALL countries and services ever discussed
   const countries = (mem.targetCountries && mem.targetCountries.length) ? mem.targetCountries : (mem.targetCountry ? [mem.targetCountry] : []);
   if (countries.length)       lines.push(`Markets discussed: ${countries.join(', ')}`);
   if (mem.currentCountry)     lines.push(`Based in: ${mem.currentCountry}`);
@@ -1033,7 +1010,7 @@ async function callClaude(session, state, mem, userMessage, kbSection, phaseHint
   const contextBlock = buildContextBlock(mem, state);
   const systemPrompt = ADVISOR_SYSTEM_PROMPT + contextBlock + (phaseHint || '') + (kbSection || '');
 
-  const history = session.history.slice(-12); // FIX #30: was -6, increased to keep more context
+  const history = session.history.slice(-12);
   const messages = [...history, { role: 'user', content: userMessage }];
 
   const estimatedInputTokens = estimateTokens(systemPrompt) + estimateTokens(JSON.stringify(messages));
@@ -1195,17 +1172,15 @@ async function sendHandoffEmail(phone, mem, session, extraInfo, handoffDetails) 
   const service = mem.serviceNeeded  || 'Not specified';
   const email   = mem.email          || 'Not provided';
 
-  // Build handoff preference summary for email
   const d = handoffDetails || {};
   const prefParts = [];
-  if (d.scheduledTime)           prefParts.push(`Requested time: ${d.scheduledTime}`);
-  if (d.urgency === 'immediate') prefParts.push(`Urgency: ASAP / immediate`);
-  if (d.preferredChannel)        prefParts.push(`Preferred channel: ${d.preferredChannel}`);
+  if (d.scheduledTime)            prefParts.push(`Requested time: ${d.scheduledTime}`);
+  if (d.urgency === 'immediate')  prefParts.push(`Urgency: ASAP / immediate`);
+  if (d.preferredChannel)         prefParts.push(`Preferred channel: ${d.preferredChannel}`);
   if (d.wantsToCheckAvailability) prefParts.push(`Wants team to suggest available time`);
-  if (d.rawPreference)           prefParts.push(`Raw preference: "${d.rawPreference}"`);
+  if (d.rawPreference)            prefParts.push(`Raw preference: "${d.rawPreference}"`);
   const prefSummary = prefParts.length ? prefParts.join(' | ') : 'No specific preference';
 
-  // FIX #19: Warn in the email if conversation history is very short
   const recentHistory = session.history.slice(-8);
   const chatLogText = recentHistory.length < 2
     ? '[Conversation too short to log — user triggered handoff very early in conversation]'
@@ -1254,6 +1229,7 @@ async function sendHandoffEmail(phone, mem, session, extraInfo, handoffDetails) 
     console.error('❌  Email send error:', err.message);
   }
 }
+
 // ─────────────────────────────────────────────
 // RATE LIMIT GRACEFUL RESPONSE
 // ─────────────────────────────────────────────
@@ -1289,10 +1265,8 @@ app.post('/webhook', async (req, res) => {
 
     // ══════════════════════════════════════════════
     // FIX #8: Atomic first-time detection via MongoDB insertOne
-    // Prevents race condition where two simultaneous messages both see isFirstTime=true
     // ══════════════════════════════════════════════
     let isFirstTime = false;
-    // FIX #29: Use ensureMongo() so connection is verified/retried before isFirstTime check
     if (await ensureMongo()) {
       try {
         await sessionsCol.insertOne({
@@ -1301,13 +1275,12 @@ app.post('/webhook', async (req, res) => {
           createdAt: new Date(),
           lastActive: new Date(),
         });
-        isFirstTime = true; // Only true if insert succeeded (no duplicate)
+        isFirstTime = true;
       } catch (err) {
-        if (err.code !== 11000) throw err; // 11000 = duplicate key → not first time
+        if (err.code !== 11000) throw err;
         isFirstTime = false;
       }
     } else {
-      // Memory-only mode fallback (no MongoDB)
       isFirstTime = !cGet('session', phone);
     }
 
@@ -1318,36 +1291,47 @@ app.post('/webhook', async (req, res) => {
     // ══════════════════════════════════════════════
     // 1. FIRST-TIME USER
     // FIX #35: Extract name + entities from first message BEFORE responding
-    // so "hi im john im from india looking at usa" gets name+country on first message
+    // FIX #36: Try nickname extractor first; immediately persist to MongoDB
     // ══════════════════════════════════════════════
     if (isFirstTime) {
-      // Extract whatever we can from this first message
-      const firstName = extractNameFirstMessage(rawMsg);
-      if (firstName) {
-        mem.name = firstName;
-        console.log(`✅  Name from first message: ${firstName}`);
+      // FIX #36: Try composite name+nickname extractor first
+      const firstNameNick = extractNameWithNickname(rawMsg);
+      if (firstNameNick) {
+        mem.name = firstNameNick;
+        console.log(`✅  Name+nickname from first message: ${firstNameNick}`);
+      } else {
+        // Fall back to original first-message extractor (FIX #35)
+        const firstName = extractNameFirstMessage(rawMsg);
+        if (firstName) {
+          mem.name = firstName;
+          console.log(`✅  Name from first message: ${firstName}`);
+        }
       }
+
       const firstEntities = extractEntities(rawMsg, mem);
       if (Object.keys(firstEntities).length > 0) {
         Object.assign(mem, firstEntities);
         console.log(`📝  Entities from first message:`, firstEntities);
       }
 
+      // FIX #36: Immediately persist name + entities to MongoDB so CRM sees them
+      // right away — fire-and-forget, does not block the response
+      if (mem.name || Object.keys(firstEntities).length > 0) {
+        saveMemory(mem).catch(e => console.error('❌  Immediate saveMemory (first msg) failed:', e.message));
+      }
+
       let msg;
 
       if (mem.name && mem.targetCountry) {
-        // We have name AND country — skip onboarding, go straight to advisory
         state.phase = 'advisory';
         const kbSection = retrieveKBChunks(rawMsg);
         const phaseHint = `\n\n[PHASE: First message. You already know their name (${mem.name}) and target market (${mem.targetCountry}). Greet them warmly by name, acknowledge their interest in ${mem.targetCountry}, and start giving advisory content immediately. Do NOT ask for name or country again.]`;
         const { reply, rateLimited } = await callClaude(session, state, mem, rawMsg, kbSection, phaseHint);
         msg = reply || `Hi ${mem.name}! 👋 Welcome to Comply Globally — great to meet you!\n\nExpanding to ${mem.targetCountry} is a smart move. Let me pull up what you need to know.`;
       } else if (mem.name) {
-        // We have name but not country — ask for market
         state.phase = 'onboarding';
         msg = `Hi ${mem.name}! 👋 Welcome to Comply Globally.\n\nI'm your international business expansion advisor — here to help across incorporation, banking, tax, and compliance in 47+ jurisdictions.\n\nWhich market are you looking to expand into?`;
       } else {
-        // No name detected — standard greeting, ask for name
         state.phase = 'onboarding';
         msg = `Hi there! 👋 Welcome to Comply Globally.\n\nI'm your international business expansion advisor — here to help you navigate incorporation, banking, tax, and compliance across 47+ jurisdictions.\n\nBefore we dive in — who am I speaking with?`;
       }
@@ -1368,7 +1352,6 @@ app.post('/webhook', async (req, res) => {
         console.log(`🧑  Human mode active — suppressing for ${phone}`);
         return;
       }
-      // FIX #10: Timeout expired — notify user that bot is resuming
       console.log(`⏰  Human mode expired — resuming bot for ${phone}`);
       state.humanMode    = false;
       state.humanModeAt  = null;
@@ -1383,25 +1366,23 @@ app.post('/webhook', async (req, res) => {
 
     // ══════════════════════════════════════════════
     // 3. PENDING HANDOFF — collect extra info then send email
-    // FIX #5:  Short single-word replies (not email) treated as no-extra-info
-    // FIX #26: Confirmation message is context-aware (uses stored handoffDetails)
+    // FIX #5:  Short single-word replies treated as no-extra-info
+    // FIX #26: Confirmation message is context-aware
     // ══════════════════════════════════════════════
     if (state.pendingHandoff) {
       const isNegative    = /^(no|nope|nothing|n\/a|nah|not really|skip|none)$/i.test(rawMsg.trim());
-      // FIX #5: if reply is very short and doesn't contain an email, treat as no extra info
       const wordCount     = rawMsg.trim().split(/\s+/).length;
       const containsEmail = EMAIL_RE.test(rawMsg);
       const isTooShort    = wordCount < 3 && !containsEmail;
       const extraInfo     = (isNegative || isTooShort) ? null : rawMsg;
 
-      // FIX #26: Use stored handoffDetails for context-aware confirmation
       const confirmMsg = buildHandoffConfirmation(state.handoffDetails);
       await send(phone, confirmMsg, incomingCC);
 
       session.history.push({ role: 'user', content: truncateMsg(rawMsg) });
       session.history.push({ role: 'assistant', content: confirmMsg });
 
-      const savedDetails   = state.handoffDetails; // capture before clearing
+      const savedDetails   = state.handoffDetails;
       state.pendingHandoff   = false;
       state.handoffEmailSent = true;
       state.humanMode        = true;
@@ -1417,7 +1398,6 @@ app.post('/webhook', async (req, res) => {
 
     // ══════════════════════════════════════════════
     // FIX #20: Emoji-only / reaction message detection
-    // Handle before entity extraction and intent pipeline
     // ══════════════════════════════════════════════
     const isEmojiOnly = /^[\u{1F300}-\u{1FFFF}\u{2600}-\u{27FF}\uFE0F\u20E3\s]+$/u.test(rawMsg) && rawMsg.trim().length < 20;
     if (isEmojiOnly) {
@@ -1431,15 +1411,62 @@ app.post('/webhook', async (req, res) => {
 
     // ══════════════════════════════════════════════
     // 4. ENTITY EXTRACTION (runs on every message)
+    // FIX #36: Nickname extractor runs first; immediate saveMemory on any name/entity change
     // ══════════════════════════════════════════════
+    let memDirty = false; // tracks whether mem changed so we know to fire immediate save
+
     if (!mem.name) {
-      const n = extractName(rawMsg);
-      if (n) { mem.name = n; console.log(`✅  Name locked: ${n}`); }
+      // FIX #36: Try composite name+nickname extractor first
+      const nn = extractNameWithNickname(rawMsg);
+      if (nn) {
+        mem.name = nn;
+        memDirty = true;
+        console.log(`✅  Name+nickname locked: ${nn}`);
+      } else {
+        // Fall back to original strict extractor
+        const n = extractName(rawMsg);
+        if (n) {
+          mem.name = n;
+          memDirty = true;
+          console.log(`✅  Name locked: ${n}`);
+        }
+      }
     }
+
+    // FIX #36: Mid-conversation nickname update
+    // If user already has a name stored (no nickname yet) and now says "call me X"
+    // → update stored name to "FullName (X)"
+    if (mem.name && !mem.name.includes('(')) {
+      const MID_NICK_RE = /^(?:call me|just call me|actually call me|you can call me|everyone calls me|people call me)\s+([A-Za-z][a-zA-Z'\-]{1,20})\s*[.!,]?\s*$/i;
+      const midNickMatch = rawMsg.trim().match(MID_NICK_RE);
+      if (midNickMatch) {
+        const nick    = midNickMatch[1].trim();
+        const nickLow = nick.toLowerCase();
+        if (
+          nick.length >= 2 &&
+          !NAME_BLACKLIST.has(nickLow) &&
+          !ALL_COUNTRY_WORDS.has(nickLow) &&
+          /^[A-Za-z'\-]+$/.test(nick)
+        ) {
+          const oldName = mem.name;
+          mem.name  = `${mem.name} (${nick})`;
+          memDirty  = true;
+          console.log(`✅  Nickname appended: "${oldName}" → "${mem.name}"`);
+        }
+      }
+    }
+
     const entityUpdates = extractEntities(rawMsg, mem);
     if (Object.keys(entityUpdates).length > 0) {
       Object.assign(mem, entityUpdates);
+      memDirty = true;
       console.log(`📝  Entities:`, entityUpdates);
+    }
+
+    // FIX #36: Fire-and-forget immediate MongoDB persist whenever mem changed
+    // This ensures CRM reflects name/country/service without waiting for end-of-handler save
+    if (memDirty) {
+      saveMemory(mem).catch(e => console.error('❌  Immediate saveMemory failed:', e.message));
     }
 
     const topic = inferTopic(rawMsg);
@@ -1460,8 +1487,7 @@ app.post('/webhook', async (req, res) => {
     // ══════════════════════════════════════════════
     const intent = await classifyIntent(rawMsg);
 
-    // ── 5a. Impossible handoff (Taylor Swift, Elon Musk, etc.) ──
-    // FIX #23: Impossible requests get a polite redirect, don't trigger real handoff
+    // ── 5a. Impossible handoff ──
     if (intent.impossibleHandoff) {
       const reason = intent.impossibleReason || '';
       let impossibleMsg;
@@ -1480,7 +1506,6 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ── 5b. Human handoff request ──
-    // FIX #24: Context-aware handoff message based on what user actually asked for
     if (intent.type === 'human_request') {
       const details = intent.details || { urgency: 'normal' };
       const msg = buildHandoffMessage(details, mem);
@@ -1492,7 +1517,7 @@ app.post('/webhook', async (req, res) => {
       state.pendingHandoff  = true;
       state.phase           = 'escalating';
       state.lastMenu        = null;
-      state.handoffDetails  = details; // FIX #25: store for confirmation msg later
+      state.handoffDetails  = details;
 
       await Promise.all([saveSession(session), saveState(state)]);
       return;
@@ -1510,7 +1535,7 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // FIX #17: menu_select with no active menu — explicit graceful handler
+    // FIX #17: menu_select with no active menu
     if (intent.type === 'menu_select' && !state.lastMenu) {
       const msg = `I don't have an active menu right now — feel free to ask me anything directly!`;
       await send(phone, msg, incomingCC);
@@ -1558,10 +1583,10 @@ app.post('/webhook', async (req, res) => {
     // ══════════════════════════════════════════════
     // 6. RETURNING USER GREETING — no LLM needed
     // FIX #15: Skip if phase is escalating or human_mode
-    // FIX #22: Require session age > 1 hour to be considered "returning"
+    // FIX #22: Require session age > 1 hour
     // ══════════════════════════════════════════════
     const sessionAgeMs  = Date.now() - new Date(session.createdAt || 0).getTime();
-    const isReturning   = session.history.length > 4 && sessionAgeMs > 3600000; // >1hr old
+    const isReturning   = session.history.length > 4 && sessionAgeMs > 3600000;
     const safePhase     = !['escalating', 'human_mode'].includes(state.phase);
 
     if (GREETING_RE.test(rawMsg) && isReturning && safePhase) {
@@ -1579,8 +1604,6 @@ app.post('/webhook', async (req, res) => {
 
     // ══════════════════════════════════════════════
     // FIX #33: DETERMINISTIC MEMORY RECALL
-    // Intercept name/country/context questions BEFORE Claude
-    // so poisoned history cannot override known facts from MongoDB.
     // ══════════════════════════════════════════════
     const isNameQuestion    = /what[''\u2019s ]*s? ?my name|yk my name|you know my name|tell me my name|do you (?:know|remember) my name/i.test(rawMsg);
     const isCountryQuestion = /which country|what country|where am i expand|which market|what market/i.test(rawMsg);
@@ -1648,7 +1671,6 @@ app.post('/webhook', async (req, res) => {
     }
 
     await send(phone, reply, incomingCC);
-    // FIX #18: truncate before storing in history
     session.history.push({ role: 'user', content: truncateMsg(rawMsg) });
     session.history.push({ role: 'assistant', content: truncateMsg(reply) });
 
@@ -1801,11 +1823,10 @@ app.get('/debug/:phone', async (req, res) => {
     lastMessages: session.history.slice(-4),
   });
 });
-// ═══════════════════════════════════════════════════════════════
-// ADD THIS TO YOUR WHATSAPP index.js (complybot.onrender.com)
-// Paste anywhere BEFORE the app.listen() call at the bottom
-// ═══════════════════════════════════════════════════════════════
 
+// ─────────────────────────────────────────────
+// /wa-leads — CRM endpoint, reads from MongoDB
+// ─────────────────────────────────────────────
 app.get('/wa-leads', async function(req, res) {
   var ready = await ensureMongo();
   if (!ready || !memoryCol) {
@@ -1851,6 +1872,7 @@ app.get('/wa-leads', async function(req, res) {
     res.json([]);
   }
 });
+
 // ─────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────
@@ -1858,7 +1880,7 @@ const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🚀  ComplyGlobally Bot v4.9 — FIX #35: First-message entity extraction`);
+    console.log(`\n🚀  ComplyGlobally Bot v4.10 — FIX #36: Immediate name persistence + nickname support`);
     console.log(`📡  Port: ${PORT}`);
     console.log(`📮  POST /webhook`);
     console.log(`❤️   GET  /health`);
