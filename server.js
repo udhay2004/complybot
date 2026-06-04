@@ -3,23 +3,24 @@
 /**
  * ============================================================
  *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  PRODUCTION EDITION v4.11 — STORAGE + GREETING FIX
- *  All 36 prior QA fixes retained. New in v4.11:
+ *  PRODUCTION EDITION v4.12 — NAME EXTRACTION HARDENING
+ *  All 39 prior QA fixes retained. New in v4.12:
  *
- *  FIX #37 — Proper returning-user greeting on first message of new session
- *             If MongoDB has prior history for this phone → greet by name,
- *             reference last topics discussed, ask what they need today.
- *             Truly new users still get the standard "Who am I speaking with?" flow.
+ *  FIX #40 (enhanced) — Multi-pattern name extraction from rolling summary.
+ *             Catches "Tanya is exploring...", "The user, Rahul, ...",
+ *             "named Tanya", "called Tanya", mid-summary "...Tanya is..."
  *
- *  FIX #38 — All immediate saveMemory() calls are now awaited (not fire-and-forget)
- *             in the paths that matter most (first message, mid-convo name lock).
- *             This prevents race conditions where MongoDB write was skipped.
+ *  FIX #41 — Real-time name rescue: scan Claude's reply for greeting patterns
+ *             like "Hi Tanya," or "Sure Rahul," to capture names that were
+ *             passed via KB/context but not stored in mem.name yet.
  *
- *  FIX #39 — Rolling summary now awaits saveMemory() after updating
- *             conversationSummary so it actually persists between sessions.
+ *  FIX #42 — saveMemory debug log: logs name + targetCountry on every write
+ *             so you can immediately see in logs whether extraction succeeded.
  *
- *  ALL other logic unchanged — advisory, handoff, menu, entity extraction,
- *  classifyIntent, callClaude, parsePhone, send, email are untouched.
+ *  FIX #43 — Broader extractName: catches mid-conversation "I'm X" (without
+ *             a greeting prefix) as a standalone message.
+ *
+ *  ALL other logic unchanged.
  * ============================================================
  */
 
@@ -309,9 +310,13 @@ async function getMemory(phone) {
   cSet('memory', phone, m);
   return m;
 }
+
+// FIX #42: saveMemory now logs name + targetCountry on every write
+// so you can immediately confirm in server logs whether extraction succeeded.
 async function saveMemory(m) {
   m.updatedAt = new Date();
   cSet('memory', m.phone, m);
+  console.log(`💾  saveMemory [${m.phone}]: name=${m.name || 'null'} targetCountry=${m.targetCountry || 'null'}`);
   if (await ensureMongo()) {
     try {
       const { _id, ...doc } = m;
@@ -444,6 +449,21 @@ function extractName(msg) {
       /^[A-Za-z'\-]+$/.test(candidate)
     ) return candidate;
   }
+
+  // FIX #43: Mid-conversation "I'm X" / "I am X" as a standalone short message
+  // (without greeting prefix — only safe when message is very short and nothing else is in it)
+  const MID_IAM_RE = /^(?:i(?:'m| am|m))\s+([A-Za-z][a-zA-Z'\-]{1,25})\s*[.!,]?\s*$/i;
+  const midIam = t.match(MID_IAM_RE);
+  if (midIam) {
+    const candidate = midIam[1].trim();
+    if (
+      candidate.length >= 2 &&
+      !NAME_BLACKLIST.has(candidate.toLowerCase()) &&
+      !ALL_COUNTRY_WORDS.has(candidate.toLowerCase()) &&
+      /^[A-Za-z'\-]+$/.test(candidate)
+    ) return candidate;
+  }
+
   const standalone = t.match(NAME_STANDALONE_RE);
   if (standalone) {
     const candidate = standalone[1].trim();
@@ -1049,14 +1069,11 @@ function rateLimitResponse(waitSec) {
 
 // ─────────────────────────────────────────────
 // FIX #37: RETURNING USER GREETING BUILDER
-// Called when MongoDB has prior history for this phone number.
-// Builds a warm, personalised re-engagement message.
 // ─────────────────────────────────────────────
 function buildReturningGreeting(mem, state) {
   const name = mem.name ? mem.name : null;
   const nameStr = name ? `${name}` : 'there';
 
-  // Build topic/country reference for context
   const contextParts = [];
   const countries = (mem.targetCountries && mem.targetCountries.length)
     ? mem.targetCountries
@@ -1072,7 +1089,6 @@ function buildReturningGreeting(mem, state) {
 
   let contextLine = '';
   if (summary && summary.length > 20) {
-    // Use the rolling summary if available — most informative
     contextLine = `Last time, we covered: ${summary.length > 120 ? summary.substring(0, 117) + '...' : summary}`;
   } else if (contextParts.length) {
     contextLine = `Last time we were discussing ${contextParts.join(' and ')}.`;
@@ -1107,9 +1123,7 @@ app.post('/webhook', async (req, res) => {
 
     console.log(`\n📩  [${phone}] "${rawMsg}"`);
 
-    // ══════════════════════════════════════════════
-    // FIX #8: Atomic first-time detection via MongoDB insertOne
-    // ══════════════════════════════════════════════
+    // ── Atomic first-time detection via MongoDB insertOne ──
     let isFirstTime = false;
     if (await ensureMongo()) {
       try {
@@ -1132,24 +1146,15 @@ app.post('/webhook', async (req, res) => {
       getSession(phone), getState(phone), getMemory(phone),
     ]);
 
-    // ══════════════════════════════════════════════
-    // FIX #37: RETURNING USER CHECK
-    // If this phone has prior MongoDB history (session.history.length > 0)
-    // even though isFirstTime=false, check if this is the very first message
-    // of a new in-memory session (cache miss) — i.e. user is returning after
-    // server restart or cache expiry.
-    // Condition: not first time AND session has history AND no recent cache hit
-    // AND the incoming message looks like an opener (greeting or short query).
-    // ══════════════════════════════════════════════
+    // ── FIX #37: RETURNING USER CHECK ──
     const isReturningOpener = (
       !isFirstTime &&
       session.history.length > 2 &&
-      mem.name // only personalise if we actually know their name
+      mem.name
     );
 
     // ── FIRST TIME USER ──
     if (isFirstTime) {
-      // Try composite name+nickname extractor first (FIX #36)
       const firstNameNick = extractNameWithNickname(rawMsg);
       if (firstNameNick) {
         mem.name = firstNameNick;
@@ -1168,7 +1173,6 @@ app.post('/webhook', async (req, res) => {
         console.log(`📝  Entities from first message:`, firstEntities);
       }
 
-      // FIX #38: await the immediate persist (was fire-and-forget — caused race conditions)
       if (mem.name || Object.keys(firstEntities).length > 0) {
         await saveMemory(mem);
         console.log(`✅  Memory persisted immediately after first-message extraction`);
@@ -1249,13 +1253,7 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // ══════════════════════════════════════════════
-    // FIX #37: RETURNING OPENER — send warm re-engagement greeting
-    // Fires when: returning user AND the current in-memory session history
-    // is SHORT (≤ 1 assistant messages) meaning this is essentially the
-    // "first message" of their new session (after restart / cache miss).
-    // We check session.history assistant-msg count to avoid greeting mid-convo.
-    // ══════════════════════════════════════════════
+    // ── FIX #37: RETURNING OPENER ──
     const assistantMsgCount = session.history.filter(m => m.role === 'assistant').length;
     if (isReturningOpener && assistantMsgCount === 0) {
       const returningMsg = buildReturningGreeting(mem, state);
@@ -1269,7 +1267,6 @@ app.post('/webhook', async (req, res) => {
 
     // ══════════════════════════════════════════════
     // ENTITY EXTRACTION (every message)
-    // FIX #38: await saveMemory immediately when mem changes
     // ══════════════════════════════════════════════
     let memDirty = false;
 
@@ -1289,7 +1286,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // Mid-conversation nickname update (FIX #36)
+    // Mid-conversation nickname update
     if (mem.name && !mem.name.includes('(')) {
       const MID_NICK_RE = /^(?:call me|just call me|actually call me|you can call me|everyone calls me|people call me)\s+([A-Za-z][a-zA-Z'\-]{1,20})\s*[.!,]?\s*$/i;
       const midNickMatch = rawMsg.trim().match(MID_NICK_RE);
@@ -1317,7 +1314,6 @@ app.post('/webhook', async (req, res) => {
       console.log(`📝  Entities:`, entityUpdates);
     }
 
-    // FIX #38: await the immediate persist so CRM sees it right away
     if (memDirty) {
       await saveMemory(mem);
       console.log(`✅  Memory persisted immediately after entity update`);
@@ -1424,10 +1420,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // ══════════════════════════════════════════════
-    // RETURNING USER GREETING (mid-session, pure greeting messages)
-    // FIX #15, #22: skip if escalating/human_mode; require session age > 1hr
-    // ══════════════════════════════════════════════
+    // ── Returning user greeting (mid-session, pure greeting messages) ──
     const sessionAgeMs  = Date.now() - new Date(session.createdAt || 0).getTime();
     const isOldSession  = session.history.length > 4 && sessionAgeMs > 3600000;
     const safePhase     = !['escalating', 'human_mode'].includes(state.phase);
@@ -1445,9 +1438,7 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // ══════════════════════════════════════════════
-    // DETERMINISTIC MEMORY RECALL (FIX #33)
-    // ══════════════════════════════════════════════
+    // ── Deterministic memory recall ──
     const isNameQuestion    = /what[''\u2019s ]*s? ?my name|yk my name|you know my name|tell me my name|do you (?:know|remember) my name/i.test(rawMsg);
     const isCountryQuestion = /which country|what country|where am i expand|which market|what market/i.test(rawMsg);
     const isContextQuestion = /what do you know about me|what have we discussed|do you remember (?:me|our|what)|what did (?:we|i) (?:talk|discuss|say)/i.test(rawMsg);
@@ -1514,13 +1505,35 @@ app.post('/webhook', async (req, res) => {
     session.history.push({ role: 'user', content: truncateMsg(rawMsg) });
     session.history.push({ role: 'assistant', content: truncateMsg(reply) });
 
+    // FIX #41: Real-time name rescue — scan Claude's reply for greeting patterns
+    // like "Hi Tanya," or "Sure Rahul," to catch names passed via KB/context
+    // that were never explicitly stored in mem.name.
+    if (!mem.name && reply) {
+      const REPLY_NAME_RE = /^(?:Hi|Hey|Hello|Sure|Great|Of course|Absolutely|Thanks|Thank you)[,!\s]+([A-Z][a-z]{2,20})\b/;
+      const replyNameMatch = reply.match(REPLY_NAME_RE);
+      if (replyNameMatch) {
+        const candidate = replyNameMatch[1].trim();
+        const candLow = candidate.toLowerCase();
+        if (
+          candidate.length >= 2 &&
+          !NAME_BLACKLIST.has(candLow) &&
+          !ALL_COUNTRY_WORDS.has(candLow) &&
+          /^[A-Za-z'\-]+$/.test(candidate)
+        ) {
+          mem.name = candidate;
+          console.log(`✅  Name rescued from Claude reply greeting: "${candidate}"`);
+          await saveMemory(mem);
+        }
+      }
+    }
+
     const newMenu = parseMenuFromReply(reply);
     if (newMenu) {
       state.lastMenu = { id: Date.now(), options: newMenu, context: topic || rawMsg.substring(0, 60), createdAt: Date.now() };
       console.log(`📋  Menu stored: [${newMenu.join(' | ')}]`);
     }
 
-    // FIX #39: Rolling summary — update every 5 user messages, then await saveMemory
+    // FIX #39 + FIX #40 (enhanced): Rolling summary — update every 5 user messages
     const userMsgCount = session.history.filter(m => m.role === 'user').length;
     if (userMsgCount > 0 && userMsgCount % 5 === 0) {
       try {
@@ -1545,22 +1558,35 @@ ${session.history.slice(-10).map(m => (m.role === 'user' ? 'User' : 'Advisor') +
           mem.conversationSummary = summary;
           console.log(`📝  Summary updated: ${summary.substring(0, 80)}...`);
 
-          // FIX #40: If name still not captured, attempt to extract from summary
-          // Summary often contains "Tanya is exploring..." or "The user, Rahul, ..."
+          // FIX #40 (enhanced): Multi-pattern name extraction from summary.
+          // Catches "Tanya is exploring...", "The user, Rahul, ...",
+          // "named Tanya", and mid-summary "...Tanya is exploring..."
           if (!mem.name) {
-            const SUMMARY_NAME_RE = /^([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20})?)\s+(?:is|has|wants|would|expressed|mentioned|asked|seems|appears)\b/;
-            const summaryNameMatch = summary.match(SUMMARY_NAME_RE);
-            if (summaryNameMatch) {
-              const candidate = summaryNameMatch[1].trim();
-              const candLow = candidate.toLowerCase();
-              if (
-                candidate.length >= 2 &&
-                !NAME_BLACKLIST.has(candLow) &&
-                !ALL_COUNTRY_WORDS.has(candLow) &&
-                /^[A-Za-z'\-]+(\s[A-Za-z'\-]+)?$/.test(candidate)
-              ) {
-                mem.name = candidate;
-                console.log(`✅  Name extracted from summary: "${candidate}"`);
+            const SUMMARY_NAME_PATTERNS = [
+              // "Tanya is exploring..." / "Rahul has expressed..."
+              /^([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20})?)\s+(?:is|has|wants|would|expressed|mentioned|asked|seems|appears|was|will)\b/,
+              // "The user, Tanya, is..." / "The client, Rahul, wants..."
+              /\bthe (?:user|client|customer|caller|person|individual)[,\s]+([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20})?)[,\s]/i,
+              // "named Tanya" / "called Tanya"
+              /\b(?:named?|called)\s+([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20})?)\b/,
+              // Mid-summary: "...Tanya is exploring/looking/interested..."
+              /\b([A-Z][a-z]{2,20})\s+is\s+(?:exploring|looking|interested|asking|expanding|planning|considering|inquiring|focused)/,
+            ];
+            for (const re of SUMMARY_NAME_PATTERNS) {
+              const summaryNameMatch = summary.match(re);
+              if (summaryNameMatch) {
+                const candidate = summaryNameMatch[1].trim();
+                const candLow = candidate.toLowerCase();
+                if (
+                  candidate.length >= 2 &&
+                  !NAME_BLACKLIST.has(candLow) &&
+                  !ALL_COUNTRY_WORDS.has(candLow) &&
+                  /^[A-Za-z'\-]+(\s[A-Za-z'\-]+)?$/.test(candidate)
+                ) {
+                  mem.name = candidate;
+                  console.log(`✅  Name extracted from summary (pattern: ${re.source.substring(0, 40)}): "${candidate}"`);
+                  break;
+                }
               }
             }
           }
@@ -1735,7 +1761,7 @@ const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🚀  ComplyGlobally Bot v4.11 — FIX #37-39: Returning-user greeting + storage reliability`);
+    console.log(`\n🚀  ComplyGlobally Bot v4.12 — FIX #40-43: Name extraction hardening`);
     console.log(`📡  Port: ${PORT}`);
     console.log(`📮  POST /webhook`);
     console.log(`❤️   GET  /health`);
