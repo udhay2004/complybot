@@ -405,6 +405,8 @@ const NAME_BLACKLIST = new Set([
 ]);
 
 const NAME_INTRO_RE = /(?:my name is|this is|you can call me|they call me)\s+([A-Za-z][a-zA-Z'\-]{1,30}(?:\s+[A-Za-z][a-zA-Z'\-]{1,30}){0,2})/i;
+// Greeting-prefixed intro: "Hi I'm Tanya", "Hey, I am Rahul" — safe mid-conversation because greeting prefix acts as guard
+const NAME_INTRO_GREETING_RE = /^(?:hi|hey|hello|hola)[!,.\s]+(?:i(?:'m| am|m)\s+)([A-Za-z][a-zA-Z'\-]{1,25})\b/i;
 const NAME_STANDALONE_RE = /^([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20}){0,2})\s*(?:here|speaking|this side)?[.!]?\s*$/;
 const CORPORATE_SUFFIX_RE = /\b(calling|support|corp|ltd|inc|llc|pvt|telecom|bank|group|global|solutions|services|systems|technologies|tech|team|helpdesk|desk)\b/i;
 
@@ -430,6 +432,18 @@ function extractName(msg) {
       )
     ) return candidate;
   }
+
+  // "Hi I'm Tanya" / "Hey I am Rahul" — greeting-prefixed intro (safe because greeting is guard)
+  const greetIntro = t.match(NAME_INTRO_GREETING_RE);
+  if (greetIntro) {
+    const candidate = greetIntro[1].trim();
+    if (
+      candidate.length >= 2 &&
+      !NAME_BLACKLIST.has(candidate.toLowerCase()) &&
+      !ALL_COUNTRY_WORDS.has(candidate.toLowerCase()) &&
+      /^[A-Za-z'\-]+$/.test(candidate)
+    ) return candidate;
+  }
   const standalone = t.match(NAME_STANDALONE_RE);
   if (standalone) {
     const candidate = standalone[1].trim();
@@ -453,7 +467,10 @@ function extractNameFirstMessage(msg) {
   const t = msg.trim();
   if (t.includes('?')) return null;
   if (CORPORATE_SUFFIX_RE.test(t)) return null;
-  const FIRST_MSG_RE = /(?:my name is|this is|i am|i'm|im|call me|you can call me)\s+([A-Za-z][a-zA-Z'\-]{1,20})/i;
+
+  // Broader pattern for first message — allows "Hi I'm Tanya", "Hey, I'm Tanya", "Hello! I'm Tanya"
+  // The greeting prefix (hi/hey/hello/hola + optional punctuation/spaces) is consumed before the intro
+  const FIRST_MSG_RE = /(?:(?:hi|hey|hello|hola|howdy|good morning|good evening|good afternoon)[!,.\s]+)?(?:my name is|this is|i am|i'm|im|call me|you can call me)\s+([A-Za-z][a-zA-Z'\-]{1,20})/i;
   const m = t.match(FIRST_MSG_RE);
   if (m) {
     const candidate = m[1].trim();
@@ -1527,7 +1544,28 @@ ${session.history.slice(-10).map(m => (m.role === 'user' ? 'User' : 'Advisor') +
         if (summary) {
           mem.conversationSummary = summary;
           console.log(`📝  Summary updated: ${summary.substring(0, 80)}...`);
-          // FIX #39: await saveMemory so summary persists to MongoDB immediately
+
+          // FIX #40: If name still not captured, attempt to extract from summary
+          // Summary often contains "Tanya is exploring..." or "The user, Rahul, ..."
+          if (!mem.name) {
+            const SUMMARY_NAME_RE = /^([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20})?)\s+(?:is|has|wants|would|expressed|mentioned|asked|seems|appears)\b/;
+            const summaryNameMatch = summary.match(SUMMARY_NAME_RE);
+            if (summaryNameMatch) {
+              const candidate = summaryNameMatch[1].trim();
+              const candLow = candidate.toLowerCase();
+              if (
+                candidate.length >= 2 &&
+                !NAME_BLACKLIST.has(candLow) &&
+                !ALL_COUNTRY_WORDS.has(candLow) &&
+                /^[A-Za-z'\-]+(\s[A-Za-z'\-]+)?$/.test(candidate)
+              ) {
+                mem.name = candidate;
+                console.log(`✅  Name extracted from summary: "${candidate}"`);
+              }
+            }
+          }
+
+          // FIX #39: await saveMemory so summary (and any name) persists to MongoDB immediately
           await saveMemory(mem);
           console.log(`✅  Summary persisted to MongoDB`);
         }
