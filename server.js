@@ -3,24 +3,27 @@
 /**
  * ============================================================
  *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  PRODUCTION EDITION v4.12 — NAME EXTRACTION HARDENING
- *  All 39 prior QA fixes retained. New in v4.12:
+ *  PRODUCTION EDITION v4.13 — COUNTRY + SUMMARY FIXES
+ *  All 43 prior fixes retained. New in v4.13:
  *
- *  FIX #40 (enhanced) — Multi-pattern name extraction from rolling summary.
- *             Catches "Tanya is exploring...", "The user, Rahul, ...",
- *             "named Tanya", "called Tanya", mid-summary "...Tanya is..."
+ *  FIX #44 — Broader target country detection: removes strict
+ *             EXPAND_INTENT_RE gate. Now catches "I want to go
+ *             to UAE", "thinking about Dubai", "looking at
+ *             Singapore", "business in Canada" etc.
+ *             Uses a wider SOFT_INTEREST_RE so we still require
+ *             some intent context (avoids misfiring on
+ *             "my client is in Germany").
  *
- *  FIX #41 — Real-time name rescue: scan Claude's reply for greeting patterns
- *             like "Hi Tanya," or "Sure Rahul," to capture names that were
- *             passed via KB/context but not stored in mem.name yet.
+ *  FIX #45 — Summary fires after 2 user messages (not 5), and
+ *             also immediately if summary is empty and we have
+ *             ≥2 messages. Ensures short conversations that
+ *             end early still produce a summary.
  *
- *  FIX #42 — saveMemory debug log: logs name + targetCountry on every write
- *             so you can immediately see in logs whether extraction succeeded.
+ *  FIX #46 — Extract targetCountry + currentCountry FROM the
+ *             summary text if still missing after real-time
+ *             extraction. Safety net for any gaps.
  *
- *  FIX #43 — Broader extractName: catches mid-conversation "I'm X" (without
- *             a greeting prefix) as a standalone message.
- *
- *  ALL other logic unchanged.
+ *  NAME LOGIC (#40-#43) — COMPLETELY UNTOUCHED.
  * ============================================================
  */
 
@@ -311,12 +314,11 @@ async function getMemory(phone) {
   return m;
 }
 
-// FIX #42: saveMemory now logs name + targetCountry on every write
-// so you can immediately confirm in server logs whether extraction succeeded.
+// FIX #42: saveMemory logs name + targetCountry + currentCountry on every write
 async function saveMemory(m) {
   m.updatedAt = new Date();
   cSet('memory', m.phone, m);
-  console.log(`💾  saveMemory [${m.phone}]: name=${m.name || 'null'} targetCountry=${m.targetCountry || 'null'}`);
+  console.log(`💾  saveMemory [${m.phone}]: name=${m.name || 'null'} targetCountry=${m.targetCountry || 'null'} currentCountry=${m.currentCountry || 'null'}`);
   if (await ensureMongo()) {
     try {
       const { _id, ...doc } = m;
@@ -371,7 +373,7 @@ const ALL_COUNTRY_WORDS = new Set([
 ]);
 
 // ─────────────────────────────────────────────
-// NAME EXTRACTION
+// NAME EXTRACTION — UNCHANGED FROM v4.12
 // ─────────────────────────────────────────────
 const NAME_BLACKLIST = new Set([
   'hi','hello','hey','okay','ok','yes','no','sure','thanks','thank','please',
@@ -410,7 +412,6 @@ const NAME_BLACKLIST = new Set([
 ]);
 
 const NAME_INTRO_RE = /(?:my name is|this is|you can call me|they call me)\s+([A-Za-z][a-zA-Z'\-]{1,30}(?:\s+[A-Za-z][a-zA-Z'\-]{1,30}){0,2})/i;
-// Greeting-prefixed intro: "Hi I'm Tanya", "Hey, I am Rahul" — safe mid-conversation because greeting prefix acts as guard
 const NAME_INTRO_GREETING_RE = /^(?:hi|hey|hello|hola)[!,.\s]+(?:i(?:'m| am|m)\s+)([A-Za-z][a-zA-Z'\-]{1,25})\b/i;
 const NAME_STANDALONE_RE = /^([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20}){0,2})\s*(?:here|speaking|this side)?[.!]?\s*$/;
 const CORPORATE_SUFFIX_RE = /\b(calling|support|corp|ltd|inc|llc|pvt|telecom|bank|group|global|solutions|services|systems|technologies|tech|team|helpdesk|desk)\b/i;
@@ -437,8 +438,6 @@ function extractName(msg) {
       )
     ) return candidate;
   }
-
-  // "Hi I'm Tanya" / "Hey I am Rahul" — greeting-prefixed intro (safe because greeting is guard)
   const greetIntro = t.match(NAME_INTRO_GREETING_RE);
   if (greetIntro) {
     const candidate = greetIntro[1].trim();
@@ -449,9 +448,7 @@ function extractName(msg) {
       /^[A-Za-z'\-]+$/.test(candidate)
     ) return candidate;
   }
-
-  // FIX #43: Mid-conversation "I'm X" / "I am X" as a standalone short message
-  // (without greeting prefix — only safe when message is very short and nothing else is in it)
+  // FIX #43: Mid-conversation "I'm X" / "I am X" as standalone short message
   const MID_IAM_RE = /^(?:i(?:'m| am|m))\s+([A-Za-z][a-zA-Z'\-]{1,25})\s*[.!,]?\s*$/i;
   const midIam = t.match(MID_IAM_RE);
   if (midIam) {
@@ -463,7 +460,6 @@ function extractName(msg) {
       /^[A-Za-z'\-]+$/.test(candidate)
     ) return candidate;
   }
-
   const standalone = t.match(NAME_STANDALONE_RE);
   if (standalone) {
     const candidate = standalone[1].trim();
@@ -487,9 +483,6 @@ function extractNameFirstMessage(msg) {
   const t = msg.trim();
   if (t.includes('?')) return null;
   if (CORPORATE_SUFFIX_RE.test(t)) return null;
-
-  // Broader pattern for first message — allows "Hi I'm Tanya", "Hey, I'm Tanya", "Hello! I'm Tanya"
-  // The greeting prefix (hi/hey/hello/hola + optional punctuation/spaces) is consumed before the intro
   const FIRST_MSG_RE = /(?:(?:hi|hey|hello|hola|howdy|good morning|good evening|good afternoon)[!,.\s]+)?(?:my name is|this is|i am|i'm|im|call me|you can call me)\s+([A-Za-z][a-zA-Z'\-]{1,20})/i;
   const m = t.match(FIRST_MSG_RE);
   if (m) {
@@ -558,12 +551,19 @@ const SERVICE_MAP = {
 
 const EMAIL_RE = /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/;
 const EMAIL_OWNERSHIP_RE = /(?:my email(?:\s+is|:)?|email me at|reach me at|contact me at|i(?:'m| am) at|you can (?:email|reach) me at)\s*:?\s*([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})/i;
+
+// FIX #44: EXPAND_INTENT_RE kept for currentCountry disambiguation.
+// For targetCountry we now also allow SOFT_INTEREST_RE so we catch
+// "I want to go to UAE", "thinking about Dubai", "business in Canada" etc.
 const EXPAND_INTENT_RE = /expand|incorporat|setup|set up|open|register|move|launch|start|going to|looking at|consider|want to|thinking about/i;
+const SOFT_INTEREST_RE = /\b(go to|move to|looking at|thinking about|interested in|exploring|considering|want to|planning|check out|open in|start in|business in|company in|entity in|office in|branch in|operate in|sell in|trade in|work in|register in|incorporate in|expand to|expanding to|expansion to|expansion into|relocate to|setup in|set up in)\b/i;
 const NEGATION_RE = /\b(not|never|don't|won't|no longer|excluding|except|avoid|against|instead of)\b/i;
 
 function extractEntities(msg, mem) {
   const lower = msg.toLowerCase();
   const updates = {};
+
+  // Email extraction — unchanged
   if (!mem.email) {
     const ownershipMatch = msg.match(EMAIL_OWNERSHIP_RE);
     if (ownershipMatch) {
@@ -573,18 +573,27 @@ function extractEntities(msg, mem) {
       if (genericMatch) updates.email = genericMatch[0];
     }
   }
+
+  // FIX #44: Target country — broader detection
+  // Requires EITHER expand-intent OR soft-interest so we don't misfire on
+  // "my client is in Germany" (no interest signal = skip).
   if (!NEGATION_RE.test(lower)) {
-    for (const [kw, country] of Object.entries(COUNTRY_MAP)) {
-      if (lower.includes(kw) && EXPAND_INTENT_RE.test(lower)) {
-        const existing = mem.targetCountries || [];
-        if (!existing.includes(country)) {
-          updates.targetCountries = [...existing, country];
-          updates.targetCountry   = updates.targetCountries[0];
+    const isTargetContext = EXPAND_INTENT_RE.test(lower) || SOFT_INTEREST_RE.test(lower);
+    if (isTargetContext) {
+      for (const [kw, country] of Object.entries(COUNTRY_MAP)) {
+        if (lower.includes(kw)) {
+          const existing = mem.targetCountries || [];
+          if (!existing.includes(country)) {
+            updates.targetCountries = [...existing, country];
+            updates.targetCountry   = updates.targetCountries[0];
+          }
+          break;
         }
-        break;
       }
     }
   }
+
+  // Current country extraction — unchanged
   if (!mem.currentCountry) {
     if (/\b(indian|from india|based in india|india-based|indian founder|indian entrepreneur|i(?:'m| am) indian)\b/i.test(lower)) {
       updates.currentCountry = 'India';
@@ -614,6 +623,8 @@ function extractEntities(msg, mem) {
       }
     }
   }
+
+  // Service extraction — unchanged
   for (const [kw, svc] of Object.entries(SERVICE_MAP)) {
     if (lower.includes(kw)) {
       const existing = mem.servicesDiscussed || [];
@@ -624,6 +635,7 @@ function extractEntities(msg, mem) {
       break;
     }
   }
+
   return updates;
 }
 
@@ -1073,31 +1085,25 @@ function rateLimitResponse(waitSec) {
 function buildReturningGreeting(mem, state) {
   const name = mem.name ? mem.name : null;
   const nameStr = name ? `${name}` : 'there';
-
   const contextParts = [];
   const countries = (mem.targetCountries && mem.targetCountries.length)
     ? mem.targetCountries
     : (mem.targetCountry ? [mem.targetCountry] : []);
   if (countries.length) contextParts.push(`expanding to ${countries.join(' and ')}`);
-
   const topics = (state.topicsDiscussed && state.topicsDiscussed.length)
     ? state.topicsDiscussed.slice(-3)
     : [];
   if (topics.length && !countries.length) contextParts.push(topics.join(', '));
-
   const summary = mem.conversationSummary || '';
-
   let contextLine = '';
   if (summary && summary.length > 20) {
     contextLine = `Last time, we covered: ${summary.length > 120 ? summary.substring(0, 117) + '...' : summary}`;
   } else if (contextParts.length) {
     contextLine = `Last time we were discussing ${contextParts.join(' and ')}.`;
   }
-
   const greeting = contextLine
     ? `Hey ${nameStr}! 👋 Great to have you back.\n\n${contextLine}\n\nWhat can I help you with today?`
     : `Hey ${nameStr}! 👋 Great to have you back at Comply Globally. What can I help you with today?`;
-
   return greeting;
 }
 
@@ -1505,9 +1511,7 @@ app.post('/webhook', async (req, res) => {
     session.history.push({ role: 'user', content: truncateMsg(rawMsg) });
     session.history.push({ role: 'assistant', content: truncateMsg(reply) });
 
-    // FIX #41: Real-time name rescue — scan Claude's reply for greeting patterns
-    // like "Hi Tanya," or "Sure Rahul," to catch names passed via KB/context
-    // that were never explicitly stored in mem.name.
+    // FIX #41: Real-time name rescue from Claude's reply greeting
     if (!mem.name && reply) {
       const REPLY_NAME_RE = /^(?:Hi|Hey|Hello|Sure|Great|Of course|Absolutely|Thanks|Thank you)[,!\s]+([A-Z][a-z]{2,20})\b/;
       const replyNameMatch = reply.match(REPLY_NAME_RE);
@@ -1533,9 +1537,18 @@ app.post('/webhook', async (req, res) => {
       console.log(`📋  Menu stored: [${newMenu.join(' | ')}]`);
     }
 
-    // FIX #39 + FIX #40 (enhanced): Rolling summary — update every 5 user messages
+    // ══════════════════════════════════════════════
+    // FIX #45: Rolling summary — fire after every 2 user messages,
+    // or immediately if summary is empty and we have ≥2 messages.
+    // This ensures short conversations always get a summary before user exits.
+    // ══════════════════════════════════════════════
     const userMsgCount = session.history.filter(m => m.role === 'user').length;
-    if (userMsgCount > 0 && userMsgCount % 5 === 0) {
+    const shouldSummarise = userMsgCount >= 2 && (
+      userMsgCount % 2 === 0 ||
+      !mem.conversationSummary
+    );
+
+    if (shouldSummarise) {
       try {
         const summaryResponse = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
@@ -1558,18 +1571,12 @@ ${session.history.slice(-10).map(m => (m.role === 'user' ? 'User' : 'Advisor') +
           mem.conversationSummary = summary;
           console.log(`📝  Summary updated: ${summary.substring(0, 80)}...`);
 
-          // FIX #40 (enhanced): Multi-pattern name extraction from summary.
-          // Catches "Tanya is exploring...", "The user, Rahul, ...",
-          // "named Tanya", and mid-summary "...Tanya is exploring..."
+          // FIX #40 (enhanced): Multi-pattern name extraction from summary — UNCHANGED
           if (!mem.name) {
             const SUMMARY_NAME_PATTERNS = [
-              // "Tanya is exploring..." / "Rahul has expressed..."
               /^([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20})?)\s+(?:is|has|wants|would|expressed|mentioned|asked|seems|appears|was|will)\b/,
-              // "The user, Tanya, is..." / "The client, Rahul, wants..."
               /\bthe (?:user|client|customer|caller|person|individual)[,\s]+([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20})?)[,\s]/i,
-              // "named Tanya" / "called Tanya"
               /\b(?:named?|called)\s+([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20})?)\b/,
-              // Mid-summary: "...Tanya is exploring/looking/interested..."
               /\b([A-Z][a-z]{2,20})\s+is\s+(?:exploring|looking|interested|asking|expanding|planning|considering|inquiring|focused)/,
             ];
             for (const re of SUMMARY_NAME_PATTERNS) {
@@ -1591,9 +1598,49 @@ ${session.history.slice(-10).map(m => (m.role === 'user' ? 'User' : 'Advisor') +
             }
           }
 
-          // FIX #39: await saveMemory so summary (and any name) persists to MongoDB immediately
+          // FIX #46: Extract targetCountry from summary if still missing
+          if (!mem.targetCountry && summary) {
+            const summaryLower = summary.toLowerCase();
+            for (const [kw, country] of Object.entries(COUNTRY_MAP)) {
+              if (summaryLower.includes(kw)) {
+                if (/expand|incorporat|register|set up|open|move|launch|business|market|explor|consider|interest|relocat/i.test(summary)) {
+                  mem.targetCountry = country;
+                  if (!mem.targetCountries || !mem.targetCountries.includes(country)) {
+                    mem.targetCountries = [...(mem.targetCountries || []), country];
+                  }
+                  console.log(`✅  targetCountry extracted from summary: "${country}"`);
+                  break;
+                }
+              }
+            }
+          }
+
+          // FIX #46b: Extract currentCountry from summary if still missing
+          if (!mem.currentCountry && summary) {
+            const SUMMARY_BASED_RE = /(?:based in|from|located in|currently in|living in|resident (?:of|in))\s+([A-Za-z\s]{2,20}?)(?:\s*[,.]|$)/i;
+            const basedMatch = summary.match(SUMMARY_BASED_RE);
+            if (basedMatch) {
+              const place = basedMatch[1].trim().toLowerCase();
+              const mapped = COUNTRY_MAP[place];
+              if (mapped) {
+                mem.currentCountry = mapped;
+                console.log(`✅  currentCountry extracted from summary: "${mapped}"`);
+              } else {
+                // Try partial match
+                for (const [kw, country] of Object.entries(COUNTRY_MAP)) {
+                  if (place.includes(kw)) {
+                    mem.currentCountry = country;
+                    console.log(`✅  currentCountry extracted from summary (partial): "${country}"`);
+                    break;
+                  }
+                }
+              }
+            }
+          }
+
+          // FIX #39: persist summary + any newly extracted fields immediately
           await saveMemory(mem);
-          console.log(`✅  Summary persisted to MongoDB`);
+          console.log(`✅  Summary + fields persisted to MongoDB`);
         }
       } catch (err) {
         console.error('❌  Summary generation failed:', err.message);
@@ -1761,7 +1808,7 @@ const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🚀  ComplyGlobally Bot v4.12 — FIX #40-43: Name extraction hardening`);
+    console.log(`\n🚀  ComplyGlobally Bot v4.13 — FIX #44-46: Country + Summary fixes`);
     console.log(`📡  Port: ${PORT}`);
     console.log(`📮  POST /webhook`);
     console.log(`❤️   GET  /health`);
