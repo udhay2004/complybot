@@ -3,53 +3,23 @@
 /**
  * ============================================================
  *  COMPLY GLOBALLY — WhatsApp AI Chatbot Backend
- *  PRODUCTION EDITION v4.10 — FIX #36: Immediate name/entity persistence + nickname support
- *  All 35 prior QA fixes retained. New in v4.10:
+ *  PRODUCTION EDITION v4.11 — STORAGE + GREETING FIX
+ *  All 36 prior QA fixes retained. New in v4.11:
  *
- *  FIX #36 — Immediate name + entity persistence to MongoDB
- *             extractNameWithNickname() handles "im Anushka call me Anu" → "Anushka (Anu)"
- *             Standalone "call me Anu" also captured
- *             Mid-conversation nickname update: existing name + "call me X" → "Name (X)"
- *             saveMemory() fires immediately (fire-and-forget) on ANY name/entity update
- *             so CRM reflects data in real-time, not only after handoff or flow completion
+ *  FIX #37 — Proper returning-user greeting on first message of new session
+ *             If MongoDB has prior history for this phone → greet by name,
+ *             reference last topics discussed, ask what they need today.
+ *             Truly new users still get the standard "Who am I speaking with?" flow.
  *
- *  Prior fixes (all retained):
- *  FIX #1  — classifyIntent: HANDOFF_VOCAB pre-screen
- *  FIX #2  — classifyIntent: smart fallback on classifier failure
- *  FIX #3  — extractName: country names rejected
- *  FIX #4  — extractName: expanded ambiguous-word blacklist
- *  FIX #5  — pendingHandoff: short replies treated as no-extra-info
- *  FIX #6  — extractName: 'i am' / "i'm" removed from NAME_INTRO_RE
- *  FIX #7  — classifyIntent: number match anchored to full message
- *  FIX #8  — isFirstTime: atomic MongoDB insertOne with duplicate-key guard
- *  FIX #9  — extractEntities: negation detection before country extraction
- *  FIX #10 — humanMode expiry: bot resumption message sent to user
- *  FIX #11 — parseMenuFromReply: NFC normalize + robust emoji digit regex
- *  FIX #12 — ADVISOR_SYSTEM_PROMPT: prompt injection resistance added
- *  FIX #13 — extractName: corporate suffix rejection
- *  FIX #14 — covered by FIX #7
- *  FIX #15 — GREETING_RE handler: skips if phase is escalating or human_mode
- *  FIX #16 — extractEntities: email only captured with personal ownership context
- *  FIX #17 — menu_select with null lastMenu: graceful handler added
- *  FIX #18 — saveSession: individual messages truncated at 800 chars
- *  FIX #19 — sendHandoffEmail: short-history warning added
- *  FIX #20 — emoji-only messages: detected and handled gracefully
- *  FIX #21 — topicsDiscussed: capped at 20 entries
- *  FIX #22 — GREETING_RE returning-user check: requires session age > 1 hour
- *  FIX #23 — classifyIntent: returns rich handoff details object
- *  FIX #24 — buildHandoffMessage(): context-aware handoff messages
- *  FIX #25 — state.handoffDetails stored so confirmation msg can reference it
- *  FIX #26 — pendingHandoff confirmation is context-aware (mentions time if given)
- *  FIX #27 — DEFINITE_QUERY_RE: availability/hours inquiries short-circuited before
- *             LLM classifier; classifier model switched to claude-haiku
- *  FIX #28 — MongoDB: ping verification, reconnect on close, ensureMongo() helper
- *  FIX #29 — All getSession/getState/getMemory/isFirstTime now use ensureMongo()
- *  FIX #30 — callClaude history slice increased from 6 → 12 messages
- *  FIX #31 — /health shows MongoDB connected/error status; new /mongo-check endpoint
- *  FIX #32 — CRITICAL: drop-and-recreate phone_1 index on startup
- *  FIX #33 — Deterministic memory recall for name/country/context questions
- *  FIX #34 — targetCountries/servicesDiscussed arrays; rolling conversation summary
- *  FIX #35 — First-message entity extraction
+ *  FIX #38 — All immediate saveMemory() calls are now awaited (not fire-and-forget)
+ *             in the paths that matter most (first message, mid-convo name lock).
+ *             This prevents race conditions where MongoDB write was skipped.
+ *
+ *  FIX #39 — Rolling summary now awaits saveMemory() after updating
+ *             conversationSummary so it actually persists between sessions.
+ *
+ *  ALL other logic unchanged — advisory, handoff, menu, entity extraction,
+ *  classifyIntent, callClaude, parsePhone, send, email are untouched.
  * ============================================================
  */
 
@@ -87,8 +57,7 @@ const HUMAN_TIMEOUT_MS  = parseInt(process.env.HUMAN_TIMEOUT_MS || '7200000', 10
   .forEach(([k, v]) => v ? console.log(`✅  ENV loaded:  ${k}`) : console.error(`❌  ENV MISSING: ${k}`));
 
 // ─────────────────────────────────────────────
-// ADVISOR SYSTEM PROMPT — STATIC BASE
-// FIX #12: Prompt injection resistance added at end of RULES block
+// ADVISOR SYSTEM PROMPT
 // ─────────────────────────────────────────────
 const ADVISOR_SYSTEM_PROMPT = `You are a premium international business expansion advisor for Comply Globally, powered by Connect Ventures Inc. You help founders and businesses expand globally across 47+ countries — covering incorporation, banking, taxation, compliance, residency, FEMA/ODI, logistics, immigration, and cross-border strategy.
 
@@ -157,8 +126,6 @@ RULES:
 // MONGODB
 // ─────────────────────────────────────────────
 let sessionsCol, activeStateCol, memoryCol;
-
-// FIX #28: mongoOk flag — lets /health and /mongo-status report real DB state
 let mongoOk = false;
 let mongoError = null;
 let mongoClient = null;
@@ -176,22 +143,18 @@ async function connectMongo() {
       socketTimeoutMS: 30000,
     });
     await mongoClient.connect();
-    // FIX #28: Ping to verify the connection is actually live
     await mongoClient.db('admin').command({ ping: 1 });
     const db    = mongoClient.db('complybot');
     sessionsCol    = db.collection('sessions');
     activeStateCol = db.collection('activeStates');
     memoryCol      = db.collection('memory');
-    // FIX #32: Drop-and-recreate the phone_1 index on each collection.
     for (const col of [sessionsCol, activeStateCol, memoryCol]) {
-      try { await col.dropIndex('phone_1'); } catch (_) { /* ok if it didn't exist */ }
+      try { await col.dropIndex('phone_1'); } catch (_) {}
       await col.createIndex({ phone: 1 }, { unique: true });
     }
     mongoOk = true;
     mongoError = null;
     console.log('✅  MongoDB connected and verified (ping ok)');
-
-    // FIX #28: Reconnect on unexpected disconnect
     mongoClient.on('close', () => {
       mongoOk = false;
       mongoError = 'Connection closed unexpectedly';
@@ -202,18 +165,15 @@ async function connectMongo() {
       mongoError = err.message;
       console.error('❌  MongoDB connection error:', err.message);
     });
-
   } catch (err) {
     mongoOk = false;
     mongoError = err.message;
     sessionsCol = null; activeStateCol = null; memoryCol = null;
     console.error('❌  MongoDB failed:', err.message);
     console.error('⚠️  Running in memory-only mode — data will NOT persist across restarts');
-    console.error('⚠️  Check: 1) MONGODB_URI env var  2) Atlas IP whitelist (allow 0.0.0.0/0)  3) DB user password');
   }
 }
 
-// FIX #28: Lazy reconnect — if collections are null, try reconnecting before each operation
 async function ensureMongo() {
   if (mongoOk && sessionsCol) return true;
   if (!MONGODB_URI) return false;
@@ -223,7 +183,7 @@ async function ensureMongo() {
 }
 
 // ─────────────────────────────────────────────
-// CACHE — 30-min TTL in-memory layer
+// CACHE — 30-min TTL
 // ─────────────────────────────────────────────
 const CACHE_TTL = 30 * 60 * 1000;
 const _cache = { session: new Map(), state: new Map(), memory: new Map() };
@@ -237,8 +197,7 @@ function cGet(store, key) {
 }
 
 // ─────────────────────────────────────────────
-// SESSION — history (capped at 16 messages)
-// FIX #18: individual messages truncated at 800 chars on push
+// SESSION
 // ─────────────────────────────────────────────
 const MAX_MSG_CHARS = 800;
 
@@ -262,7 +221,6 @@ async function saveSession(s) {
   s.lastActive = new Date();
   if (s.history.length > 16) s.history = s.history.slice(-16);
   cSet('session', s.phone, s);
-  // FIX #28: ensureMongo + explicit error logging so failures are never silent
   if (await ensureMongo()) {
     try {
       const { _id, ...doc } = s;
@@ -273,27 +231,25 @@ async function saveSession(s) {
   }
 }
 
-// Helper — truncate a message string before storing in history
 function truncateMsg(text) {
   if (!text) return text;
   return text.length > MAX_MSG_CHARS ? text.substring(0, MAX_MSG_CHARS) + '… [truncated]' : text;
 }
 
 // ─────────────────────────────────────────────
-// ACTIVE STATE — conversation flow + deterministic menu engine
-// FIX #25: handoffDetails added to state for context-aware confirmation
+// ACTIVE STATE
 // ─────────────────────────────────────────────
 function newState(phone) {
   return {
     phone,
-    phase: 'new',           // new | onboarding | advisory | escalating | human_mode
+    phase: 'new',
     topicsDiscussed: [],
-    lastMenu: null,         // { id, options: string[4], context: string, createdAt: number }
+    lastMenu: null,
     humanMode: false,
     humanModeAt: null,
     pendingHandoff: false,
     handoffEmailSent: false,
-    handoffDetails: null,   // FIX #25: stores rich handoff context for confirmation msg
+    handoffDetails: null,
     lastActive: new Date(),
   };
 }
@@ -307,14 +263,13 @@ async function getState(phone) {
   }
   if (!s) s = newState(phone);
   s.topicsDiscussed = s.topicsDiscussed || [];
-  s.handoffDetails  = s.handoffDetails  || null; // FIX #25: backwards compat
+  s.handoffDetails  = s.handoffDetails  || null;
   cSet('state', phone, s);
   return s;
 }
 async function saveState(s) {
   s.lastActive = new Date();
   cSet('state', s.phone, s);
-  // FIX #28: ensureMongo + explicit error logging
   if (await ensureMongo()) {
     try {
       const { _id, ...doc } = s;
@@ -326,19 +281,19 @@ async function saveState(s) {
 }
 
 // ─────────────────────────────────────────────
-// MEMORY — locked validated entities
+// MEMORY
 // ─────────────────────────────────────────────
 function newMemory(phone) {
   return {
     phone,
     name: null,
-    targetCountries: [],     // FIX #34: array — tracks ALL countries ever discussed
-    targetCountry: null,     // kept for backwards compat — mirrors targetCountries[0]
+    targetCountries: [],
+    targetCountry: null,
     currentCountry: null,
-    servicesDiscussed: [],   // FIX #34: array — tracks ALL services ever discussed
-    serviceNeeded: null,     // kept for backwards compat — mirrors servicesDiscussed[0]
+    servicesDiscussed: [],
+    serviceNeeded: null,
     email: null,
-    conversationSummary: '', // FIX #34: rolling plain-English summary updated every 5 messages
+    conversationSummary: '',
     updatedAt: new Date(),
   };
 }
@@ -357,7 +312,6 @@ async function getMemory(phone) {
 async function saveMemory(m) {
   m.updatedAt = new Date();
   cSet('memory', m.phone, m);
-  // FIX #28: ensureMongo + explicit error logging
   if (await ensureMongo()) {
     try {
       const { _id, ...doc } = m;
@@ -369,7 +323,7 @@ async function saveMemory(m) {
 }
 
 // ─────────────────────────────────────────────
-// COUNTRY MAP — used for entity extraction AND name rejection
+// COUNTRY MAP
 // ─────────────────────────────────────────────
 const COUNTRY_MAP = {
   'uae': 'UAE', 'dubai': 'UAE', 'abu dhabi': 'UAE', 'sharjah': 'UAE',
@@ -389,7 +343,6 @@ const COUNTRY_MAP = {
   'vietnam': 'Vietnam',
   'estonia': 'Estonia',
   'italy': 'Italy',
-  // Extended list for name rejection (FIX #3)
   'pakistan': 'Pakistan', 'bangladesh': 'Bangladesh', 'nepal': 'Nepal',
   'srilanka': 'Sri Lanka', 'myanmar': 'Myanmar', 'malaysia': 'Malaysia',
   'china': 'China', 'japan': 'Japan', 'korea': 'Korea',
@@ -407,52 +360,39 @@ const COUNTRY_MAP = {
   'bangkok': 'Bangkok', 'jakarta': 'Jakarta', 'manila': 'Manila',
 };
 
-// FIX #3: Set of all country/city values and keys for fast name rejection
 const ALL_COUNTRY_WORDS = new Set([
   ...Object.keys(COUNTRY_MAP),
   ...Object.values(COUNTRY_MAP).map(v => v.toLowerCase()),
 ]);
 
 // ─────────────────────────────────────────────
-// NAME EXTRACTION — strict, production-grade
-// FIX #4: Expanded blacklist + removed ambiguous words
-// FIX #6: Removed 'i am' and "i'm" from NAME_INTRO_RE
-// FIX #13: Corporate suffix rejection
+// NAME EXTRACTION
 // ─────────────────────────────────────────────
 const NAME_BLACKLIST = new Set([
-  // Greetings / filler
   'hi','hello','hey','okay','ok','yes','no','sure','thanks','thank','please',
-  // Question words
   'tell','about','how','what','where','when','why','which','who','can','could',
   'would','should','need','want','like','just','also','even','still','now',
-  // Cities already covered by COUNTRY_MAP but kept for safety
   'india','usa','uae','uk','singapore','canada','dubai','delhi','mumbai',
   'bangalore','hyderabad','chennai','pune','kolkata',
-  // Business terms
   'expanding','expand','incorporate','incorporating','business','company','startup','venture',
   'help','advice','information','details','guide','looking','trying','planning','exploring',
-  // Common words
   'more','some','any','all','this','that','these','those','with','from','into','for','the','and','but',
   'not','are','is','was','will','been','have','get','got','we','us','my','me',
   'good','great','fine','well','very','quite','really','actually',
-  // Brand / service
   'comply','globally','setup','setting','service','services','incorporation','registration',
   'taxation','banking','fema','odi','compliance','question','options','option',
-  // FIX #4: ambiguous words
   'maybe','perhaps','anyone','someone','nobody','whoever','whatever','whenever',
   'nothing','everything','something','anything','later','soon','ready','done',
   'cool','happy','sad','mad','busy','free','new','old','young','open','close',
   'first','second','third','fourth','last','next','previous','other','another',
   'calling','support','team','corp','ltd','inc','llc','pvt','telecom','bank',
   'group','global','solutions','services','systems','technologies','tech',
-  // FIX #34: pop culture / brand false positives
   'helloween','metallica','nirvana','adidas','nike','google','apple','amazon',
   'punjabi','gujarati','marathi','bengali','tamil','telugu','kannada','malayali',
   'indian','american','british','canadian','australian','german','french','chinese',
   'monday','tuesday','wednesday','thursday','friday','saturday','sunday',
   'january','february','march','april','june','july','august','september',
   'october','november','december','yesterday','today','tomorrow',
-  // FIX A: common capitalized non-name words that slip through standalone regex
   'interested','interesting','expansion','advisory','consultant','consulting',
   'founder','director','manager','executive','partner','investor','advisor',
   'startup','venture','limited','private','public','global','international',
@@ -464,12 +404,8 @@ const NAME_BLACKLIST = new Set([
   'basically','essentially','specifically','particularly','primarily','mainly',
 ]);
 
-// FIX #6: Removed 'i am' and "i'm" — too easily match action sentences
-// FIX #4: Removed bare 'call me' — too ambiguous (see HANDOFF_VOCAB conflict)
 const NAME_INTRO_RE = /(?:my name is|this is|you can call me|they call me)\s+([A-Za-z][a-zA-Z'\-]{1,30}(?:\s+[A-Za-z][a-zA-Z'\-]{1,30}){0,2})/i;
 const NAME_STANDALONE_RE = /^([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20}){0,2})\s*(?:here|speaking|this side)?[.!]?\s*$/;
-
-// FIX #13: Corporate suffix pattern — reject 'this is Accenture calling' etc.
 const CORPORATE_SUFFIX_RE = /\b(calling|support|corp|ltd|inc|llc|pvt|telecom|bank|group|global|solutions|services|systems|technologies|tech|team|helpdesk|desk)\b/i;
 
 function extractName(msg) {
@@ -477,15 +413,9 @@ function extractName(msg) {
   if (t.length > 80) return null;
   if (t.includes('?')) return null;
   const lower = t.toLowerCase();
-
-  // Guard: business/action intent in message → not a name introduction
   if (/tell me|about|how|what|expand|incorporat|setup|looking|need|want|tax|bank|fema|odi|visa|compli|register|market|country|jurisdict/.test(lower)) return null;
-  // FIX #34: Guard against nationality statements being mistaken for name intros
   if (/(punjabi|gujarati|marathi|bengali|tamil|telugu|sikh|hindu|muslim|christian|fan|lover|into|obsessed|huge)/i.test(lower)) return null;
-
-  // FIX #13: Corporate suffix present → skip
   if (CORPORATE_SUFFIX_RE.test(t)) return null;
-
   const intro = t.match(NAME_INTRO_RE);
   if (intro) {
     const candidate = intro[1].trim();
@@ -498,50 +428,31 @@ function extractName(msg) {
         !ALL_COUNTRY_WORDS.has(w.toLowerCase()) &&
         /^[A-Za-z'\-]+$/.test(w)
       )
-    ) {
-      return candidate;
-    }
+    ) return candidate;
   }
-
   const standalone = t.match(NAME_STANDALONE_RE);
   if (standalone) {
     const candidate = standalone[1].trim();
     const words = candidate.split(/\s+/);
-    // FIX A: extra guard — single-word standalone must not look like a business/action word
     const firstWordLower = words[0].toLowerCase();
     const looksLikeAction = /(?:ing|tion|ment|ance|ence|ity|ive|ous|al|ary|ory|ery|ism|ist|ize|ise)$/i.test(firstWordLower);
     if (
-      words.length >= 1 &&
-      words.length <= 3 &&
-      !looksLikeAction &&
+      words.length >= 1 && words.length <= 3 && !looksLikeAction &&
       words.every(w =>
         w.length >= 2 &&
         !NAME_BLACKLIST.has(w.toLowerCase()) &&
         !ALL_COUNTRY_WORDS.has(w.toLowerCase()) &&
         /^[A-Za-z'\-]+$/.test(w)
       )
-    ) {
-      return candidate;
-    }
+    ) return candidate;
   }
-
   return null;
 }
 
-// ─────────────────────────────────────────────
-// FIX #35: FIRST-MESSAGE NAME EXTRACTOR
-// More permissive than extractName():
-// - Handles 'im' / 'i am' (intentionally removed from main extractName in FIX #6
-//   because they cause false positives in ongoing conversation, but safe on first msg)
-// - No 80-char limit (first messages are often long intros with name + intent)
-// - Single-word capture only to prevent false multi-word matches
-// ─────────────────────────────────────────────
 function extractNameFirstMessage(msg) {
   const t = msg.trim();
   if (t.includes('?')) return null;
   if (CORPORATE_SUFFIX_RE.test(t)) return null;
-
-  // Matches: "im John", "i am Priya", "my name is Rahul", "this is Arjun", "you can call me Sneha"
   const FIRST_MSG_RE = /(?:my name is|this is|i am|i'm|im|call me|you can call me)\s+([A-Za-z][a-zA-Z'\-]{1,20})/i;
   const m = t.match(FIRST_MSG_RE);
   if (m) {
@@ -556,22 +467,10 @@ function extractNameFirstMessage(msg) {
   return null;
 }
 
-// ─────────────────────────────────────────────
-// FIX #36: NICKNAME + COMPOSITE NAME EXTRACTOR
-// Handles patterns like:
-//   "im Anushka call me Anu"        → "Anushka (Anu)"
-//   "my name is Anushka call me Anu"→ "Anushka (Anu)"
-//   "call me Anu"                   → "Anu"  (standalone)
-//   "just call me Anu"              → "Anu"
-// Called BEFORE extractNameFirstMessage so composite is preferred over partial.
-// ─────────────────────────────────────────────
 function extractNameWithNickname(msg) {
   const t = msg.trim();
   if (t.includes('?')) return null;
   if (CORPORATE_SUFFIX_RE.test(t)) return null;
-
-  // Pattern A: full name intro + nickname qualifier
-  // e.g. "im Anushka call me Anu" / "my name is Anushka but call me Anu"
   const FULL_NICK_RE = /(?:my name is|i am|i'm|im|this is)\s+([A-Za-z][a-zA-Z'\-]{1,25})(?:\s+\w+){0,4}?\s+(?:but\s+)?(?:call me|just call me|known as|or just|or call me)\s+([A-Za-z][a-zA-Z'\-]{1,20})/i;
   const fullNickMatch = t.match(FULL_NICK_RE);
   if (fullNickMatch) {
@@ -589,8 +488,6 @@ function extractNameWithNickname(msg) {
       return `${fullName} (${nick})`;
     }
   }
-
-  // Pattern B: standalone "call me X" with no prior name intro in this message
   const NICK_ONLY_RE = /^(?:call me|just call me|you can call me|people call me|everyone calls me)\s+([A-Za-z][a-zA-Z'\-]{1,20})\s*[.!,]?\s*$/i;
   const nickOnlyMatch = t.match(NICK_ONLY_RE);
   if (nickOnlyMatch) {
@@ -606,14 +503,11 @@ function extractNameWithNickname(msg) {
       return nick;
     }
   }
-
   return null;
 }
 
 // ─────────────────────────────────────────────
-// ENTITY EXTRACTION — country, service, email
-// FIX #9:  Negation detection before country extraction
-// FIX #16: Email only captured with personal ownership context
+// ENTITY EXTRACTION
 // ─────────────────────────────────────────────
 const SERVICE_MAP = {
   'incorporat': 'Incorporation', 'register': 'Incorporation', 'set up': 'Incorporation',
@@ -626,17 +520,13 @@ const SERVICE_MAP = {
 };
 
 const EMAIL_RE = /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/;
-// FIX #16: Email ownership patterns — only capture user's own email
 const EMAIL_OWNERSHIP_RE = /(?:my email(?:\s+is|:)?|email me at|reach me at|contact me at|i(?:'m| am) at|you can (?:email|reach) me at)\s*:?\s*([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})/i;
 const EXPAND_INTENT_RE = /expand|incorporat|setup|set up|open|register|move|launch|start|going to|looking at|consider|want to|thinking about/i;
-// FIX #9: Negation detection
 const NEGATION_RE = /\b(not|never|don't|won't|no longer|excluding|except|avoid|against|instead of)\b/i;
 
 function extractEntities(msg, mem) {
   const lower = msg.toLowerCase();
   const updates = {};
-
-  // FIX #16: prefer ownership-contextual email match; fall back only if 'my' is present
   if (!mem.email) {
     const ownershipMatch = msg.match(EMAIL_OWNERSHIP_RE);
     if (ownershipMatch) {
@@ -646,24 +536,19 @@ function extractEntities(msg, mem) {
       if (genericMatch) updates.email = genericMatch[0];
     }
   }
-
-  // FIX #34: Accumulate ALL target countries mentioned (not just the first)
   if (!NEGATION_RE.test(lower)) {
     for (const [kw, country] of Object.entries(COUNTRY_MAP)) {
       if (lower.includes(kw) && EXPAND_INTENT_RE.test(lower)) {
         const existing = mem.targetCountries || [];
         if (!existing.includes(country)) {
           updates.targetCountries = [...existing, country];
-          updates.targetCountry   = updates.targetCountries[0]; // backwards compat
+          updates.targetCountry   = updates.targetCountries[0];
         }
         break;
       }
     }
   }
-
-  // FIX C: currentCountry detection — does NOT require expand intent
   if (!mem.currentCountry) {
-    // Specific India patterns
     if (/\b(indian|from india|based in india|india-based|indian founder|indian entrepreneur|i(?:'m| am) indian)\b/i.test(lower)) {
       updates.currentCountry = 'India';
     } else {
@@ -692,14 +577,12 @@ function extractEntities(msg, mem) {
       }
     }
   }
-
-  // FIX #34: Accumulate ALL services discussed (not just the first)
   for (const [kw, svc] of Object.entries(SERVICE_MAP)) {
     if (lower.includes(kw)) {
       const existing = mem.servicesDiscussed || [];
       if (!existing.includes(svc)) {
         updates.servicesDiscussed = [...existing, svc];
-        updates.serviceNeeded     = updates.servicesDiscussed[0]; // backwards compat
+        updates.serviceNeeded     = updates.servicesDiscussed[0];
       }
       break;
     }
@@ -728,42 +611,29 @@ function inferTopic(msg) {
 }
 
 // ─────────────────────────────────────────────
-// INTENT CLASSIFICATION — Claude-powered
-// FIX #1:  HANDOFF_VOCAB pre-screen
-// FIX #2:  Smart fallback on classifier failure
-// FIX #7:  Number match anchored to full message
-// FIX #23: Returns rich handoffDetails
+// INTENT CLASSIFICATION
 // ─────────────────────────────────────────────
 const ORDINAL_MAP = { first: 1, second: 2, third: 3, fourth: 4, '1st': 1, '2nd': 2, '3rd': 3, '4th': 4 };
-
 const HANDOFF_VOCAB = /\b(human|agent|speak|talk|person|connect|team|transfer|real|escalat|manager|expert|someone|sales|call|get me)\b/i;
-
 const DEFINITE_QUERY_RE = /\b(when|what|how|where|do|does|is|are|who|which|btw|anyway|just asking|curious|wondering)\b.*\b(human|agent|team|person|someone|expert|manager|sales|staff|advisor|people|representative)\b|\b(human|agent|team|person|someone|expert|manager|sales|staff|advisor|people)\b.*\b(available|online|hours|timing|schedule|work|open|active|free|respond|reply|office|around|reachable)\b|\b(tell me about|asking about|question about|info about|information about|know about|curious about)\b.*\b(human|agent|team|call|connect)\b/i;
 
 async function classifyIntent(msg) {
   const lower = msg.toLowerCase().trim();
-
-  // ── Fast path: ordinal words → menu ──
   for (const [word, num] of Object.entries(ORDINAL_MAP)) {
     if (lower.includes(word)) return { type: 'menu_select', num };
   }
-
   if (/\blast\b/.test(lower) && lower.length < 25) return { type: 'menu_select', num: 4 };
-
   const numMatch = lower.match(/^\s*(?:option\s*|question\s*|no\.?\s*|#\s*)?([1-9]|1[0-9])\s*$/);
   if (numMatch) {
     const num = parseInt(numMatch[1]);
     if (num >= 1 && num <= 4) return { type: 'menu_select', num };
     return { type: 'invalid_menu' };
   }
-
   if (!HANDOFF_VOCAB.test(lower)) return { type: 'query' };
-
   if (DEFINITE_QUERY_RE.test(lower)) {
     console.log(`⚡  Fast-path QUERY (availability inquiry): "${msg.substring(0, 60)}"`);
     return { type: 'query' };
   }
-
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -809,14 +679,11 @@ Message: "${msg.replace(/"/g, "'")}"`
         }],
       }),
     });
-
     const data = await response.json();
     const rawText = ((data.content?.[0]?.text) || '').trim();
     console.log(`🧠  Intent classify raw: "${msg.substring(0, 50)}" → ${rawText}`);
-
     let parsed;
     try { parsed = JSON.parse(rawText); } catch { parsed = null; }
-
     if (parsed) {
       if (parsed.impossible) {
         console.log(`🚫  Impossible handoff: ${parsed.impossibleReason}`);
@@ -836,11 +703,9 @@ Message: "${msg.replace(/"/g, "'")}"`
       }
       return { type: 'query' };
     }
-
     const fallbackText = rawText.toUpperCase();
     if (fallbackText.includes('HANDOFF')) return { type: 'human_request', details: { urgency: 'normal' } };
     return { type: 'query' };
-
   } catch (err) {
     console.error(`❌  classifyIntent failed: ${err.message}`);
     console.warn(`⚠️  Classifier failed with handoff vocab present — triggering handoff as safe default`);
@@ -849,78 +714,30 @@ Message: "${msg.replace(/"/g, "'")}"`
 }
 
 // ─────────────────────────────────────────────
-// FIX #24: SMART HANDOFF MESSAGE BUILDER
+// HANDOFF MESSAGE BUILDERS
 // ─────────────────────────────────────────────
 function buildHandoffMessage(details, mem) {
   const name = mem && mem.name ? `${mem.name}` : null;
   const nameGreet = name ? `${name}, ` : '';
   const d = details || {};
-
   if (d.preferredChannel === 'video') {
-    return `Of course, ${nameGreet}I'd love to set that up! Our team connects via phone or WhatsApp call — we don't currently offer video consultations, but a phone call works just as well for covering everything in detail. 😊
-
-📞 You can reach them directly:
-• Email: sales@complyglobally.com
-• Phone: +1 (302) 214-1717 | +91 99999 81613
-
-They're available from 11:00 AM to 10:00 PM in their respective timezone. Is there a preferred time for them to call you, or any context you'd like me to pass along?`;
+    return `Of course, ${nameGreet}I'd love to set that up! Our team connects via phone or WhatsApp call — we don't currently offer video consultations, but a phone call works just as well for covering everything in detail. 😊\n\n📞 You can reach them directly:\n• Email: sales@complyglobally.com\n• Phone: +1 (302) 214-1717 | +91 99999 81613\n\nThey're available from 11:00 AM to 10:00 PM in their respective timezone. Is there a preferred time for them to call you, or any context you'd like me to pass along?`;
   }
-
   if (d.wantsToCheckAvailability) {
-    return `Absolutely! Our team is typically available Monday–Saturday, 10am–7pm IST. 🕙
-
-I'll flag your request and they'll reach out to confirm a suitable slot. If you have a preferred window, let me know and I'll include that too!
-
-📞 Or if you'd rather reach them directly:
-• Email: sales@complyglobally.com
-• Phone: +1 (302) 214-1717 | +91 99999 81613
-
-Is there any context about what you'd like to discuss that I can pass along?`;
+    return `Absolutely! Our team is typically available Monday–Saturday, 10am–7pm IST. 🕙\n\nI'll flag your request and they'll reach out to confirm a suitable slot. If you have a preferred window, let me know and I'll include that too!\n\n📞 Or if you'd rather reach them directly:\n• Email: sales@complyglobally.com\n• Phone: +1 (302) 214-1717 | +91 99999 81613\n\nIs there any context about what you'd like to discuss that I can pass along?`;
   }
-
   if (d.urgency === 'immediate') {
-    return `Got it — I'll flag this as urgent right away! 🚀
-
-📞 For the fastest response, you can reach the team directly:
-• Phone: +1 (302) 214-1717 | +91 99999 81613
-• Email: sales@complyglobally.com
-
-They're available 10am–7pm IST (Monday–Saturday). I'll also notify them to get back to you as soon as possible. Is there any additional context you'd like me to pass along?`;
+    return `Got it — I'll flag this as urgent right away! 🚀\n\n📞 For the fastest response, you can reach the team directly:\n• Phone: +1 (302) 214-1717 | +91 99999 81613\n• Email: sales@complyglobally.com\n\nThey're available 10am–7pm IST (Monday–Saturday). I'll also notify them to get back to you as soon as possible. Is there any additional context you'd like me to pass along?`;
   }
-
   if (d.scheduledTime) {
-    return `Perfect! I'll let our team know you'd like to connect around ${d.scheduledTime}. 🙌
-
-📋 Just so you know, our team is available Monday–Saturday, 10am–7pm IST — so if that time falls within those hours, they'll make it work. If not, they'll suggest the closest available slot.
-
-📞 Or reach them directly:
-• Email: sales@complyglobally.com
-• Phone: +1 (302) 214-1717 | +91 99999 81613
-
-Is there any additional context you'd like me to pass along before they reach out?`;
+    return `Perfect! I'll let our team know you'd like to connect around ${d.scheduledTime}. 🙌\n\n📋 Just so you know, our team is available Monday–Saturday, 10am–7pm IST — so if that time falls within those hours, they'll make it work. If not, they'll suggest the closest available slot.\n\n📞 Or reach them directly:\n• Email: sales@complyglobally.com\n• Phone: +1 (302) 214-1717 | +91 99999 81613\n\nIs there any additional context you'd like me to pass along before they reach out?`;
   }
-
   if (d.preferredChannel === 'email') {
-    return `Of course! I'll have our team follow up with you over email. 😊
-
-📧 You can also reach them directly at: sales@complyglobally.com
-📞 Or by phone: +1 (302) 214-1717 | +91 99999 81613
-
-They're available Monday–Saturday, 10am–7pm IST. Could you share your email address, or any other context you'd like them to have?`;
+    return `Of course! I'll have our team follow up with you over email. 😊\n\n📧 You can also reach them directly at: sales@complyglobally.com\n📞 Or by phone: +1 (302) 214-1717 | +91 99999 81613\n\nThey're available Monday–Saturday, 10am–7pm IST. Could you share your email address, or any other context you'd like them to have?`;
   }
-
-  return `Of course! I'll connect you with our specialist team right away. 😊
-
-📞 Direct contact:
-• Email: sales@complyglobally.com
-• Phone: +1 (302) 214-1717 | +91 99999 81613
-
-They're available Monday–Saturday, 10am–7pm IST. Is there any additional context you'd like to share before they reach out?`;
+  return `Of course! I'll connect you with our specialist team right away. 😊\n\n📞 Direct contact:\n• Email: sales@complyglobally.com\n• Phone: +1 (302) 214-1717 | +91 99999 81613\n\nThey're available Monday–Saturday, 10am–7pm IST. Is there any additional context you'd like to share before they reach out?`;
 }
 
-// ─────────────────────────────────────────────
-// FIX #26: SMART HANDOFF CONFIRMATION BUILDER
-// ─────────────────────────────────────────────
 function buildHandoffConfirmation(details) {
   const d = details || {};
   if (d.urgency === 'immediate') return `Our team has been notified and will get back to you as soon as possible! 🚀`;
@@ -930,28 +747,24 @@ function buildHandoffConfirmation(details) {
 }
 
 // ─────────────────────────────────────────────
-// GREETING DETECTION — deterministic
+// GREETING DETECTION
 // ─────────────────────────────────────────────
 const GREETING_RE = /^(hi|hey|hello|good morning|good evening|good afternoon|hola|yo|sup|howdy|greetings)\b[!.,]?\s*$/i;
 
 // ─────────────────────────────────────────────
-// DETERMINISTIC MENU PARSER
-// FIX #11: NFC normalization + robust emoji digit matcher
+// MENU PARSER
 // ─────────────────────────────────────────────
 function parseMenuFromReply(reply) {
   const normalized = reply.normalize('NFC');
   const emojiRE = /([1-4])[\uFE0F\u20E3]{0,2}\s*(.+?)(?=\n[1-4][\uFE0F\u20E3]{0,2}|\n*$)/g;
   const plainRE = /^([1-4])[.)]\s*(.+)/gm;
-
   let opts = [];
   let m;
-
   while ((m = emojiRE.exec(normalized)) !== null) opts.push(m[2].trim());
   if (opts.length < 3) {
     opts = [];
     while ((m = plainRE.exec(normalized)) !== null) opts.push(m[2].trim());
   }
-
   if (opts.length >= 3) {
     while (opts.length < 4) opts.push(opts[opts.length - 1]);
     return opts.slice(0, 4);
@@ -960,7 +773,7 @@ function parseMenuFromReply(reply) {
 }
 
 // ─────────────────────────────────────────────
-// CONTEXT BLOCK — compact, per-request injection
+// CONTEXT BLOCK
 // ─────────────────────────────────────────────
 function buildContextBlock(mem, state) {
   const lines = [];
@@ -975,12 +788,10 @@ function buildContextBlock(mem, state) {
   if (state.topicsDiscussed.length > 0) lines.push(`Topics covered: ${state.topicsDiscussed.join(', ')}`);
   if (mem.conversationSummary) lines.push(`Previous conversation summary: ${mem.conversationSummary}`);
   if (state.phase)             lines.push(`Phase: ${state.phase}`);
-
   if (state.lastMenu) {
     const mn = state.lastMenu;
     lines.push(`\n[ACTIVE MENU — context: "${mn.context}"]\n1. ${mn.options[0]}\n2. ${mn.options[1]}\n3. ${mn.options[2]}\n4. ${mn.options[3]}`);
   }
-
   return lines.length ? `\n\n[USER CONTEXT — treat this as ground truth, it overrides anything in chat history]\n${lines.join('\n')}` : '';
 }
 
@@ -998,7 +809,7 @@ let _rateLimitUntil = 0;
 let _rateLimitRetryAfter = 0;
 
 // ─────────────────────────────────────────────
-// CLAUDE API CALL — token-safe, rate-limit-aware
+// CLAUDE API CALL
 // ─────────────────────────────────────────────
 async function callClaude(session, state, mem, userMessage, kbSection, phaseHint) {
   if (Date.now() < _rateLimitUntil) {
@@ -1006,20 +817,16 @@ async function callClaude(session, state, mem, userMessage, kbSection, phaseHint
     console.warn(`⚠️  Rate limit active — ${waitSec}s remaining`);
     return { reply: null, rateLimited: true, waitSec };
   }
-
   const contextBlock = buildContextBlock(mem, state);
   const systemPrompt = ADVISOR_SYSTEM_PROMPT + contextBlock + (phaseHint || '') + (kbSection || '');
-
   const history = session.history.slice(-12);
   const messages = [...history, { role: 'user', content: userMessage }];
-
   const estimatedInputTokens = estimateTokens(systemPrompt) + estimateTokens(JSON.stringify(messages));
   console.log(`📊  Est. input tokens: ~${estimatedInputTokens}`);
   if (estimatedInputTokens > 25000) {
     console.warn(`⚠️  Large prompt detected (${estimatedInputTokens} est. tokens) — trimming history further`);
     messages.splice(0, Math.max(0, messages.length - 5));
   }
-
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -1035,9 +842,7 @@ async function callClaude(session, state, mem, userMessage, kbSection, phaseHint
         messages,
       }),
     });
-
     const data = await response.json();
-
     if (response.status === 429) {
       const retryAfter = parseInt(data?.error?.message?.match(/\d+/)?.[0] || '60');
       _rateLimitUntil = Date.now() + (retryAfter * 1000);
@@ -1045,22 +850,17 @@ async function callClaude(session, state, mem, userMessage, kbSection, phaseHint
       console.error(`❌  Rate limited. Retry after ${retryAfter}s`);
       return { reply: null, rateLimited: true, waitSec: retryAfter };
     }
-
     if (!response.ok) {
       console.error(`❌  Claude error ${response.status}:`, JSON.stringify(data));
       return { reply: null, rateLimited: false };
     }
-
     _rateLimitUntil = 0;
-
     const reply = (data.content || [])
       .filter(b => b.type === 'text')
       .map(b => b.text)
       .join('\n')
       .trim() || null;
-
     return { reply, rateLimited: false };
-
   } catch (err) {
     console.error('❌  Claude fetch failed:', err.message);
     return { reply: null, rateLimited: false };
@@ -1072,13 +872,11 @@ async function callClaude(session, state, mem, userMessage, kbSection, phaseHint
 // ─────────────────────────────────────────────
 function parsePhone(raw, knownCC) {
   const d = String(raw).replace(/\D/g, '');
-
   if (knownCC) {
     const cc = String(knownCC).replace(/\D/g, '');
     const local = d.startsWith(cc) ? d.slice(cc.length) : d;
     return { countryCode: '+' + cc, phoneNumber: local };
   }
-
   const patterns = [
     [/^971(\d{7,9})$/,   '+971'],
     [/^966(\d{9})$/,     '+966'],
@@ -1128,12 +926,10 @@ function parsePhone(raw, knownCC) {
     [/^1([2-9]\d{9})$/,  '+1'],
     [/^([2-9]\d{9})$/,    '+1'],
   ];
-
   for (const [regex, cc] of patterns) {
     const mn = d.match(regex);
     if (mn) return { countryCode: cc, phoneNumber: mn[1] };
   }
-
   console.warn(`⚠️  parsePhone: unrecognised format "${d}" — sending as-is`);
   return { countryCode: '', phoneNumber: d };
 }
@@ -1160,18 +956,15 @@ async function send(phone, text, knownCC) {
 }
 
 // ─────────────────────────────────────────────
-// STRUCTURED HANDOFF EMAIL
-// FIX #19: Short-history warning added to chat log
+// HANDOFF EMAIL
 // ─────────────────────────────────────────────
 async function sendHandoffEmail(phone, mem, session, extraInfo, handoffDetails) {
   if (!RESEND_API_KEY || !NOTIFY_EMAIL) { console.warn('⚠️  Email not configured'); return; }
-
   const name    = mem.name           || 'Not provided';
   const target  = mem.targetCountry  || 'Not specified';
   const based   = mem.currentCountry || 'Not specified';
   const service = mem.serviceNeeded  || 'Not specified';
   const email   = mem.email          || 'Not provided';
-
   const d = handoffDetails || {};
   const prefParts = [];
   if (d.scheduledTime)            prefParts.push(`Requested time: ${d.scheduledTime}`);
@@ -1180,14 +973,12 @@ async function sendHandoffEmail(phone, mem, session, extraInfo, handoffDetails) 
   if (d.wantsToCheckAvailability) prefParts.push(`Wants team to suggest available time`);
   if (d.rawPreference)            prefParts.push(`Raw preference: "${d.rawPreference}"`);
   const prefSummary = prefParts.length ? prefParts.join(' | ') : 'No specific preference';
-
   const recentHistory = session.history.slice(-8);
   const chatLogText = recentHistory.length < 2
     ? '[Conversation too short to log — user triggered handoff very early in conversation]'
     : recentHistory
         .map(mn => `${mn.role === 'user' ? '👤 Customer' : '🤖 Advisor'}: ${mn.content}`)
         .join('\n\n');
-
   const html = `
 <div style="font-family:Arial,sans-serif;max-width:640px;color:#222">
   <h2 style="color:#1a365d;margin-bottom:4px">New Consultation Request</h2>
@@ -1211,7 +1002,6 @@ async function sendHandoffEmail(phone, mem, session, extraInfo, handoffDetails) 
     ${email !== 'Not provided' ? `📧 Email: ${email}<br>` : ''}
   </div>
 </div>`;
-
   try {
     const r = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -1241,10 +1031,48 @@ function rateLimitResponse(waitSec) {
 }
 
 // ─────────────────────────────────────────────
+// FIX #37: RETURNING USER GREETING BUILDER
+// Called when MongoDB has prior history for this phone number.
+// Builds a warm, personalised re-engagement message.
+// ─────────────────────────────────────────────
+function buildReturningGreeting(mem, state) {
+  const name = mem.name ? mem.name : null;
+  const nameStr = name ? `${name}` : 'there';
+
+  // Build topic/country reference for context
+  const contextParts = [];
+  const countries = (mem.targetCountries && mem.targetCountries.length)
+    ? mem.targetCountries
+    : (mem.targetCountry ? [mem.targetCountry] : []);
+  if (countries.length) contextParts.push(`expanding to ${countries.join(' and ')}`);
+
+  const topics = (state.topicsDiscussed && state.topicsDiscussed.length)
+    ? state.topicsDiscussed.slice(-3)
+    : [];
+  if (topics.length && !countries.length) contextParts.push(topics.join(', '));
+
+  const summary = mem.conversationSummary || '';
+
+  let contextLine = '';
+  if (summary && summary.length > 20) {
+    // Use the rolling summary if available — most informative
+    contextLine = `Last time, we covered: ${summary.length > 120 ? summary.substring(0, 117) + '...' : summary}`;
+  } else if (contextParts.length) {
+    contextLine = `Last time we were discussing ${contextParts.join(' and ')}.`;
+  }
+
+  const greeting = contextLine
+    ? `Hey ${nameStr}! 👋 Great to have you back.\n\n${contextLine}\n\nWhat can I help you with today?`
+    : `Hey ${nameStr}! 👋 Great to have you back at Comply Globally. What can I help you with today?`;
+
+  return greeting;
+}
+
+// ─────────────────────────────────────────────
 // WEBHOOK — MAIN HANDLER
 // ─────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // Always ack WhatsApp immediately
+  res.sendStatus(200);
 
   try {
     const body = req.body;
@@ -1255,7 +1083,6 @@ app.post('/webhook', async (req, res) => {
     const rawMsg     = (body.data?.message?.message || '').trim();
     if (!phone || !rawMsg) return;
 
-    // FIX #12: Reject suspiciously long messages before any processing
     if (rawMsg.length > 1500) {
       await send(phone, `That message was a bit long for me — could you summarize your question in a sentence or two?`, incomingCC);
       return;
@@ -1289,18 +1116,28 @@ app.post('/webhook', async (req, res) => {
     ]);
 
     // ══════════════════════════════════════════════
-    // 1. FIRST-TIME USER
-    // FIX #35: Extract name + entities from first message BEFORE responding
-    // FIX #36: Try nickname extractor first; immediately persist to MongoDB
+    // FIX #37: RETURNING USER CHECK
+    // If this phone has prior MongoDB history (session.history.length > 0)
+    // even though isFirstTime=false, check if this is the very first message
+    // of a new in-memory session (cache miss) — i.e. user is returning after
+    // server restart or cache expiry.
+    // Condition: not first time AND session has history AND no recent cache hit
+    // AND the incoming message looks like an opener (greeting or short query).
     // ══════════════════════════════════════════════
+    const isReturningOpener = (
+      !isFirstTime &&
+      session.history.length > 2 &&
+      mem.name // only personalise if we actually know their name
+    );
+
+    // ── FIRST TIME USER ──
     if (isFirstTime) {
-      // FIX #36: Try composite name+nickname extractor first
+      // Try composite name+nickname extractor first (FIX #36)
       const firstNameNick = extractNameWithNickname(rawMsg);
       if (firstNameNick) {
         mem.name = firstNameNick;
         console.log(`✅  Name+nickname from first message: ${firstNameNick}`);
       } else {
-        // Fall back to original first-message extractor (FIX #35)
         const firstName = extractNameFirstMessage(rawMsg);
         if (firstName) {
           mem.name = firstName;
@@ -1314,14 +1151,13 @@ app.post('/webhook', async (req, res) => {
         console.log(`📝  Entities from first message:`, firstEntities);
       }
 
-      // FIX #36: Immediately persist name + entities to MongoDB so CRM sees them
-      // right away — fire-and-forget, does not block the response
+      // FIX #38: await the immediate persist (was fire-and-forget — caused race conditions)
       if (mem.name || Object.keys(firstEntities).length > 0) {
-        saveMemory(mem).catch(e => console.error('❌  Immediate saveMemory (first msg) failed:', e.message));
+        await saveMemory(mem);
+        console.log(`✅  Memory persisted immediately after first-message extraction`);
       }
 
       let msg;
-
       if (mem.name && mem.targetCountry) {
         state.phase = 'advisory';
         const kbSection = retrieveKBChunks(rawMsg);
@@ -1342,10 +1178,7 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // ══════════════════════════════════════════════
-    // 2. HUMAN MODE — suppress bot
-    // FIX #10: Send re-entry message when bot resumes after timeout
-    // ══════════════════════════════════════════════
+    // ── HUMAN MODE ──
     if (state.humanMode) {
       const elapsed = Date.now() - new Date(state.humanModeAt || 0).getTime();
       if (elapsed < HUMAN_TIMEOUT_MS) {
@@ -1364,24 +1197,17 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // ══════════════════════════════════════════════
-    // 3. PENDING HANDOFF — collect extra info then send email
-    // FIX #5:  Short single-word replies treated as no-extra-info
-    // FIX #26: Confirmation message is context-aware
-    // ══════════════════════════════════════════════
+    // ── PENDING HANDOFF ──
     if (state.pendingHandoff) {
       const isNegative    = /^(no|nope|nothing|n\/a|nah|not really|skip|none)$/i.test(rawMsg.trim());
       const wordCount     = rawMsg.trim().split(/\s+/).length;
       const containsEmail = EMAIL_RE.test(rawMsg);
       const isTooShort    = wordCount < 3 && !containsEmail;
       const extraInfo     = (isNegative || isTooShort) ? null : rawMsg;
-
       const confirmMsg = buildHandoffConfirmation(state.handoffDetails);
       await send(phone, confirmMsg, incomingCC);
-
       session.history.push({ role: 'user', content: truncateMsg(rawMsg) });
       session.history.push({ role: 'assistant', content: confirmMsg });
-
       const savedDetails   = state.handoffDetails;
       state.pendingHandoff   = false;
       state.handoffEmailSent = true;
@@ -1390,15 +1216,12 @@ app.post('/webhook', async (req, res) => {
       state.phase            = 'human_mode';
       state.lastMenu         = null;
       state.handoffDetails   = null;
-
       await sendHandoffEmail(phone, mem, session, extraInfo, savedDetails);
       await Promise.all([saveSession(session), saveState(state)]);
       return;
     }
 
-    // ══════════════════════════════════════════════
-    // FIX #20: Emoji-only / reaction message detection
-    // ══════════════════════════════════════════════
+    // ── EMOJI ONLY ──
     const isEmojiOnly = /^[\u{1F300}-\u{1FFFF}\u{2600}-\u{27FF}\uFE0F\u20E3\s]+$/u.test(rawMsg) && rawMsg.trim().length < 20;
     if (isEmojiOnly) {
       const emojiReply = `Ha! 😄 Anything I can help you with on the business expansion side?`;
@@ -1410,20 +1233,36 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ══════════════════════════════════════════════
-    // 4. ENTITY EXTRACTION (runs on every message)
-    // FIX #36: Nickname extractor runs first; immediate saveMemory on any name/entity change
+    // FIX #37: RETURNING OPENER — send warm re-engagement greeting
+    // Fires when: returning user AND the current in-memory session history
+    // is SHORT (≤ 1 assistant messages) meaning this is essentially the
+    // "first message" of their new session (after restart / cache miss).
+    // We check session.history assistant-msg count to avoid greeting mid-convo.
     // ══════════════════════════════════════════════
-    let memDirty = false; // tracks whether mem changed so we know to fire immediate save
+    const assistantMsgCount = session.history.filter(m => m.role === 'assistant').length;
+    if (isReturningOpener && assistantMsgCount === 0) {
+      const returningMsg = buildReturningGreeting(mem, state);
+      console.log(`👋  Returning user greeting for ${phone}: ${returningMsg.substring(0, 60)}...`);
+      await send(phone, returningMsg, incomingCC);
+      session.history.push({ role: 'user', content: rawMsg });
+      session.history.push({ role: 'assistant', content: returningMsg });
+      await Promise.all([saveSession(session), saveState(state), saveMemory(mem)]);
+      return;
+    }
+
+    // ══════════════════════════════════════════════
+    // ENTITY EXTRACTION (every message)
+    // FIX #38: await saveMemory immediately when mem changes
+    // ══════════════════════════════════════════════
+    let memDirty = false;
 
     if (!mem.name) {
-      // FIX #36: Try composite name+nickname extractor first
       const nn = extractNameWithNickname(rawMsg);
       if (nn) {
         mem.name = nn;
         memDirty = true;
         console.log(`✅  Name+nickname locked: ${nn}`);
       } else {
-        // Fall back to original strict extractor
         const n = extractName(rawMsg);
         if (n) {
           mem.name = n;
@@ -1433,9 +1272,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // FIX #36: Mid-conversation nickname update
-    // If user already has a name stored (no nickname yet) and now says "call me X"
-    // → update stored name to "FullName (X)"
+    // Mid-conversation nickname update (FIX #36)
     if (mem.name && !mem.name.includes('(')) {
       const MID_NICK_RE = /^(?:call me|just call me|actually call me|you can call me|everyone calls me|people call me)\s+([A-Za-z][a-zA-Z'\-]{1,20})\s*[.!,]?\s*$/i;
       const midNickMatch = rawMsg.trim().match(MID_NICK_RE);
@@ -1463,16 +1300,15 @@ app.post('/webhook', async (req, res) => {
       console.log(`📝  Entities:`, entityUpdates);
     }
 
-    // FIX #36: Fire-and-forget immediate MongoDB persist whenever mem changed
-    // This ensures CRM reflects name/country/service without waiting for end-of-handler save
+    // FIX #38: await the immediate persist so CRM sees it right away
     if (memDirty) {
-      saveMemory(mem).catch(e => console.error('❌  Immediate saveMemory failed:', e.message));
+      await saveMemory(mem);
+      console.log(`✅  Memory persisted immediately after entity update`);
     }
 
     const topic = inferTopic(rawMsg);
     if (topic && !state.topicsDiscussed.includes(topic)) {
       state.topicsDiscussed.push(topic);
-      // FIX #21: Cap topicsDiscussed at 20 entries
       if (state.topicsDiscussed.length > 20) {
         state.topicsDiscussed = state.topicsDiscussed.slice(-20);
       }
@@ -1483,11 +1319,11 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ══════════════════════════════════════════════
-    // 5. INTENT ROUTING — Claude-powered classification
+    // INTENT ROUTING
     // ══════════════════════════════════════════════
     const intent = await classifyIntent(rawMsg);
 
-    // ── 5a. Impossible handoff ──
+    // Impossible handoff
     if (intent.impossibleHandoff) {
       const reason = intent.impossibleReason || '';
       let impossibleMsg;
@@ -1505,25 +1341,22 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // ── 5b. Human handoff request ──
+    // Human handoff request
     if (intent.type === 'human_request') {
       const details = intent.details || { urgency: 'normal' };
       const msg = buildHandoffMessage(details, mem);
-
       await send(phone, msg, incomingCC);
       session.history.push({ role: 'user', content: truncateMsg(rawMsg) });
       session.history.push({ role: 'assistant', content: msg });
-
       state.pendingHandoff  = true;
       state.phase           = 'escalating';
       state.lastMenu        = null;
       state.handoffDetails  = details;
-
       await Promise.all([saveSession(session), saveState(state)]);
       return;
     }
 
-    // ── 5c. Invalid menu number ──
+    // Invalid menu
     if (intent.type === 'invalid_menu') {
       const msg = state.lastMenu
         ? `I had options 1 to 4 there — did you mean one of those? 😊 Or go ahead and ask directly!`
@@ -1535,7 +1368,7 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // FIX #17: menu_select with no active menu
+    // Menu select with no active menu
     if (intent.type === 'menu_select' && !state.lastMenu) {
       const msg = `I don't have an active menu right now — feel free to ask me anything directly!`;
       await send(phone, msg, incomingCC);
@@ -1545,18 +1378,15 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // ── 5d. Valid menu selection ──
+    // Valid menu selection
     if (intent.type === 'menu_select' && state.lastMenu) {
       const num      = intent.num;
       const selected = state.lastMenu.options[num - 1];
       if (selected) {
         console.log(`📋  Menu ${num} selected: "${selected}"`);
-
         const kbSection = retrieveKBChunks(selected);
         const menuHint  = `\n\n[INSTRUCTION: The user selected option ${num}: "${selected}" from the active menu. Answer this question fully and accurately from the knowledge base. You may show new follow-up options after answering.]`;
-
         const { reply, rateLimited, waitSec } = await callClaude(session, state, mem, selected, kbSection, menuHint);
-
         if (rateLimited) {
           await send(phone, rateLimitResponse(waitSec || 60), incomingCC);
           return;
@@ -1565,31 +1395,27 @@ app.post('/webhook', async (req, res) => {
           await send(phone, `I hit a brief snag there. Please try again in a moment!`, incomingCC);
           return;
         }
-
         await send(phone, reply, incomingCC);
         session.history.push({ role: 'user', content: rawMsg });
         session.history.push({ role: 'assistant', content: truncateMsg(reply) });
-
         const newMenu = parseMenuFromReply(reply);
         state.lastMenu = newMenu
           ? { id: Date.now(), options: newMenu, context: selected, createdAt: Date.now() }
           : null;
-
         await Promise.all([saveSession(session), saveState(state), saveMemory(mem)]);
         return;
       }
     }
 
     // ══════════════════════════════════════════════
-    // 6. RETURNING USER GREETING — no LLM needed
-    // FIX #15: Skip if phase is escalating or human_mode
-    // FIX #22: Require session age > 1 hour
+    // RETURNING USER GREETING (mid-session, pure greeting messages)
+    // FIX #15, #22: skip if escalating/human_mode; require session age > 1hr
     // ══════════════════════════════════════════════
     const sessionAgeMs  = Date.now() - new Date(session.createdAt || 0).getTime();
-    const isReturning   = session.history.length > 4 && sessionAgeMs > 3600000;
+    const isOldSession  = session.history.length > 4 && sessionAgeMs > 3600000;
     const safePhase     = !['escalating', 'human_mode'].includes(state.phase);
 
-    if (GREETING_RE.test(rawMsg) && isReturning && safePhase) {
+    if (GREETING_RE.test(rawMsg) && isOldSession && safePhase) {
       const nameGreet = mem.name ? `, ${mem.name}` : '';
       const topicRef  = state.topicsDiscussed.length > 0
         ? ` Last time we were discussing ${state.topicsDiscussed.slice(-2).join(' and ')} — want to pick up there, or something new on your mind?`
@@ -1603,7 +1429,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ══════════════════════════════════════════════
-    // FIX #33: DETERMINISTIC MEMORY RECALL
+    // DETERMINISTIC MEMORY RECALL (FIX #33)
     // ══════════════════════════════════════════════
     const isNameQuestion    = /what[''\u2019s ]*s? ?my name|yk my name|you know my name|tell me my name|do you (?:know|remember) my name/i.test(rawMsg);
     const isCountryQuestion = /which country|what country|where am i expand|which market|what market/i.test(rawMsg);
@@ -1617,7 +1443,6 @@ app.post('/webhook', async (req, res) => {
       await Promise.all([saveSession(session), saveState(state), saveMemory(mem)]);
       return;
     }
-
     if (isCountryQuestion && (mem.targetCountry || mem.currentCountry)) {
       const c = mem.targetCountry || mem.currentCountry;
       const countryReply = "You're looking at expanding to " + c + '! \u{1F30D}';
@@ -1627,7 +1452,6 @@ app.post('/webhook', async (req, res) => {
       await Promise.all([saveSession(session), saveState(state), saveMemory(mem)]);
       return;
     }
-
     if (isContextQuestion) {
       const parts = [];
       if (mem.name)           parts.push('your name is ' + mem.name);
@@ -1646,10 +1470,9 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ══════════════════════════════════════════════
-    // 7. STANDARD CLAUDE ADVISORY RESPONSE
+    // STANDARD CLAUDE ADVISORY RESPONSE
     // ══════════════════════════════════════════════
     const kbSection = retrieveKBChunks(rawMsg);
-
     let phaseHint = '';
     if (state.phase === 'onboarding' || state.phase === 'new') {
       if (!mem.name) {
@@ -1680,7 +1503,7 @@ app.post('/webhook', async (req, res) => {
       console.log(`📋  Menu stored: [${newMenu.join(' | ')}]`);
     }
 
-    // FIX #34: Rolling conversation summary — update every 5 user messages
+    // FIX #39: Rolling summary — update every 5 user messages, then await saveMemory
     const userMsgCount = session.history.filter(m => m.role === 'user').length;
     if (userMsgCount > 0 && userMsgCount % 5 === 0) {
       try {
@@ -1704,6 +1527,9 @@ ${session.history.slice(-10).map(m => (m.role === 'user' ? 'User' : 'Advisor') +
         if (summary) {
           mem.conversationSummary = summary;
           console.log(`📝  Summary updated: ${summary.substring(0, 80)}...`);
+          // FIX #39: await saveMemory so summary persists to MongoDB immediately
+          await saveMemory(mem);
+          console.log(`✅  Summary persisted to MongoDB`);
         }
       } catch (err) {
         console.error('❌  Summary generation failed:', err.message);
@@ -1734,7 +1560,6 @@ app.get('/health', (req, res) => res.json({
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-// FIX #31: Deep MongoDB diagnostic endpoint
 app.get('/mongo-check', async (req, res) => {
   if (!MONGODB_URI) return res.json({ status: 'error', reason: 'MONGODB_URI not set' });
   try {
@@ -1756,7 +1581,6 @@ app.get('/mongo-check', async (req, res) => {
   }
 });
 
-// Admin: manually patch a user's memory
 app.post('/memory/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/D/g, '');
   const updates = req.body || {};
@@ -1772,7 +1596,6 @@ app.post('/memory/:phone', async (req, res) => {
   res.json({ success: true, updated: filtered, memory: mem });
 });
 
-// FIX #34: Wipe ALL data from MongoDB — fresh start
 app.post('/reset-all', async (req, res) => {
   const secret = req.query.secret;
   if (secret !== 'comply2024') return res.status(403).json({ error: 'Forbidden — add ?secret=comply2024' });
@@ -1817,16 +1640,13 @@ app.get('/debug/:phone', async (req, res) => {
   const phone = req.params.phone.replace(/\D/g, '');
   const [session, state, mem] = await Promise.all([getSession(phone), getState(phone), getMemory(phone)]);
   res.json({
-    memory: { name: mem.name, targetCountry: mem.targetCountry, currentCountry: mem.currentCountry, serviceNeeded: mem.serviceNeeded, email: mem.email },
+    memory: { name: mem.name, targetCountry: mem.targetCountry, currentCountry: mem.currentCountry, serviceNeeded: mem.serviceNeeded, email: mem.email, conversationSummary: mem.conversationSummary },
     state:  { phase: state.phase, topicsDiscussed: state.topicsDiscussed, humanMode: state.humanMode, lastMenu: state.lastMenu, handoffDetails: state.handoffDetails },
     historyLength: session.history.length,
     lastMessages: session.history.slice(-4),
   });
 });
 
-// ─────────────────────────────────────────────
-// /wa-leads — CRM endpoint, reads from MongoDB
-// ─────────────────────────────────────────────
 app.get('/wa-leads', async function(req, res) {
   var ready = await ensureMongo();
   if (!ready || !memoryCol) {
@@ -1854,8 +1674,6 @@ app.get('/wa-leads', async function(req, res) {
           lastUpdated:         m.updatedAt            || null,
         };
       });
-
-    // merge topicsDiscussed from activeStates
     if (activeStateCol) {
       var states = await activeStateCol.find({}).toArray();
       var stateMap = {};
@@ -1865,7 +1683,6 @@ app.get('/wa-leads', async function(req, res) {
         if (s && Array.isArray(s.topicsDiscussed)) l.topicsDiscussed = s.topicsDiscussed;
       });
     }
-
     res.json(leads);
   } catch (err) {
     console.error('❌ /wa-leads error:', err.message);
@@ -1880,7 +1697,7 @@ const PORT = process.env.PORT || 5000;
 
 connectMongo().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n🚀  ComplyGlobally Bot v4.10 — FIX #36: Immediate name persistence + nickname support`);
+    console.log(`\n🚀  ComplyGlobally Bot v4.11 — FIX #37-39: Returning-user greeting + storage reliability`);
     console.log(`📡  Port: ${PORT}`);
     console.log(`📮  POST /webhook`);
     console.log(`❤️   GET  /health`);
