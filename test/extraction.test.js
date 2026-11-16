@@ -8,13 +8,13 @@ test('bad names from the old summary scraper are rejected', () => {
   for (const bad of ['is exploring', 'is looking', 'The user', 'Pty ltd', 'FEMA', 'Australia', 'urgent', 'Banking Setup', 'has expressed']) {
     assert.equal(s.isPlausibleName(bad), false, bad);
   }
-  for (const good of ['Piyush Sharma', 'Himanshu RS Jindal', 'CA Himanshu RS Jindal', 'Rahul', "D'Souza", 'Anil (Andy)']) {
+  for (const good of ['Arjun Mehta', 'Vikram KS Kapoor', 'CA Vikram KS Kapoor', 'Rahul', "D'Souza", 'Anil (Andy)']) {
     assert.equal(s.isPlausibleName(good), true, good);
   }
 });
 
 test('explicit intros are captured, sentences are not', () => {
-  assert.equal(s.extractExplicitName('my name is piyush sharma'), 'Piyush Sharma');
+  assert.equal(s.extractExplicitName('my name is arjun mehta'), 'Arjun Mehta');
   assert.equal(s.extractExplicitName("Hi, I'm Rahul"), 'Rahul');
   assert.equal(s.extractExplicitName('i am interested in UAE'), null);
   assert.equal(s.extractExplicitName('this is urgent'), null);
@@ -23,8 +23,8 @@ test('explicit intros are captured, sentences are not', () => {
 });
 
 test('standalone reply to "who am I speaking with?"', () => {
-  assert.equal(s.extractStandaloneName('Piyush Sharma'), 'Piyush Sharma');
-  assert.equal(s.extractStandaloneName('CA Himanshu RS Jindal'), 'Himanshu RS Jindal');
+  assert.equal(s.extractStandaloneName('Arjun Mehta'), 'Arjun Mehta');
+  assert.equal(s.extractStandaloneName('CA Vikram KS Kapoor'), 'Vikram KS Kapoor');
   assert.equal(s.extractStandaloneName('FEMA'), null);
   assert.equal(s.extractStandaloneName('Australia'), null);
   assert.equal(s.extractStandaloneName('who is required to do APR Filling??'), null);
@@ -32,12 +32,12 @@ test('standalone reply to "who am I speaking with?"', () => {
 
 test('LLM names must be grounded in the user message', () => {
   const mem = s.newMemory('1');
-  s.applyProfile(mem, 'Australia', { llm: { name: 'Piyush', preferredName: null, targetCountries: ['Australia'], currentCountry: null, services: [] } });
-  assert.equal(mem.name, null);                  // "Piyush" not in message → rejected
+  s.applyProfile(mem, 'Australia', { llm: { name: 'Arjun', preferredName: null, targetCountries: ['Australia'], currentCountry: null, services: [] } });
+  assert.equal(mem.name, null);                  // "Arjun" not in message → rejected
   assert.deepEqual(mem.targetCountries, ['Australia']);
-  s.applyProfile(mem, 'CA Himanshu RS Jindal', { llm: { name: 'Himanshu RS Jindal', preferredName: null, targetCountries: [], currentCountry: null, services: [] } });
-  assert.equal(mem.name, 'Himanshu RS Jindal');
-  assert.equal(s.firstName(mem.name), 'Himanshu');
+  s.applyProfile(mem, 'CA Vikram KS Kapoor', { llm: { name: 'Vikram KS Kapoor', preferredName: null, targetCountries: [], currentCountry: null, services: [] } });
+  assert.equal(mem.name, 'Vikram KS Kapoor');
+  assert.equal(s.firstName(mem.name), 'Vikram');
 });
 
 test('country matching uses word boundaries', () => {
@@ -74,7 +74,7 @@ test('markdown converted to WhatsApp formatting', () => {
 });
 
 test('history sent to Claude starts with a user turn', () => {
-  const msgs = s.buildMessages([{ role: 'assistant', content: 'Hi! who am I speaking with?' }], 'Piyush');
+  const msgs = s.buildMessages([{ role: 'assistant', content: 'Hi! who am I speaking with?' }], 'Arjun');
   assert.equal(msgs[0].role, 'user');
 });
 

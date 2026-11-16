@@ -682,7 +682,7 @@ User message:
 """${userMsg}"""
 
 Fields:
-- name: the user's OWN personal name, only if clearly given (e.g. "I'm Rahul", or "Piyush Sharma" as a reply to "who am I speaking with?"). Drop professional titles/honorifics (CA, CS, Dr, Mr, Mrs, Ms, Adv, Er, Prof). Copy the words exactly as written. null if it is not clearly their name — company names, brands, places, topics ("FEMA", "Pty ltd"), or other people are NOT names.
+- name: the user's OWN personal name, only if clearly given (e.g. "I'm Rahul", or "Arjun Mehta" as a reply to "who am I speaking with?"). Drop professional titles/honorifics (CA, CS, Dr, Mr, Mrs, Ms, Adv, Er, Prof). Copy the words exactly as written. null if it is not clearly their name — company names, brands, places, topics ("FEMA", "Pty ltd"), or other people are NOT names.
 - preferredName: nickname only if they say "call me X", else null.
 - targetCountries: countries they want to expand to / set up in / are asking about for their business, as short English names ("UAE", "USA", "UK", "Australia", "Singapore"). A US state → "USA", Dubai → "UAE". Empty if none.
 - currentCountry: the country they are based in / from, only if stated. null otherwise.
